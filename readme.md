@@ -80,7 +80,10 @@ Options:
 
 ### Interactive mode
 
-Run `macmon` without a subcommand to open the terminal UI: the metric boxes on top and the process list below. Press `?` in the app to see the keys.
+Run `macmon` without a subcommand to open the terminal UI. At least 100 columns and 30 rows
+show Compute on the left, Memory and a Power/Temperature ledger on the right, and full-width
+Network and Processes below. Smaller windows and VMs use the adaptive metric grid. Press `?`
+in the app to see the keys.
 
 CPU, GPU and RAM charts use terminal-theme accents; high-load history remains red. Primary
 values are bold, while secondary details are dimmed. Network receive/transmit rates and totals
@@ -92,9 +95,21 @@ omitted when space is limited. Units and process metadata are quieter than prima
 the latest chart sample and hot-load history stay prominent. Wide network tables align their
 totals to the panel edge while preserving the compact layout in narrow windows.
 
-The screen redraws when data, input or the window size changes. Unchanged input heartbeats skip
-drawing, and interfaces are ranked when samples arrive. The default sampling interval stays
-1000 ms; the existing controls and saved configuration remain compatible.
+Fans have a small character indicator driven by their reported RPM. Zero RPM stays stationary;
+unavailable fans stay absent. Press `a` to toggle motion (enabled by default, saved as
+`animate_fans`); it changes at most four times per second using the existing input heartbeat.
+Motion pauses on focus loss, under help and when its indicator does not fit. It never controls
+hardware fans or changes the 1000 ms default sampling interval.
+
+The screen redraws when data, input, the window size or a visible fan frame changes. Other input
+heartbeats skip drawing, and interfaces are ranked when samples arrive. Existing configuration
+fields, including `Sparkline` and `Gauge`, remain compatible.
+
+For the optional deep blue Warp palette, copy [macmon-deep-space.yaml](themes/macmon-deep-space.yaml)
+to `~/.warp/themes/`, then select **Macmon Deep Space** in Warp's Theme Picker
+(`Ctrl+Cmd+T`). See [Warp's custom theme guide](https://docs.warp.dev/terminal/appearance/custom-themes/).
+The program uses ANSI colors and also follows other terminal palettes; it does not change your
+terminal preferences automatically.
 
 Press `/` to filter the process list. A filter is a comma-separated list of terms, each matched case-insensitively against the process name or pid: `safari, cargo` shows processes matching any term, and a term starting with `!` hides its matches (`chrome, !helper`). `Enter` keeps the filter, `Esc` clears it.
 

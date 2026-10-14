@@ -81,6 +81,70 @@ mod ui_preview {
   }
 
   #[test]
+  #[ignore = "opt-in PTY fixture with synthetic 3000 RPM; no hardware sampling"]
+  fn live_fan_fixture() {
+    let duration: u64 = std::env::var("MACMON_UI_FIXTURE_SECONDS").unwrap().parse().unwrap();
+    assert!((1..=300).contains(&duration));
+    let report = std::env::var("MACMON_UI_FIXTURE_REPORT").unwrap();
+    let mut app = demo();
+    app.cfg.animate_fans = std::env::var("MACMON_UI_FIXTURE_MOTION").as_deref() == Ok("on");
+    // These are fixture values, never a fallback for real hardware readings.
+    let fixture = || Metrics {
+      fans: vec![FanMetric { name: "fixture fan".into(), rpm: 3000, max_rpm: None }],
+      network: Some(vec![NetworkMetric {
+        name: "en0".into(), rx_bytes: 28 << 30, tx_bytes: 5 << 30,
+        rx_bytes_per_sec: Some(4_521_984.0), tx_bytes_per_sec: Some(430_080.0),
+      }]),
+      ..test_metrics()
+    };
+    app.update_metrics(fixture());
+    let interval = RwLock::new(1000);
+    let (tx, rx) = mpsc::channel();
+    let (mut terminal, guard) = super::super::enter_term().unwrap();
+    super::super::run_inputs_thread(tx, 250);
+    let start = Instant::now();
+    let mut next_sample = start + Duration::from_secs(1);
+    let (mut redraw, mut frames, mut ticks, mut fan_frames, mut samples) = (true, 0, 0, 0, 0);
+    while start.elapsed().as_secs() < duration {
+      if redraw {
+        terminal.draw(|f| app.render(f)).unwrap();
+        frames += 1;
+      }
+      if Instant::now() >= next_sample {
+        app.update_metrics(fixture());
+        if let Some(showing) = app.procs_shown.showing() {
+          app.update_procs(showing, test_procs());
+        }
+        next_sample += Duration::from_secs(1);
+        samples += 1;
+        redraw = true;
+        continue;
+      }
+      match rx.recv_timeout(next_sample.saturating_duration_since(Instant::now())) {
+        Ok(event) => {
+          let tick = matches!(event, Event::Tick);
+          ticks += u32::from(tick);
+          match app.apply_event(event, &interval).unwrap() {
+            ControlFlow::Continue(changed) => {
+              redraw = changed;
+              fan_frames += u32::from(tick && changed);
+            }
+            ControlFlow::Break(()) => break,
+          }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => redraw = false,
+        Err(err) => panic!("fixture inputs: {err}"),
+      }
+    }
+    drop(guard);
+    std::fs::write(report, serde_json::to_vec_pretty(&serde_json::json!({
+      "synthetic_rpm": 3000, "hardware_sampling": false, "seconds": start.elapsed().as_secs_f64(),
+      "motion": app.cfg.animate_fans, "frames": frames, "ticks": ticks,
+      "fan_frames": fan_frames, "samples": samples, "interval_ms": app.cfg.interval(),
+    })).unwrap()).unwrap();
+  }
+
+  #[test]
   #[ignore = "writes fixture previews only when explicitly requested"]
   fn export_buffers() {
     let output = std::env::var("MACMON_UI_PREVIEW_OUT").expect("set MACMON_UI_PREVIEW_OUT");

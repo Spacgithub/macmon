@@ -1,0 +1,25 @@
+name: Macmon Deep Space
+accent: '#63d9ea'
+cursor: '#63d9ea'
+background: '#0d1420'
+foreground: '#d8e4f0'
+details: darker
+terminal_colors:
+  normal:
+    black: '#0d1420'
+    red: '#f08080'
+    green: '#91caa8'
+    yellow: '#f2bb71'
+    blue: '#8db6f3'
+    magenta: '#c7a3ef'
+    cyan: '#63d9ea'
+    white: '#9aaabe'
+  bright:
+    black: '#62748b'
+    red: '#ff9898'
+    green: '#adddbc'
+    yellow: '#ffce91'
+    blue: '#accbff'
+    magenta: '#d9bffc'
+    cyan: '#88eaf5'
+    white: '#edf5ff'
