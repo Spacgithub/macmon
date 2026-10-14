@@ -86,7 +86,7 @@ while [ "$#" -gt 0 ]; do
   esac
   shift 2
 done
-[ "$repo" = Spacgithub/macmon ] && [ "$base" = main ] || exit 92
+[ "$repo" = github.com/Spacgithub/macmon ] && [ "$base" = main ] || exit 92
 case "$action" in
   list)
     [ "$state" = open ] || exit 93
@@ -194,6 +194,22 @@ second="$primary/.worktrees/upstream-sync-$(printf '%.12s' "$first")-$(printf '%
 "$REAL_GIT" -C "$second" merge-base --is-ancestor "$first" HEAD || die 'lost previous sync ancestry'
 [ "$(grep -c '^pr-create ' "$FIXTURE_DIR/events")" -eq 2 ] || die 'wrong successive PR count'
 printf 'ok - repeated and successive sync ancestry\n'
+
+fixture
+printf 'dirty user change\n' >>"$primary/shared.txt"
+status_before=$("$REAL_GIT" -C "$primary" status --porcelain)
+diff_before=$("$REAL_GIT" -C "$primary" diff HEAD)
+index_before=$(cksum "$primary/.git/index")
+(export GH_HOST=enterprise.example; success 'inherited alternate GitHub host')
+grep '^pr-list$' "$FIXTURE_DIR/events" >/dev/null || die 'did not query the fully qualified fork'
+grep '^pr-create ' "$FIXTURE_DIR/events" >/dev/null || die 'did not create a PR in the fully qualified fork'
+[ -f "$candidate/personal-network.marker" ] && [ -f "$candidate/upstream-improvement.marker" ] || die 'alternate host lost either feature'
+[ "$("$REAL_GIT" -C "$candidate" show -s --format=%P HEAD)" = "$fork $upstream" ] || die 'alternate host lost merge ancestry'
+[ "$(cksum "$primary/.git/index")" = "$index_before" ] || die 'alternate host changed primary index'
+[ "$("$REAL_GIT" -C "$primary" status --porcelain)" = "$status_before" ] || die 'alternate host changed dirty status'
+[ "$("$REAL_GIT" -C "$primary" diff HEAD)" = "$diff_before" ] || die 'alternate host changed dirty diff'
+unchanged_main
+printf 'ok - inherited GH_HOST cannot redirect fork PR operations\n'
 
 fixture
 printf 'personal conflict\n' >"$primary/shared.txt"

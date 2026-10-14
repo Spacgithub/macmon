@@ -8,7 +8,8 @@ The TUI is in `src/app/tui/`. Per-process usage (`src/app/procs.rs`) comes from 
 
 - This checkout maintains `Spacgithub/macmon`; `vladkens/macmon` is a read-only upstream.
   All pushes and pull requests target the personal fork. Configure upstream's push URL as
-  `/dev/null` and the local `remote.pushDefault` as `origin`.
+  `/dev/null` and the local `remote.pushDefault` as `origin`. Set the GitHub CLI default to
+  `github.com/Spacgithub/macmon`; specify `--repo github.com/Spacgithub/macmon` for PR commands.
 - Keep personal features on fork `main` after the person merges their feature PRs. Integrate
   upstream through `make upstream-sync`: an isolated worktree, a real merge, checks, and a PR.
   Never replace fork main with upstream, force-update main, or discard local user changes.

@@ -84,7 +84,7 @@ what we need.
 
 ## Personal fork maintenance
 
-- [ ] **14. Keep personal fork features while syncing upstream.** A one-command, isolated merge
+- [x] **14. Keep personal fork features while syncing upstream.** A one-command, isolated merge
       with checks and a PR in `Spacgithub/macmon`; sync PRs preserve upstream history, and
       inherited publication jobs remain restricted to the original repository.
-      Plan: [docs/plans/20261013-upstream-sync.md](plans/20261013-upstream-sync.md).
+      Plan: [docs/plans/completed/20261013-upstream-sync.md](plans/completed/20261013-upstream-sync.md).

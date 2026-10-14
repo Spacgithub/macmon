@@ -4,7 +4,7 @@ set -eu
 
 die() { printf 'upstream-sync: %s\n' "$*" >&2; exit 1; }
 [ "$#" -eq 0 ] || die 'usage: make upstream-sync'
-repo=Spacgithub/macmon
+repo=github.com/Spacgithub/macmon
 prefix=feat/upstream-sync-
 command -v gh >/dev/null || die 'GitHub CLI is required'
 command -v make >/dev/null || die 'Make is required'

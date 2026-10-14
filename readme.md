@@ -399,16 +399,17 @@ merged. `origin` points to this fork; `vladkens/macmon` is a read-only `upstream
 performance improvements and new features are merged into the fork's history, preserving personal
 commits. Changes to the same code can still require conflict resolution and testing.
 
-For a fresh clone of the personal fork, configure the remotes once:
+With Git and authenticated GitHub CLI (`gh auth login`), configure a fresh clone once:
 
 ```sh
 git remote add upstream https://github.com/vladkens/macmon.git
 git remote set-url --push upstream /dev/null
 git config --local remote.pushDefault origin
+gh repo set-default github.com/Spacgithub/macmon
 ```
 
-To prepare an update, install Git, GitHub CLI (`gh auth login` for access to your fork), and the Rust
-tools used by `make check` / `make test`, including nightly rustfmt, then run:
+To prepare an update, install the Rust tools used by `make check` / `make test`, including nightly
+rustfmt, then run:
 
 ```sh
 make upstream-sync

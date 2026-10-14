@@ -1,3 +1,5 @@
+Done: 2026-10-13, PR #2
+
 # Preserve fork features while merging upstream improvements
 
 Maintain `Spacgithub/macmon` as the personal fork. Keep Network Monitoring and future personal
@@ -36,4 +38,11 @@ updates through a separate, tested PR instead of replacing the fork with the ups
 - [x] Implement isolated merge/check/own-fork PR creation and focused fixture tests.
 - [x] Document fork maintenance and the merge-commit exception; guard inherited publishers.
 - [x] Verify local fixtures, `make check`, `make test`, and an actual isolated merge preview.
-- [ ] Review the integrated diff and open the tooling PR only in the personal fork.
+- [x] Review the integrated diff and open the tooling PR only in the personal fork.
+
+## Result
+
+Added manual upstream synchronization through isolated, checked merge PRs in the personal fork.
+The tool preserves fork history and local edits, stops unsafe publication, and requires merge
+commits for synchronization PRs. Fork maintenance rules and inherited publisher guards are in
+place; focused Git fixtures are included in `make test`.
