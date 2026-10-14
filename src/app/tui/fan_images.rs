@@ -1,4 +1,4 @@
-//! Owned Kitty RAW32 file images; no animation extension or terminal-wide deletion.
+//! Owned Kitty RAW32 images; inline transport for Warp, file transport elsewhere.
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -18,14 +18,22 @@ struct Resources {
 static ACTIVE: Mutex<Option<Resources>> = Mutex::new(None);
 #[cfg(test)]
 pub(super) static TEST_SESSION: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+pub(super) static FRAME_SUBMISSIONS: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
 
 pub(super) struct FanImages {
   resources: Resources,
   areas: [Option<[u16; 4]>; 2],
+  inline: bool,
 }
 
 impl FanImages {
   pub(super) fn new() -> io::Result<Self> {
+    Self::with_inline(std::env::var("TERM_PROGRAM").is_ok_and(|name| name == "WarpTerminal"))
+  }
+
+  fn with_inline(inline: bool) -> io::Result<Self> {
     let mut nonce = [0; 8];
     File::open("/dev/urandom")?.read_exact(&mut nonce)?;
     let pid = std::process::id();
@@ -48,7 +56,7 @@ impl FanImages {
       let _ = fs::remove_dir(&resources.directory);
       return Err(io::Error::new(io::ErrorKind::AlreadyExists, "fan image session already active"));
     }
-    Ok(Self { resources, areas: [None; 2] })
+    Ok(Self { resources, areas: [None; 2], inline })
   }
 
   fn expose(&self) {
@@ -57,13 +65,19 @@ impl FanImages {
     }
   }
 
-  /// Query the same file medium and RAW32 format used by the actual fan images.
+  /// Query the same medium and RAW32 format used by the actual fan images.
   pub(super) fn probe(&mut self, out: &mut impl Write) -> io::Result<u32> {
+    let id = self.resources.ids[0];
+    if self.inline {
+      self.expose();
+      inline(out, &format!("a=q,t=d,f=32,s=1,v=1,i={id}"), &[0; 4], 0)?;
+      out.flush()?;
+      return Ok(id);
+    }
     let path = self.resources.directory.join("probe.raw");
     let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
     file.write_all(&[0; 4])?;
     drop(file);
-    let id = self.resources.ids[0];
     let payload = base64(path.as_os_str().as_bytes());
     self.expose();
     write!(out, "\x1b_Ga=q,t=f,f=32,s=1,v=1,i={id};{payload}\x1b\\")?;
@@ -89,33 +103,39 @@ impl FanImages {
       ));
     }
     let path = self.resources.directory.join(format!("{slot}.raw"));
-    let staging = self.resources.directory.join(format!("{slot}.pending"));
-    let stored = (|| {
-      let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&staging)?;
-      file.write_all(rgba)?;
-      drop(file);
-      fs::rename(&staging, &path)
-    })();
-    if stored.is_err() {
-      let _ = fs::remove_file(&staging);
+    if !self.inline {
+      let staging = self.resources.directory.join(format!("{slot}.pending"));
+      let stored = (|| {
+        let mut file =
+          OpenOptions::new().write(true).create_new(true).mode(0o600).open(&staging)?;
+        file.write_all(rgba)?;
+        drop(file);
+        fs::rename(&staging, &path)
+      })();
+      if stored.is_err() {
+        let _ = fs::remove_file(&staging);
+      }
+      stored?;
     }
-    stored?;
     let id = self.resources.ids[slot];
     let area = [origin.0, origin.1, cells.0, cells.1];
     if self.areas[slot].is_some_and(|old| old != area) {
       delete(out, id, false)?;
       self.areas[slot] = None;
     }
-    let payload = base64(path.as_os_str().as_bytes());
     self.expose();
-    write!(
-      out,
-      "\x1b7\x1b[{};{}H\x1b_Ga=T,t=f,f=32,s={side},v={side},i={id},p=1,C=1,q=2;{payload}\x1b\\\x1b8",
-      u32::from(origin.1) + 1,
-      u32::from(origin.0) + 1,
-    )?;
+    write!(out, "\x1b7\x1b[{};{}H", u32::from(origin.1) + 1, u32::from(origin.0) + 1,)?;
+    if self.inline {
+      inline(out, &format!("a=T,t=d,f=32,s={side},v={side},i={id},p=1,C=1"), rgba, 2)?;
+    } else {
+      let payload = base64(path.as_os_str().as_bytes());
+      write!(out, "\x1b_Ga=T,t=f,f=32,s={side},v={side},i={id},p=1,C=1,q=2;{payload}\x1b\\")?;
+    }
+    out.write_all(b"\x1b8")?;
     out.flush()?;
     self.areas[slot] = Some(area);
+    #[cfg(test)]
+    FRAME_SUBMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
   }
 
@@ -143,6 +163,8 @@ pub(super) fn cleanup(out: &mut impl Write) {
   let resources = ACTIVE.lock().unwrap_or_else(|err| err.into_inner()).take();
   if let Some(resources) = resources {
     if resources.exposed {
+      // Finish any partially written APC before sending cleanup commands.
+      let _ = out.write_all(b"\x1b\\");
       for id in resources.ids {
         let _ = delete(out, id, true);
       }
@@ -150,6 +172,22 @@ pub(super) fn cleanup(out: &mut impl Write) {
     let _ = out.flush();
     let _ = fs::remove_dir_all(resources.directory);
   }
+}
+
+fn inline(out: &mut impl Write, controls: &str, rgba: &[u8], quiet: u8) -> io::Result<()> {
+  let encoded = base64(rgba);
+  let count = encoded.len().div_ceil(4096);
+  for (index, chunk) in encoded.as_bytes().chunks(4096).enumerate() {
+    let more = u8::from(index + 1 < count);
+    if index == 0 {
+      write!(out, "\x1b_G{controls},q={quiet},m={more};")?;
+    } else {
+      write!(out, "\x1b_Gm={more},q={quiet};")?;
+    }
+    out.write_all(chunk)?;
+    out.write_all(b"\x1b\\")?;
+  }
+  Ok(())
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -194,18 +232,18 @@ mod tests {
     let _session = TEST_SESSION.lock().unwrap();
     let mut out = Vec::new();
     cleanup(&mut out);
-    let images = FanImages::new().unwrap();
+    let images = FanImages::with_inline(false).unwrap();
     let unused = images.resources.directory.clone();
     cleanup(&mut out);
     assert!(out.is_empty());
     assert!(!unused.exists());
-    let mut images = FanImages::new().unwrap();
+    let mut images = FanImages::with_inline(false).unwrap();
     let directory = images.resources.directory.clone();
     let ids = images.resources.ids;
     assert_ne!(ids[0], ids[1]);
     assert_ne!(ids[0], 0);
     assert_eq!(fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o700);
-    assert_eq!(FanImages::new().err().unwrap().kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(FanImages::with_inline(false).err().unwrap().kind(), io::ErrorKind::AlreadyExists);
     assert_eq!(images.probe(&mut out).unwrap(), ids[0]);
     let probe_path = directory.join("probe.raw");
     assert_eq!(fs::read(&probe_path).unwrap(), [0; 4]);
@@ -282,9 +320,53 @@ mod tests {
         Ok(())
       }
     }
-    let images = FanImages::new().unwrap();
+    let images = FanImages::with_inline(false).unwrap();
     let directory = images.resources.directory.clone();
     cleanup(&mut Broken);
     assert!(!directory.exists());
+  }
+
+  #[test]
+  fn inline_probe_and_frames_are_chunked_without_file_access() {
+    let _session = TEST_SESSION.lock().unwrap();
+    let mut images = FanImages::with_inline(true).unwrap();
+    let mut out = Vec::new();
+    let id = images.probe(&mut out).unwrap();
+    assert_eq!(
+      String::from_utf8(out.clone()).unwrap(),
+      format!("\x1b_Ga=q,t=d,f=32,s=1,v=1,i={id},q=0,m=0;AAAAAA==\x1b\\")
+    );
+    for side in [1_u16, 32, 180, 240] {
+      out.clear();
+      let rgba: Vec<u8> = (0..usize::from(side).pow(2) * 4).map(|i| (i % 251) as u8).collect();
+      images.render(&mut out, &rgba, side, 0, (3, 4), (30, 15)).unwrap();
+      let encoded = base64(&rgba);
+      let text = String::from_utf8(out.clone()).unwrap();
+      let body = text.strip_prefix("\x1b7\x1b[5;4H").unwrap().strip_suffix("\x1b8").unwrap();
+      let chunks: Vec<_> = body.split_terminator("\x1b\\").collect();
+      assert_eq!(chunks.len(), encoded.len().div_ceil(4096));
+      let mut joined = String::new();
+      for (index, chunk) in chunks.iter().enumerate() {
+        let (header, data) = chunk.strip_prefix("\x1b_G").unwrap().split_once(';').unwrap();
+        let more = u8::from(index + 1 < chunks.len());
+        assert!(!data.is_empty() && data.len() <= 4096 && data.len() % 4 == 0);
+        if index == 0 {
+          assert_eq!(header, format!("a=T,t=d,f=32,s={side},v={side},i={id},p=1,C=1,q=2,m={more}"));
+        } else {
+          assert_eq!(header, format!("m={more},q=2"));
+        }
+        joined.push_str(data);
+      }
+      assert_eq!(joined, encoded);
+      assert_eq!(fs::read_dir(&images.resources.directory).unwrap().count(), 0);
+    }
+    out.clear();
+    cleanup(&mut out);
+    let cleaned = String::from_utf8(out).unwrap();
+    assert!(cleaned.starts_with("\x1b\\"));
+    for id in images.resources.ids {
+      assert!(cleaned.contains(&format!("a=d,d=I,i={id},q=2")));
+    }
+    assert!(!images.resources.directory.exists());
   }
 }

@@ -20,6 +20,9 @@ target `Spacgithub/macmon`; `vladkens/macmon` remains a read-only upstream.
 - Derive image shades from queried terminal colors through `tui/theme.rs`. Capability queries,
   delayed replies and fragmented replies cannot act as keyboard shortcuts. Image ownership is
   limited to this macmon process; hide, resize, error, panic and exit remove its own images.
+- Use chunked inline RGBA images in Warp and private file images in other supported terminals.
+  Query the selected transport and format, keep query acknowledgments enabled and suppress
+  routine frame replies. Complete each image before another terminal write can interleave.
 - Keep rootless metric sources, Network Monitoring, JSON, Prometheus, the library API and
   dependency versions compatible. Deliver rendering, terminal capability/ownership and UI
   integration in one feature PR, with the person's approved exception to the production-line
@@ -32,6 +35,7 @@ target `Spacgithub/macmon`; `vladkens/macmon` remains a read-only upstream.
 - [x] Port and test the rasterizer and independent 60 FPS rotor clock.
 - [x] Implement bounded terminal capability detection and safe reply handling.
 - [x] Implement owned image transmission and complete cleanup paths.
+- [x] Handle Warp builds without local-file image support using bounded inline packets.
 - [x] Integrate real fan identities, adaptive cooling panels and manual/focus/visibility gating.
 - [x] Validate output/config compatibility, resize, zero/missing RPM, terminal recovery and
       static/animated CPU, RSS and submitted-frame rate; distinguish actual Warp display checks.

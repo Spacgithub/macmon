@@ -160,7 +160,7 @@ mod fan_preview {
     std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
   }
 
-  /// Private PTY only: --ignored --exact tui::tests::fan_preview::native_graphical_fan_fixture
+  /// Opt-in synthetic terminal fixture; never samples hardware or saves the user's settings.
   /// --nocapture --test-threads=1. All readings are synthetic; no real sampler runs here.
   #[test]
   #[ignore = "synthetic graphical fixture needs a private PTY and external frame/cleanup checks"]
@@ -266,11 +266,15 @@ mod fan_preview {
         }
       })
     };
+    super::super::fan_images::FRAME_SUBMISSIONS.store(0, Ordering::Relaxed);
     let result = app.run_terminal(tx, rx, interval.as_ref());
     stop.store(true, Ordering::SeqCst);
     producer.join().unwrap();
     report["phase"] = "returned".into();
     report["elapsed_seconds"] = started.elapsed().as_secs_f64().into();
+    report["submitted_image_frames"] =
+      super::super::fan_images::FRAME_SUBMISSIONS.load(Ordering::Relaxed).into();
+    report["native_images_enabled"] = app.capabilities.is_some().into();
     report["result"] = match &result {
       Ok(()) => "ok".into(),
       Err(error) => error.to_string().into(),

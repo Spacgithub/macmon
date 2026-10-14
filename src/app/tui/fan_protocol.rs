@@ -8,7 +8,7 @@ use ratatui::crossterm::event::Event;
 use super::fan_images::FanImages;
 use super::fan_replies::ReplyParser;
 
-// File query, foreground, background, cursor, grid pixels and grid character dimensions.
+// Image query, foreground, background, cursor, grid pixels and grid character dimensions.
 const ALL_REPLIES: u8 = 0b11_1111;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
