@@ -244,6 +244,20 @@ mod tests {
   }
 
   #[test]
+  fn animation_frames_leave_a_stopped_fans_pixels_unchanged() {
+    let mut cooling = Cooling::default();
+    cooling.sync(&[fan("still", 0), fan("turning", 1800)]);
+    let palette =
+      Palette { background: [1, 2, 3], foreground: [220, 230, 240], accent: [5, 180, 190] };
+    assert!(cooling.rasterize(180, palette, false));
+    let before: Vec<_> = cooling.items().iter().map(|fan| fan.rgba.clone()).collect();
+    cooling.frame(Duration::from_millis(100));
+    assert!(cooling.rasterize(180, palette, true));
+    assert_eq!(cooling.items()[0].rgba, before[0]);
+    assert_ne!(cooling.items()[1].rgba, before[1]);
+  }
+
+  #[test]
   fn unsupported_small_vm_empty_or_many_fans_keep_current_layout() {
     for (area, power, count, cell) in [
       (Rect::new(0, 0, 120, 40), true, 2, None),

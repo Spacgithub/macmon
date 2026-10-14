@@ -1,14 +1,20 @@
-//! Framed query replies must never become TUI shortcut keys, including after the probe deadline.
+//! Keep late query bodies out of shortcut input while retaining ordinary ESC keys.
 
 use std::io;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
   Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
+const QUERY_PREFIXES: [&[u8]; 6] = [b"_G", b"]10;", b"]11;", b"]12;", b"[4;", b"[8;"];
+
 #[derive(Default)]
 pub(super) struct ReplyParser {
   pending: Vec<u8>,
+  // Number of literal prefix bytes already emitted after an idle ESC was returned.
+  shadow: Option<usize>,
+  idle_since: Option<Instant>,
 }
 
 impl ReplyParser {
@@ -17,11 +23,34 @@ impl ReplyParser {
       events.push(Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
       return Ok(Vec::new());
     }
+    if !data.is_empty() {
+      self.idle_since = None;
+    }
     self.pending.extend_from_slice(data);
     let mut replies = Vec::new();
     while !self.pending.is_empty() {
+      if let Some(emitted) = self.shadow {
+        if self.pending[0] == 27 {
+          self.shadow = None;
+        } else if QUERY_PREFIXES.iter().any(|prefix| self.pending.starts_with(prefix)) {
+          self.pending.insert(0, 27);
+          self.shadow = None;
+        } else if QUERY_PREFIXES.iter().any(|prefix| prefix.starts_with(&self.pending)) {
+          if self.pending.len() > emitted {
+            self.idle_since.get_or_insert_with(Instant::now);
+          }
+          break;
+        } else {
+          self.pending.drain(..emitted);
+          self.shadow = Some(0);
+        }
+      }
+      if self.pending.is_empty() {
+        break;
+      }
       if self.pending[0] == 27 {
         if self.pending.len() == 1 {
+          self.idle_since.get_or_insert_with(Instant::now);
           break;
         }
         if matches!(self.pending[1], b'_' | b']' | b'[' | b'O') {
@@ -62,15 +91,28 @@ impl ReplyParser {
   }
 
   pub(super) fn has_pending(&self) -> bool {
-    !self.pending.is_empty()
+    self.pending.len() > self.shadow.unwrap_or(0)
   }
 
-  /// Only after every requested reply has completed may an idle lone ESC become a key.
+  pub(super) fn idle_wait(&self) -> Option<Duration> {
+    self.idle_since.map(|since| Duration::from_millis(40).saturating_sub(since.elapsed()))
+  }
+
+  /// Return idle ESC/literal prefixes while retaining enough shadow state for late replies.
+  /// A literal complete query prefix is indistinguishable from such a reply and stays framed.
   pub(super) fn flush_idle_esc(&mut self, events: &mut Vec<Event>) {
     if self.pending == [27] {
       self.pending.clear();
+      self.shadow = Some(0);
       events.push(Event::Key(KeyCode::Esc.into()));
+    } else if let Some(emitted) = self.shadow
+      && self.idle_since.is_some()
+    {
+      events
+        .extend(self.pending[emitted..].iter().map(|&byte| Event::Key(character(byte as char))));
+      self.shadow = Some(self.pending.len());
     }
+    self.idle_since = None;
   }
 }
 
@@ -200,6 +242,16 @@ mod tests {
     Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
   }
 
+  fn after_idle_escape() -> ReplyParser {
+    let mut parser = ReplyParser::default();
+    let mut events = Vec::new();
+    parser.feed(b"\x1b", &mut events).unwrap();
+    parser.flush_idle_esc(&mut events);
+    assert_eq!(events, vec![Event::Key(KeyCode::Esc.into())]);
+    assert!(!parser.has_pending());
+    parser
+  }
+
   #[test]
   fn every_reply_split_preserves_keyboard_input() {
     let reply =
@@ -302,6 +354,85 @@ mod tests {
     parser.flush_idle_esc(&mut events);
     assert_eq!(events, vec![Event::Key(KeyCode::Esc.into())]);
     assert!(!parser.has_pending());
+  }
+
+  #[test]
+  fn returned_escape_reframes_each_requested_reply_at_every_split() {
+    for reply in [
+      b"_Gi=123;ERROR: a q\x1b\\".as_slice(),
+      b"]10;ERROR: a q\x07",
+      b"]11;ERROR: a q\x1b\\",
+      b"]12;ERROR: a q\x07",
+      b"[4;600;800t",
+      b"[8;30;80t",
+    ] {
+      for split in 0..=reply.len() {
+        let mut parser = after_idle_escape();
+        let mut events = Vec::new();
+        let mut frames = parser.feed(&reply[..split], &mut events).unwrap();
+        frames.extend(parser.feed(&reply[split..], &mut events).unwrap());
+        assert_eq!(frames, vec![[b"\x1b".as_slice(), reply].concat()], "split {split}");
+        assert!(events.is_empty(), "reply {reply:?}, split {split}: {events:?}");
+        parser.feed("aq中".as_bytes(), &mut events).unwrap();
+        assert_eq!(events, vec![key('a'), key('q'), key('中')]);
+        assert!(!parser.has_pending());
+      }
+      let mut parser = after_idle_escape();
+      let mut events = Vec::new();
+      let mut frames = Vec::new();
+      for byte in reply {
+        frames.extend(parser.feed(&[*byte], &mut events).unwrap());
+        parser.flush_idle_esc(&mut events);
+      }
+      assert_eq!(frames.len(), 1);
+      assert!(!events.iter().any(
+        |event| matches!(event, Event::Key(key) if matches!(key.code, KeyCode::Char('a' | 'q')))
+      ));
+      assert!(!parser.has_pending());
+    }
+  }
+
+  #[test]
+  fn shadow_escape_preserves_nonquery_text_and_idle_literal_prefixes_without_alt_or_duplicates() {
+    for text in ["aq中", "[a q]", "]xaq", "_x aq", "]10xaq", "[42aq", "[", "]", "_", "]1", "[4"] {
+      for split in 0..=text.len() {
+        let mut parser = after_idle_escape();
+        let mut events = Vec::new();
+        assert!(parser.feed(&text.as_bytes()[..split], &mut events).unwrap().is_empty());
+        parser.flush_idle_esc(&mut events);
+        assert!(parser.feed(&text.as_bytes()[split..], &mut events).unwrap().is_empty());
+        parser.flush_idle_esc(&mut events);
+        let expected: Vec<_> = text.chars().map(|c| Event::Key(character(c))).collect();
+        assert_eq!(events, expected, "text {text:?}, split {split}");
+        assert!(!parser.has_pending());
+        events.clear();
+        parser.feed(b"aq", &mut events).unwrap();
+        assert_eq!(events, vec![key('a'), key('q')]);
+      }
+    }
+  }
+
+  #[test]
+  fn shadow_escape_keeps_utf8_partial_and_ctrl_c_prioritizes_unclosed_replies() {
+    let mut parser = after_idle_escape();
+    let mut events = Vec::new();
+    parser.feed(b"\xe4", &mut events).unwrap();
+    parser.flush_idle_esc(&mut events);
+    assert!(events.is_empty() && parser.has_pending());
+    parser.feed(b"\xb8\xad", &mut events).unwrap();
+    assert_eq!(events, vec![key('中')]);
+    for prefix in [b"_Gi=123;".as_slice(), b"]10;rgb:", b"[4;100;"] {
+      let mut parser = after_idle_escape();
+      let mut events = Vec::new();
+      parser.feed(prefix, &mut events).unwrap();
+      parser.flush_idle_esc(&mut events);
+      assert!(events.is_empty() && parser.has_pending());
+      parser.feed(b"\x03aq", &mut events).unwrap();
+      assert_eq!(
+        events,
+        vec![Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))]
+      );
+    }
   }
 
   #[test]

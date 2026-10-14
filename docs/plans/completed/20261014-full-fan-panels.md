@@ -1,3 +1,5 @@
+Done: 2026-10-14, PR #11
+
 # Full graphical fan panels
 
 Implement the selected deep-space cooling panels in the native terminal UI. All branches and PRs
@@ -32,7 +34,17 @@ target `Spacgithub/macmon`; `vladkens/macmon` remains a read-only upstream.
 - [x] Implement bounded terminal capability detection and safe reply handling.
 - [x] Implement owned image transmission and complete cleanup paths.
 - [x] Integrate real fan identities, adaptive cooling panels and manual/focus/visibility gating.
-- [ ] Validate output/config compatibility, resize, zero/missing RPM, terminal recovery and
+- [x] Validate output/config compatibility, resize, zero/missing RPM, terminal recovery and
       static/animated CPU, RSS and submitted-frame rate; distinguish actual Warp display checks.
-- [ ] Complete integrated reviews, required checks and feature PRs in the personal fork.
-- [ ] Refresh and verify the installed command with the previous binary retained.
+- [x] Complete integrated reviews, required checks and feature PRs in the personal fork.
+- [x] Refresh and verify the installed command with the previous binary retained.
+
+## Result
+
+Implemented the graphical fan panels through the small PR stack #6–#11. Required checks,
+257 unit/doc tests and 14 upstream-sync fixtures passed. Native private-PTY tests submitted
+about 60 frames per second per moving fan and covered controls, queue pressure, late/missing
+replies, resize, zero/missing RPM, and normal/error/aborting-panic recovery. Real rootless
+M2 Max checks preserved Network Monitoring, JSON, Prometheus and the saved configuration.
+The installed preview matches the checked release build, with the previous binary retained.
+Actual Warp GUI rendering and presentation FPS remain unverified.

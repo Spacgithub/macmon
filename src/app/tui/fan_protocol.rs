@@ -83,19 +83,19 @@ impl PendingQueries {
     let deadline = Instant::now() + timeout;
     while !self.finished() {
       let remaining = deadline.saturating_duration_since(Instant::now());
+      let remaining = self.parser.idle_wait().map_or(remaining, |idle| remaining.min(idle));
       let mut poll = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
-      let ready =
-        unsafe { libc::poll(&mut poll, 1, remaining.as_millis().min(i32::MAX as u128) as i32) };
+      let millis = remaining.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
+      let ready = unsafe { libc::poll(&mut poll, 1, millis) };
       if ready < 0 {
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
           return Err(error);
         }
       } else if ready == 0 {
-        if self.evidence.seen == ALL_REPLIES {
+        if self.parser.idle_wait().is_some_and(|idle| idle.is_zero()) {
           self.parser.flush_idle_esc(&mut events);
         }
-        break;
       } else {
         if poll.revents & libc::POLLIN == 0 {
           return Err(io::ErrorKind::UnexpectedEof.into());
@@ -443,16 +443,67 @@ mod tests {
   }
 
   #[test]
-  fn only_completed_requests_allow_idle_escape_to_become_a_key() {
+  fn completed_requests_release_idle_escape_without_waiting_for_the_full_probe() {
     let (input, mut terminal) = pipe();
     let mut bytes = replies("OK");
     bytes.push(27);
     terminal.write_all(&bytes).unwrap();
     let detected =
-      detect_fd(&mut Vec::new(), input.as_raw_fd(), Duration::from_millis(10), PROBE_ID).unwrap();
+      detect_fd(&mut Vec::new(), input.as_raw_fd(), Duration::from_millis(700), PROBE_ID).unwrap();
     assert_eq!(detected.early_events, vec![Event::Key(KeyCode::Esc.into())]);
     assert!(detected.pending.is_none());
     assert!(detected.capabilities.is_some());
+  }
+
+  #[test]
+  fn every_missing_query_still_returns_idle_escape_and_preserves_following_shortcuts() {
+    let frames = ReplyParser::default().feed(&replies("OK"), &mut Vec::new()).unwrap();
+    assert_eq!(frames.len(), 6);
+    for missing in 0..frames.len() {
+      let (input, mut terminal) = pipe();
+      for (index, frame) in frames.iter().enumerate() {
+        if index != missing {
+          terminal.write_all(frame).unwrap();
+        }
+      }
+      let detected =
+        detect_fd(&mut Vec::new(), input.as_raw_fd(), Duration::ZERO, PROBE_ID).unwrap();
+      let mut pending = detected.pending.unwrap();
+      terminal.write_all(b"\x1b").unwrap();
+      let started = Instant::now();
+      assert_eq!(
+        pending.read(Duration::from_millis(700)).unwrap(),
+        vec![Event::Key(KeyCode::Esc.into())]
+      );
+      assert!(started.elapsed() < Duration::from_millis(100), "missing {missing}");
+      assert!(!pending.finished());
+      terminal.write_all("aq中".as_bytes()).unwrap();
+      assert_eq!(
+        pending.read(Duration::from_millis(700)).unwrap(),
+        vec![key('a'), key('q'), key('中')]
+      );
+      assert!(!pending.finished());
+      terminal.write_all(&frames[missing]).unwrap();
+      assert!(pending.read(Duration::from_millis(20)).unwrap().is_empty());
+      assert!(pending.finished());
+    }
+  }
+
+  #[test]
+  fn idle_literal_bracket_returns_before_the_query_deadline_and_retains_a_late_prefix() {
+    let (input, mut terminal) = pipe();
+    terminal.write_all(b"\x1b").unwrap();
+    let detected =
+      detect_fd(&mut Vec::new(), input.as_raw_fd(), Duration::from_millis(700), PROBE_ID).unwrap();
+    assert_eq!(detected.early_events, vec![Event::Key(KeyCode::Esc.into())]);
+    let mut pending = detected.pending.unwrap();
+    terminal.write_all(b"[").unwrap();
+    let started = Instant::now();
+    assert_eq!(pending.read(Duration::from_millis(700)).unwrap(), vec![key('[')]);
+    assert!(started.elapsed() < Duration::from_millis(100));
+    terminal.write_all(b"4;600;800taq").unwrap();
+    assert_eq!(pending.read(Duration::from_millis(700)).unwrap(), vec![key('a'), key('q')]);
+    assert!(!pending.finished());
   }
 
   #[test]

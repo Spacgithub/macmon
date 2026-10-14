@@ -173,6 +173,8 @@ mod fan_preview {
     let animate = animation == "on";
     let exit = std::env::var("MACMON_FAN_PREVIEW_EXIT").unwrap_or_else(|_| "quit".into());
     assert!(["quit", "error", "panic"].contains(&exit.as_str()));
+    let fault_delay = std::env::var("MACMON_FAN_PREVIEW_FAULT_MSEC")
+      .ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(1000).clamp(1, 2000);
     let minimum = if exit == "quit" { 1 } else { 2 };
     let seconds = std::env::var("MACMON_FAN_PREVIEW_SECONDS")
       .ok()
@@ -225,7 +227,7 @@ mod fan_preview {
           if super::super::TERM_ACTIVE.load(Ordering::SeqCst) {
             active_since.get_or_insert(now);
           }
-          if active_since.is_some_and(|active| now.duration_since(active) >= Duration::from_secs(1))
+          if active_since.is_some_and(|active| now.duration_since(active) >= Duration::from_millis(fault_delay))
           {
             if exit == "error" {
               let _ = tx.send(Event::Failed(SYNTHETIC_FAULT.into()));

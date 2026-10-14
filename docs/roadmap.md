@@ -114,7 +114,7 @@ what we need.
       visibility/focus gating, real RPM and measured resource cost.
       Plan: [docs/plans/completed/20261014-deep-space-console.md](plans/completed/20261014-deep-space-console.md).
 
-- [ ] **19. Add full graphical cooling panels.** Seven curved, shaded blades per real fan,
+- [x] **19. Add full graphical cooling panels.** Seven curved, shaded blades per real fan,
       independent 60 FPS image updates and the existing manual switch, with terminal capability
       detection, adaptive placement, owned image cleanup and measured resource cost.
-      Plan: [docs/plans/20261014-full-fan-panels.md](plans/20261014-full-fan-panels.md).
+      Plan: [docs/plans/completed/20261014-full-fan-panels.md](plans/completed/20261014-full-fan-panels.md).

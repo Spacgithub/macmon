@@ -80,7 +80,7 @@ fn enter_term() -> WithError<(Terminal<CrosstermBackend<Stdout>>, TermGuard)> {
 
 /// Restores the terminal once, whichever comes first: the normal exit, an error return or a panic.
 fn leave_term() {
-  restore_term_once(&TERM_ACTIVE, &mut stdout(), terminal::disable_raw_mode);
+  restore_term_once(&TERM_ACTIVE, &mut stdout().lock(), terminal::disable_raw_mode);
 }
 
 /// Turns mouse capture and focus reports off, leaves the alternate screen, shows the cursor
@@ -671,8 +671,13 @@ impl App {
   }
 
   fn draw_fan_images(&mut self, images: &mut FanImages, moving_only: bool) -> io::Result<()> {
+    // Keep complete image sequences atomic with the panic hook's terminal restoration.
+    let mut out = stdout().lock();
+    if !TERM_ACTIVE.load(Ordering::SeqCst) {
+      return Ok(());
+    }
     if !self.graphics_visible() {
-      return images.hide(&mut stdout());
+      return images.hide(&mut out);
     }
     let caps = self.capabilities.unwrap();
     let side = self.placements[0].side;
@@ -682,7 +687,7 @@ impl App {
     for (slot, (image, place)) in self.cooling.items().iter().zip(&self.placements).enumerate() {
       if !moving_only || image.rotor.moving() {
         let r = place.image;
-        images.render(&mut stdout(), &image.rgba, side, slot, (r.x, r.y), (r.width, r.height))?;
+        images.render(&mut out, &image.rgba, side, slot, (r.x, r.y), (r.width, r.height))?;
       }
     }
     Ok(())
@@ -741,7 +746,7 @@ impl App {
     let (mut term, _guard) = enter_term()?;
     let mut images = FanImages::new().ok();
     let detection = if let Some(images) = &mut images {
-      Some(fan_protocol::detect(&mut stdout(), images)?)
+      Some(fan_protocol::detect(&mut stdout().lock(), images)?)
     } else {
       None
     };
@@ -769,26 +774,32 @@ impl App {
         if (self.help.is_some() || next != self.placements)
           && let Some(images) = &mut images
         {
-          images.hide(&mut stdout())?;
+          images.hide(&mut stdout().lock())?;
         }
-        term.draw(|f| self.render(f))?;
-        mouse = set_mouse_capture(&mut stdout(), mouse, self.wants_mouse())?;
+        {
+          let _output = stdout().lock();
+          if !TERM_ACTIVE.load(Ordering::SeqCst) {
+            return Ok(());
+          }
+          term.draw(|f| self.render(f))?;
+          mouse = set_mouse_capture(&mut stdout(), mouse, self.wants_mouse())?;
+        }
         if let Some(images) = &mut images {
           self.draw_fan_images(images, false)?;
         }
       }
       let active = images.is_some() && self.fan_frames_active();
       clock.set_active(active, Instant::now());
+      if let Some(delta) = clock.frame(Instant::now()) {
+        self.cooling.frame(delta);
+        if let Some(images) = &mut images {
+          self.draw_fan_images(images, true)?;
+        }
+      }
       let event = if let Some(wait) = clock.wait(Instant::now()) {
         match rx.recv_timeout(wait) {
           Ok(event) => event,
           Err(mpsc::RecvTimeoutError::Timeout) => {
-            if let Some(delta) = clock.frame(Instant::now()) {
-              self.cooling.frame(delta);
-              if let Some(images) = &mut images {
-                self.draw_fan_images(images, true)?;
-              }
-            }
             redraw = false;
             continue;
           }
