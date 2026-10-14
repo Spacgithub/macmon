@@ -1,3 +1,5 @@
+Done: 2026-10-13, PR #1
+
 # Per-interface network monitoring
 
 Add the requested per-interface network view to the personal fork, `Spacgithub/macmon`.
@@ -38,4 +40,14 @@ The feature uses a `feat/network-monitor` branch and a pull request in that fork
 - [x] Add the TUI network panel and focused narrow/short terminal rendering tests.
 - [x] Add Prometheus counters/gauges, compatibility tests, and user documentation.
 - [x] Run `make check`, `make test`, and rootless `pipe`/HTTP/TUI runtime validation.
-- [ ] Review the integrated diff and open the pull request only in the personal fork.
+- [x] Review the integrated diff and open the pull request only in the personal fork.
+
+## Result
+
+Added 210 production Rust lines, excluding tests, with no new dependencies. The TUI, JSON,
+Rust library, and Prometheus exporter expose per-interface rates and cumulative 64-bit bytes.
+Existing metric names and configuration fields remain compatible.
+
+`make check`, all 187 tests, and the final Codex source review passed. Rootless runtime checks
+on M2 Max / macOS 15.6.1 covered 21 interfaces, native counter comparisons above 4 GiB,
+HTTP output, three terminal sizes, normal quit, and terminal restoration.
