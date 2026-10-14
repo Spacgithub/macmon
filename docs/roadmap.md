@@ -72,6 +72,11 @@ POWER does today.
       Plan (first PR): [docs/plans/completed/20261012-vm-start.md](plans/completed/20261012-vm-start.md).
       Plan (second PR): [docs/plans/completed/20261012-vm-power.md](plans/completed/20261012-vm-power.md).
 
+- [x] **13. Per-interface network monitoring.** Real-time receive/transmit rates and cumulative
+      byte counters without sudo, in the TUI, JSON, Rust library, and Prometheus exporter.
+      Keep interfaces separate to avoid double-counting VPN or bridge traffic.
+      Plan: [docs/plans/completed/20261013-network-monitor.md](plans/completed/20261013-network-monitor.md).
+
 Later, only on request: automatic grouping of an app's processes (filter terms with totals
 cover the known-app case), per-process network (only `nettop` has it without root), history
 graphs per process, Activity Monitor's Memory and Statistics tabs (context switches, faults,
@@ -89,3 +94,7 @@ what we need.
       with checks and a PR in `Spacgithub/macmon`; sync PRs preserve upstream history, and
       inherited publication jobs remain restricted to the original repository.
       Plan: [docs/plans/completed/20261013-upstream-sync.md](plans/completed/20261013-upstream-sync.md).
+
+- [ ] **15. Complete the first upstream sync with Network Monitoring preserved.** Integrate
+      upstream VM improvements, coordinate the network layout, and validate the combined fork.
+      Plan: [docs/plans/20261014-first-upstream-sync.md](plans/20261014-first-upstream-sync.md).

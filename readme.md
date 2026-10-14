@@ -21,6 +21,7 @@
 - ⚡ Real-time CPU / GPU / ANE power usage
 - 📊 CPU frequency-scaled and active ratios per cluster
 - 💾 RAM / Swap usage
+- 🌐 Per-interface network receive/transmit rates and cumulative traffic
 - 📈 Historical charts with average and max values
 - 🌡️ Average CPU / GPU temperature
 - 📋 Process list with per-process CPU, memory, power and GPU usage
@@ -206,6 +207,29 @@ The working rootless workaround we found is to read hidden energy reports from t
 
 Both the CLI and the Rust library use known CLPC counters automatically, and `Sampler::new()` retains legacy fallbacks for older systems. New chips or driver versions may need additional mappings. On an unsupported configuration, zero CPU/ANE readings can mean unavailable counters rather than zero consumption. See [docs/clpc-discovery.md](docs/clpc-discovery.md) for details.
 
+### Network monitoring
+
+The TUI shows receive and transmit rates and cumulative byte counters for each network
+interface that is up, excluding loopback. The compact panel shows the busiest interfaces;
+`pipe`, HTTP `/json`, and Prometheus export every sampled interface. Rates use the measured
+time between snapshots, including time between calls to the Rust sampler.
+
+```sh
+macmon pipe -s 5 | jq '.network'
+```
+
+`network` is an array of interface metrics, or `null` if the network source is unavailable.
+Rates are bytes per second; a rate is `null` until an interface has two usable samples, or
+when its counter decreases. Cumulative bytes come from the kernel and can reset when an
+interface restarts. The TUI uses binary byte units (KiB, MiB, GiB). VPN and bridge interfaces
+are reported separately: adding their traffic to a physical interface can count the same
+data twice.
+
+The public macOS interface MIB supplies 64-bit counters without sudo. Prometheus exposes
+`macmon_network_receive_bytes_total` and `macmon_network_transmit_bytes_total` counters, plus
+`macmon_network_receive_bytes_per_second` and `macmon_network_transmit_bytes_per_second`
+gauges, labeled by `interface`. Unavailable rates have no gauge series for that sample.
+
 ### Output format
 
 The `pipe` command and the HTTP `/json` endpoint return the same metrics. In a macOS VM (`"vm": true` in the `soc` object of `pipe --soc-info` and `/json`) power and frequencies read 0, temperatures `null` and fans are empty:
@@ -229,6 +253,15 @@ The `pipe` command and the HTTP `/json` endpoint return the same metrics. In a m
   "fans": [
     { "name": "fan0", "rpm": 999, "max_rpm": 4900 },
     { "name": "fan1", "rpm": 1200, "max_rpm": 5200 },
+  ],
+  "network": [ // Interfaces that are up, excluding loopback; null if unavailable
+    {
+      "name": "en0",
+      "rx_bytes": 18349147606, // Cumulative received bytes
+      "tx_bytes": 1852839321, // Cumulative transmitted bytes
+      "rx_bytes_per_sec": 65536.0, // Bytes/s, null without a usable baseline
+      "tx_bytes_per_sec": 4096.0, // Bytes/s, null without a usable baseline
+    },
   ],
   "cpu_scaled_ratio": 0.036854, // Combined frequency-scaled CPU ratio (weighted by core count, 0–1)
   "cpu_active_ratio": 0.092, // Combined active residency ratio (not frequency-scaled, weighted by core count, 0–1)
