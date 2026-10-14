@@ -120,7 +120,9 @@ enum Event {
   Mouse(MouseEvent),
   /// The terminal window lost focus.
   FocusLost,
-  /// Redraw: the periodic tick, and a resize, so the mouse targets follow the new layout at once.
+  /// A resized terminal needs fresh layout and mouse targets even without a sample.
+  Resize,
+  /// Input-thread heartbeat; no display data changed.
   Tick,
 }
 
@@ -141,7 +143,7 @@ fn input_event(event: event::Event) -> Option<Event> {
       action.then_some(Event::Mouse(mouse))
     }
     event::Event::FocusLost => Some(Event::FocusLost),
-    event::Event::Resize(..) => Some(Event::Tick),
+    event::Event::Resize(..) => Some(Event::Resize),
     _ => None,
   }
 }
@@ -355,6 +357,14 @@ impl App {
     self.gpu_temp.push(data.temp.gpu_temp_avg);
     self.fans.push(data.fans);
     self.network = data.network;
+    if let Some(metrics) = &mut self.network {
+      let busy =
+        |x: &NetworkMetric| x.rx_bytes_per_sec.unwrap_or(0.0) + x.tx_bytes_per_sec.unwrap_or(0.0);
+      let total = |x: &NetworkMetric| u128::from(x.rx_bytes) + u128::from(x.tx_bytes);
+      metrics.sort_by(|a, b| {
+        busy(b).total_cmp(&busy(a)).then_with(|| total(b).cmp(&total(a))).then(a.name.cmp(&b.name))
+      });
+    }
 
     self.mem.push(data.memory);
   }
@@ -415,12 +425,21 @@ impl App {
         self.info.iter_mut().for_each(|info| info.typing = false);
         return ControlFlow::Continue(());
       }
-      Event::Tick => return ControlFlow::Continue(()),
+      Event::Tick | Event::Resize => return ControlFlow::Continue(()),
       Event::Failed(_) => return ControlFlow::Break(()),
     };
 
     *msec.write().unwrap() = self.cfg.interval();
     flow
+  }
+
+  /// Processes an event and tells the loop whether the screen can have changed.
+  fn apply_event(&mut self, event: Event, msec: &RwLock<u32>) -> WithError<ControlFlow<(), bool>> {
+    if let Event::Failed(err) = event {
+      return Err(err.into());
+    }
+    let redraw = !matches!(event, Event::Tick);
+    Ok(self.handle_event(event, msec).map_continue(|()| redraw))
   }
 
   /// Applies a key press to the app state. Returns `Break` when the app should quit. The help
@@ -569,15 +588,16 @@ impl App {
     self.three_level_bars = theme::detect_three_level_bars();
 
     let mut mouse = false;
+    let mut redraw = true;
     loop {
-      term.draw(|f| self.render(f))?;
-      mouse = set_mouse_capture(&mut stdout(), mouse, self.wants_mouse())?;
-      let event = rx.recv()?;
-      if let Event::Failed(err) = event {
-        return Err(err.into());
+      if redraw {
+        term.draw(|f| self.render(f))?;
+        mouse = set_mouse_capture(&mut stdout(), mouse, self.wants_mouse())?;
       }
-      if self.handle_event(event, &msec).is_break() {
-        break;
+      let event = rx.recv()?;
+      match self.apply_event(event, &msec)? {
+        ControlFlow::Continue(changed) => redraw = changed,
+        ControlFlow::Break(()) => break,
       }
     }
 
@@ -614,6 +634,155 @@ mod tests {
   use crate::config::{Config, ProcSort, RatioMode, TUI_MAX_MS, TUI_MIN_MS, TempConfig, ViewType};
   use crate::fds::{Kind, OpenFile};
   use crate::procs::ProcInfo;
+
+  include!("ui_preview.rs");
+
+  #[test]
+  fn idle_heartbeats_do_not_draw_but_samples_and_resize_do() {
+    let mut app = network_app();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let interval = RwLock::new(1000);
+    let mut frames = 1;
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    for _ in 0..10 {
+      let mut events = vec![Event::Tick, Event::Tick, Event::Tick, Event::Tick];
+      events.push(Event::Update(Box::new(test_metrics())));
+      let showing = app.procs_shown.showing().unwrap();
+      events.push(Event::Procs { showing, procs: test_procs() });
+      for event in events {
+        if app.apply_event(event, &interval).unwrap() == ControlFlow::Continue(true) {
+          terminal.draw(|frame| app.render(frame)).unwrap();
+          frames += 1;
+        }
+      }
+    }
+    assert_eq!(frames, 21); // old loop: initial frame plus all 60 events
+    assert_eq!(app.cfg.interval(), 1000);
+    assert_eq!(app.proc_view.procs().unwrap().len(), 3);
+    let resized = super::input_event(ratatui::crossterm::event::Event::Resize(60, 18)).unwrap();
+    assert!(matches!(resized, Event::Resize));
+    assert_eq!(app.apply_event(resized, &interval).unwrap(), ControlFlow::Continue(true));
+  }
+
+  #[test]
+  fn resize_without_a_sample_updates_layout_and_process_showing() {
+    for vm in [false, true] {
+      let mut app = network_app();
+      app.soc.vm = vm;
+      let mut app = with_procs(app, test_procs());
+      let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+      let interval = RwLock::new(10_000);
+      terminal.draw(|frame| app.render(frame)).unwrap();
+      let previous = app.procs_shown.showing().unwrap();
+      for (width, height, visible) in [(60, 18, false), (80, 24, true)] {
+        terminal.backend_mut().resize(width, height);
+        assert_eq!(app.apply_event(Event::Resize, &interval).unwrap(), ControlFlow::Continue(true));
+        let buf = terminal.draw(|frame| app.render(frame)).unwrap().buffer.clone();
+        assert_eq!(buf.area, Rect::new(0, 0, width, height));
+        assert_eq!(app.procs_visible(), visible);
+        assert!(app.proc_view.procs().is_none());
+        let network = app.layout(buf.area).network.unwrap();
+        assert!(network.right() <= width && network.bottom() <= height);
+        assert!(row(&buf, network.y + 1).contains("↓ RX/s"));
+      }
+      let current = app.procs_shown.showing().unwrap();
+      assert_ne!(current, previous);
+      assert!(
+        app
+          .apply_event(Event::Procs { showing: previous, procs: test_procs() }, &interval)
+          .unwrap()
+          .is_continue()
+      );
+      assert!(app.proc_view.procs().is_none());
+      assert!(
+        app
+          .apply_event(Event::Procs { showing: current, procs: test_procs() }, &interval)
+          .unwrap()
+          .is_continue()
+      );
+      assert_eq!(app.proc_view.procs().unwrap().len(), 3);
+    }
+  }
+
+  #[test]
+  fn redraw_gate_preserves_focus_quit_and_sampler_errors() {
+    let mut app = with_procs(network_app(), test_procs());
+    let interval = RwLock::new(1000);
+    assert_eq!(
+      app.apply_event(Event::Key(key('/')), &interval).unwrap(),
+      ControlFlow::Continue(true)
+    );
+    assert!(app.proc_view.typing());
+    assert_eq!(app.apply_event(Event::FocusLost, &interval).unwrap(), ControlFlow::Continue(true));
+    assert!(!app.proc_view.typing());
+    assert_eq!(app.apply_event(Event::Key(key('q')), &interval).unwrap(), ControlFlow::Break(()));
+    assert_eq!(
+      app.apply_event(Event::Failed("sampling failed".into()), &interval).unwrap_err().to_string(),
+      "sampling failed"
+    );
+  }
+
+  #[test]
+  fn incoming_samples_reorder_network_without_mutating_it_during_render() {
+    let mut app = network_app();
+    assert_eq!(app.network.as_ref().unwrap()[0].name, "en0");
+    let mut metrics = test_metrics();
+    let mut network = app.network.clone().unwrap();
+    network.iter_mut().find(|m| m.name == "utun0").unwrap().rx_bytes_per_sec = Some(10_000_000.0);
+    metrics.network = Some(network);
+    app.update_metrics(metrics);
+    assert_eq!(app.network.as_ref().unwrap()[0].name, "utun0");
+    let order: Vec<_> = app.network.as_ref().unwrap().iter().map(|m| m.name.clone()).collect();
+    for (width, height) in [(80, 24), (60, 18), (200, 50)] {
+      let buf = render_buffer(&mut app, width, height);
+      let rect = app.layout(buf.area).network.unwrap();
+      assert!(row(&buf, rect.y + 2).contains("utun0"));
+    }
+    assert_eq!(
+      app.network.as_ref().unwrap().iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+      order
+    );
+  }
+
+  #[test]
+  fn network_rates_have_direction_colors_alignment_and_unknown_values() {
+    let mut app = network_app();
+    let buf = render_buffer(&mut app, 80, 24);
+    let rect = app.layout(buf.area).network.unwrap();
+    let first = row(&buf, rect.y + 2);
+    let x = x_of(&first, "1.0 MiB/s");
+    assert_eq!(buf[(x, rect.y + 2)].fg, theme::DOWNLOAD);
+    assert!(buf[(x, rect.y + 2)].modifier.contains(Modifier::BOLD));
+    let second = row(&buf, rect.y + 3);
+    let y = rect.y + 3;
+    assert_eq!(buf[(x_of(&second, "—"), y)].fg, theme::DIM);
+    assert!(row(&buf, rect.y + 1).contains("↓ RX/s"));
+    assert!(row(&buf, rect.y + 1).contains("↑ TX/s"));
+    // Both receive values end at the same column despite having different widths.
+    assert_eq!(
+      x + "1.0 MiB/s".chars().count() as u16,
+      x_of(&second, "512.0 B/s") + "512.0 B/s".chars().count() as u16
+    );
+  }
+
+  #[test]
+  fn metric_accents_keep_small_window_corners_and_units() {
+    let mut app = network_app();
+    for (width, height) in [(80, 24), (60, 18), (120, 40), (5, 3), (1, 1)] {
+      let buf = render_buffer(&mut app, width, height);
+      let plan = app.layout(buf.area);
+      for (_, rect) in plan.boxes {
+        if rect.width >= 2 && rect.height >= 2 {
+          assert_eq!(buf[(rect.x, rect.y)].symbol(), "╭");
+          assert_eq!(buf[(rect.right() - 1, rect.bottom() - 1)].symbol(), "╯");
+        }
+      }
+      if width == 80 {
+        let screen = screen_text(&buf);
+        assert!(screen.contains("1.0 TiB") && screen.contains("1.0 MiB/s"));
+      }
+    }
+  }
 
   fn key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -1406,7 +1575,11 @@ mod tests {
     app.update_metrics(Metrics { cpu_tiers, ..test_metrics() });
 
     let buf = render_buffer(&mut app, 200, 50);
-    assert!(row(&buf, 0).starts_with("╭─ Apple M6 (6E+4P+2S+12GPU 32GB) ─"), "{}", row(&buf, 0));
+    assert!(
+      row(&buf, 0).starts_with("╭─ macmon / Apple M6 (6E+4P+2S+12GPU 32GB) ─"),
+      "{}",
+      row(&buf, 0)
+    );
     let screen = screen_text(&buf);
     for title in ["E-CPU 71% @ 2940 MHz", "P-CPU 25% @ 2394 MHz", "S-CPU 50% @ 4776 MHz"] {
       assert!(screen.contains(&format!("╭─ {title} ─")), "missing {title}");
@@ -1431,7 +1604,11 @@ mod tests {
     let app = &mut with_procs(app, varied_procs());
 
     let buf = render_buffer(app, 200, 50);
-    assert!(row(&buf, 0).starts_with("╭─ Apple M2 (Virtual) (4CPU 8GB) ─"), "{}", row(&buf, 0));
+    assert!(
+      row(&buf, 0).starts_with("╭─ macmon / Apple M2 (Virtual) (4CPU 8GB) ─"),
+      "{}",
+      row(&buf, 0)
+    );
     let screen = screen_text(&buf);
     for title in ["CPU 63% ─", "GPU 0% ─"] {
       assert!(screen.contains(&format!("╭─ {title}")), "missing {title}");
@@ -1475,9 +1652,11 @@ mod tests {
       assert!(screen.contains(&format!("╭─ {title} ─")), "missing {title}");
     }
     // the chip with its core counts left on the metrics box, the version right
-    let version = format!("─ macmon v{} ─╮", env!("CARGO_PKG_VERSION"));
+    let version = format!("─ v{} ─╮", env!("CARGO_PKG_VERSION"));
     let top = row(&buf, 0);
-    assert!(top.starts_with("╭─ Apple M3 Pro (6E+6P+18GPU 36GB) ─") && top.ends_with(&version));
+    assert!(
+      top.starts_with("╭─ macmon / Apple M3 Pro (6E+6P+18GPU 36GB) ─") && top.ends_with(&version)
+    );
     // whole-degree temperatures right on the CPU / GPU power boxes, none for ANE
     assert!(box_top(&app, &buf, Metric::CpuPower).ends_with("─ 45°C ─╮"));
     assert!(box_top(&app, &buf, Metric::GpuPower).ends_with("─ 40°C ─╮"));
@@ -1485,6 +1664,47 @@ mod tests {
     // nothing right on the total power box; no summary on the bottom border of the metrics box
     assert!(box_top(&app, &buf, Metric::TotalPower).ends_with("───╮"));
     assert_eq!(row(&buf, PROC_Y - 1), format!("╰{}╯", "─".repeat(198)));
+  }
+
+  #[test]
+  fn hardware_header_drops_complete_components_at_narrow_widths() {
+    let mut app = test_app();
+    for width in [200, 80, 60, 45, 30, 18, 8] {
+      let buf = render_buffer(&mut app, width, 50);
+      let top = row(&buf, 0);
+      assert_eq!(top.contains('('), top.contains("(6E+6P+18GPU 36GB)"), "{top}");
+      if top.contains("macmon") {
+        assert!(top.contains("macmon / Apple M3 Pro"), "{top}");
+      }
+      if width >= 18 {
+        assert!(top.contains("Apple M3 Pro"), "{top}");
+      }
+    }
+    let mut app = App::default();
+    let top = row(&render_buffer(&mut app, 80, 24), 0);
+    assert!(top.contains("macmon") && !top.contains("macmon / macmon"), "{top}");
+  }
+
+  #[test]
+  fn wide_network_tables_align_to_the_panel_and_keep_units_secondary() {
+    let mut app = network_app();
+    for width in [80, 120, 200] {
+      let buf = render_buffer(&mut app, width, 50);
+      let area = app.layout(buf.area).network.unwrap();
+      let y = area.y + 2;
+      let first = row(&buf, y);
+      assert_eq!(x_of(&first, "en0"), area.x + 2);
+      assert_eq!(x_of(&first, "1.0 GiB") + 7, area.right() - 2);
+      let number = x_of(&first, "1.0 MiB/s");
+      assert_eq!(buf[(number, y)].fg, theme::DOWNLOAD);
+      assert!(buf[(number, y)].modifier.contains(Modifier::BOLD));
+      let unit = number + 4;
+      assert_eq!(buf[(unit, y)].fg, theme::DIM);
+      assert!(!buf[(unit, y)].modifier.contains(Modifier::BOLD));
+      let header = row(&buf, area.y + 1);
+      assert_eq!(buf[(x_of(&header, "↓ RX/s"), area.y + 1)].fg, theme::DOWNLOAD);
+      assert_eq!(buf[(x_of(&header, "↑ TX/s"), area.y + 1)].fg, theme::UPLOAD);
+    }
   }
 
   #[test]
@@ -1520,6 +1740,34 @@ mod tests {
     let buf = render_buffer(&mut app, 200, 50);
     let top = box_top(&app, &buf, Metric::TotalPower);
     assert!(top.starts_with("╭─ Power 6.60W (6.60, 6.60) ───"), "{top}");
+  }
+
+  #[test]
+  fn narrow_power_titles_keep_whole_values_and_units() {
+    let mut app = test_app_with(|m| {
+      m.cpu_power = 7.43;
+      m.gpu_power = 3.86;
+      m.ane_power = 0.50;
+      m.sys_power = 21.29;
+    });
+    let buf = render_buffer(&mut app, 60, 18);
+    for (metric, title) in [
+      (Metric::CpuPower, "CPU 7.4W"),
+      (Metric::GpuPower, "GPU 3.86W"),
+      (Metric::AnePower, "ANE 0.5W"),
+      (Metric::TotalPower, "Total 21W"),
+    ] {
+      let top = box_top(&app, &buf, metric);
+      assert!(top.contains(&format!(" {title} ")), "{top}");
+    }
+    let buf = render_buffer(&mut app, 58, 18);
+    assert!(box_top(&app, &buf, Metric::TotalPower).contains(" Tot 21W "));
+    assert!(box_top(&app, &buf, Metric::GpuPower).contains(" GPU 3.9W "));
+    let buf = render_buffer(&mut app, 46, 18);
+    for metric in [Metric::CpuPower, Metric::GpuPower, Metric::AnePower, Metric::TotalPower] {
+      let top = box_top(&app, &buf, metric);
+      assert!(!top.contains(|c: char| c.is_ascii_digit()), "{top}");
+    }
   }
 
   #[test]
@@ -1589,6 +1837,13 @@ mod tests {
     // load values on the gradient
     let cpu = x_of(&proc_row(&buf, 2), "25.0");
     assert_eq!(buf[(cpu, PROC_Y + 2)].fg, gradient(0.25));
+    assert!(buf[(cpu, PROC_Y + 2)].modifier.contains(Modifier::BOLD));
+    let body = proc_row(&buf, 2);
+    let name = x_of(&body, "WindowServer");
+    assert!(buf[(name, PROC_Y + 2)].modifier.contains(Modifier::BOLD));
+    for metadata in ["631", "vlad"] {
+      assert_eq!(buf[(x_of(&body, metadata), PROC_Y + 2)].fg, theme::DIM);
+    }
   }
 
   #[test]
@@ -1600,13 +1855,13 @@ mod tests {
     let wide = title(&mut app, 200);
     assert!(wide.starts_with("╭─ proc 3 ─ / filter ─ sort ───"), "{wide}");
     assert!(wide.ends_with("─ info | finder | copy | kill ─╮"), "{wide}");
-    // the count bold and plain, the hint keys cyan, their labels faint, the separators dim
+    // section name emphasized, count secondary, hint keys cyan and labels faint
     let buf = render_buffer(&mut app, 200, 50);
     let style = |text| {
       let cell = &buf[(x_of(&wide, text), PROC_Y)];
       (cell.fg, cell.modifier)
     };
-    let (bold, plain) = ((theme::TEXT, Modifier::BOLD), (theme::TEXT, Modifier::empty()));
+    let (bold, plain) = ((theme::SECTION, Modifier::BOLD), (theme::DIM, Modifier::empty()));
     let (cyan, faint) = ((theme::KEY, Modifier::empty()), (theme::TEXT, Modifier::DIM));
     let sep = (theme::DIM, Modifier::empty());
     let cells = ["proc", " 3", "/ ", " filter", "sort", "ort", "info", "nfo", " | "];

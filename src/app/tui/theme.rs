@@ -12,9 +12,17 @@ pub(super) const BORDER: Color = Color::DarkGray;
 pub(super) const DIM: Color = Color::DarkGray;
 /// Titles and text: the terminal's default foreground.
 pub(super) const TEXT: Color = Color::Reset;
-/// The key in a hint or a button: cyan (ANSI 6), which no value uses (green, yellow and red are
-/// load, blue is links).
+/// Keys in hints and buttons: cyan (ANSI 6).
 pub(super) const KEY: Color = Color::Cyan;
+/// Brand and panel names share one restrained accent.
+pub(super) const SECTION: Color = Color::Cyan;
+/// Quiet, consistent accents; load and temperature values still use the warning gradient.
+pub(super) const CPU: Color = Color::Cyan;
+pub(super) const GPU: Color = Color::Magenta;
+pub(super) const MEMORY: Color = Color::Blue;
+pub(super) const POWER: Color = Color::Green;
+pub(super) const DOWNLOAD: Color = CPU;
+pub(super) const UPLOAD: Color = GPU;
 /// Selected process row: reverse video over the default colors, so the row reads as one bar
 /// instead of reversing each load color in it.
 pub(super) const SELECTED: Style = Style::new().fg(TEXT).add_modifier(Modifier::REVERSED);
@@ -26,6 +34,10 @@ const YELLOW_MAX: f64 = 2.0 / 3.0;
 /// Box or metric name: bold, in the default color.
 pub(super) fn heading<'a>(text: impl Into<Cow<'a, str>>) -> Span<'a> {
   Span::styled(text, Style::new().fg(TEXT).add_modifier(Modifier::BOLD))
+}
+
+pub(super) fn value<'a>(text: impl Into<Cow<'a, str>>, color: Color) -> Span<'a> {
+  Span::styled(text, Style::new().fg(color).add_modifier(Modifier::BOLD))
 }
 
 /// Text in the default color. The color is set, not left out, so text drawn over a border doesn't
@@ -65,6 +77,15 @@ pub(super) fn gradient(t: f64) -> Color {
   } else {
     Color::Red
   }
+}
+
+/// Calm chart accents retain the hot-load warning of the original history graphs.
+pub(super) fn graph_color(accent: Color, load: f64) -> Color {
+  if load > YELLOW_MAX { Color::Red } else { accent }
+}
+
+pub(super) fn history_emphasis(newest: bool, color: Color) -> Modifier {
+  if newest || color == Color::Red { Modifier::BOLD } else { Modifier::DIM }
 }
 
 /// True in Apple Terminal (`TERM_PROGRAM`), which draws gaps between the eighth blocks, so graph

@@ -98,3 +98,13 @@ what we need.
 - [x] **15. Complete the first upstream sync with Network Monitoring preserved.** Integrate
       upstream VM improvements, coordinate the network layout, and validate the combined fork.
       Plan: [docs/plans/completed/20261014-first-upstream-sync.md](plans/completed/20261014-first-upstream-sync.md).
+
+- [x] **16. Polish the terminal UI while avoiding unchanged redraws.** Add terminal-theme metric
+      accents and aligned network values, retain complete narrow power titles, and redraw on
+      resize, input or fresh data while preserving Network Monitoring and VM behavior.
+      Plan: [docs/plans/completed/20261014-ui-polish.md](plans/completed/20261014-ui-polish.md).
+
+- [x] **17. Refine the terminal dashboard hierarchy.** Separate brand and hardware metadata,
+      emphasize values over units, align wide tables and keep the latest sample prominent.
+      Continue PR #4 with the existing sampling, controls and terminal-theme compatibility.
+      Plan: [docs/plans/completed/20261014-ui-refinement.md](plans/completed/20261014-ui-refinement.md).

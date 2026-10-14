@@ -7,10 +7,10 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
-use super::theme::gradient;
+use super::theme::{gradient, graph_color, history_emphasis};
 
 /// Bar heights in one row: `▁` (1/8) up to `█` (8/8).
 const BAR_LEVELS: u64 = 8;
@@ -56,19 +56,27 @@ pub(super) struct Graph<'a> {
   data: &'a [u64],
   max: Option<u64>,
   color: Option<Color>,
+  warn_hot: bool,
+  emphasis: bool,
   three_levels: bool,
 }
 
 impl<'a> Graph<'a> {
   /// Graph scaled to its largest visible sample, each bar in its load color.
   pub(super) fn new(data: &'a [u64]) -> Self {
-    Self { data, max: None, color: None, three_levels: false }
+    Self { data, max: None, color: None, warn_hot: false, emphasis: false, three_levels: false }
   }
 
   /// Bars in three levels (blank, `▄`, `█`) instead of eighths, for Apple Terminal, which draws
   /// gaps between the eighth blocks.
   pub(super) fn three_levels(mut self, three_levels: bool) -> Self {
     self.three_levels = three_levels;
+    self
+  }
+
+  /// Distinguish the current sample from older history, retaining prominent warnings.
+  pub(super) fn emphasis(mut self) -> Self {
+    self.emphasis = true;
     self
   }
 
@@ -81,6 +89,14 @@ impl<'a> Graph<'a> {
   /// Draws every bar in `color` instead of its load color.
   pub(super) fn color(mut self, color: Color) -> Self {
     self.color = Some(color);
+    self.warn_hot = false;
+    self
+  }
+
+  /// An accent below the hot-load threshold, red above it.
+  pub(super) fn accent(mut self, color: Color) -> Self {
+    self.color = Some(color);
+    self.warn_hot = true;
     self
   }
 }
@@ -97,7 +113,12 @@ impl Widget for Graph<'_> {
     let levels = u64::from(area.height) * BAR_LEVELS;
     for (x, &value) in (area.left()..area.right()).rev().zip(visible) {
       let mut level = bar_level(value, max, levels);
-      let color = self.color.unwrap_or_else(|| gradient(value as f64 / max as f64));
+      let load = value as f64 / max as f64;
+      let color = match self.color {
+        Some(accent) if self.warn_hot => graph_color(accent, load),
+        Some(color) => color,
+        None => gradient(load),
+      };
       for y in (area.top()..area.bottom()).rev() {
         if level == 0 {
           break;
@@ -107,6 +128,13 @@ impl Widget for Graph<'_> {
         let symbol = bar_symbol(eighths, self.three_levels);
         if symbol != ' ' {
           buf[(x, y)].set_char(symbol).set_fg(color);
+          if self.emphasis {
+            buf[(x, y)].set_style(
+              Style::new()
+                .remove_modifier(Modifier::BOLD | Modifier::DIM)
+                .add_modifier(history_emphasis(x + 1 == area.right(), color)),
+            );
+          }
         }
         level -= eighths;
       }
@@ -141,7 +169,7 @@ fn bar_level(value: u64, max: u64, levels: u64) -> u64 {
 mod tests {
   use ratatui::buffer::Buffer;
   use ratatui::layout::Rect;
-  use ratatui::style::Color;
+  use ratatui::style::{Color, Modifier};
   use ratatui::widgets::Widget;
 
   use super::{Gauge, Graph};
@@ -151,6 +179,32 @@ mod tests {
     let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
     widget.render(buf.area, &mut buf);
     buf
+  }
+
+  #[test]
+  fn chart_accents_keep_hot_history_red_without_changing_power_colors() {
+    let accent = crate::tui::theme::CPU;
+    let levels = [67, 66, 33];
+    let buf = draw(Graph::new(&levels).max(100).accent(accent), 3, 2);
+    assert_eq!(buf[(0, 1)].fg, accent);
+    assert_eq!(buf[(1, 1)].fg, accent);
+    assert_eq!(buf[(2, 1)].fg, Color::Red);
+    let power = draw(Graph::new(&levels).max(100).color(accent), 3, 2);
+    assert!(power.content.iter().filter(|cell| cell.symbol() != " ").all(|cell| cell.fg == accent));
+  }
+
+  #[test]
+  fn newest_and_hot_history_stay_prominent_over_older_samples() {
+    let accent = crate::tui::theme::CPU;
+    let buf = draw(Graph::new(&[33, 90, 20]).max(100).accent(accent).emphasis(), 3, 2);
+    assert_eq!(buf[(0, 1)].fg, accent);
+    assert!(buf[(0, 1)].modifier.contains(Modifier::DIM));
+    assert!(!buf[(0, 1)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buf[(1, 1)].fg, Color::Red);
+    assert!(buf[(1, 1)].modifier.contains(Modifier::BOLD));
+    assert!(!buf[(1, 1)].modifier.contains(Modifier::DIM));
+    assert_eq!(buf[(2, 1)].fg, accent);
+    assert!(buf[(2, 1)].modifier.contains(Modifier::BOLD));
   }
 
   fn rows(buf: &Buffer) -> Vec<String> {
