@@ -33,14 +33,19 @@ fn temp_ratio(celsius: f32) -> f64 {
   (f64::from(celsius) - 30.0) / 70.0
 }
 
-fn network_bytes(mut bytes: f64) -> String {
+fn network_quantity(mut bytes: f64) -> (f64, &'static str) {
   let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
   let mut unit = 0;
   while bytes >= 1024.0 && unit < units.len() - 1 {
     bytes /= 1024.0;
     unit += 1;
   }
-  format!("{bytes:.1} {}", units[unit])
+  (bytes, units[unit])
+}
+
+fn network_bytes(bytes: f64) -> String {
+  let (bytes, unit) = network_quantity(bytes);
+  format!("{bytes:.1} {unit}")
 }
 
 /// `width` cells as `u16`, the type of screen coordinates; saturating, as no text on screen is
@@ -346,27 +351,42 @@ impl App {
   pub(super) fn render_network_box(&self, f: &mut Frame, area: Rect) {
     let metrics = self.network.as_deref().unwrap_or_default();
     let shown = usize::from(area.height.saturating_sub(3)).min(3).min(metrics.len());
-    let title = format!("Network {shown}/{}", metrics.len());
-    let inner = draw_box(f, area, Titles::new(heading(title)));
+    let title =
+      vec![theme::value("Network", theme::SECTION), dim(format!(" {shown}/{}", metrics.len()))];
+    let inner = draw_box(f, area, Titles::new(title));
     if metrics.is_empty() {
       let status = if self.network.is_none() { "unavailable" } else { "no active interfaces" };
       f.render_widget(Paragraph::new(dim(status)), inner);
       return;
     }
-    let widths = [15u16, 12, 12, 11, 11];
+    let mut widths = [15u16, 12, 12, 11, 11];
     let headers = ["Interface", "↓ RX/s", "↑ TX/s", "RX total", "TX total"];
     let mut columns = widths.len();
     while columns > 1 && widths[..columns].iter().sum::<u16>() + columns as u16 - 1 > inner.width {
       columns -= 1;
     }
+    let needed = widths[..columns].iter().sum::<u16>() + columns as u16 - 1;
+    let table = if inner.width >= needed + 2 { inner.inner(Margin::new(1, 0)) } else { inner };
+    widths[0] += table.width.saturating_sub(needed);
     let rate = |v: Option<f64>, color| {
-      let label = v.map_or_else(|| "—".into(), |v| format!("{}/s", network_bytes(v)));
-      let value = if v.is_some_and(|v| v > 0.0) { theme::value(label, color) } else { dim(label) };
-      Cell::from(Line::from(value).right_aligned())
+      let line = match v {
+        Some(v) if v > 0.0 => {
+          let (value, unit) = network_quantity(v);
+          Line::from(vec![theme::value(format!("{value:.1}"), color), dim(format!(" {unit}/s"))])
+        }
+        v => Line::from(dim(v.map_or_else(|| "—".into(), |v| format!("{}/s", network_bytes(v))))),
+      };
+      Cell::from(line.right_aligned())
     };
     let rows = metrics.iter().take(shown).map(|m| {
       let values = [
-        Cell::from(heading(m.name.clone())),
+        Cell::from(
+          if m.rx_bytes_per_sec.unwrap_or(0.0) + m.tx_bytes_per_sec.unwrap_or(0.0) > 0.0 {
+            heading(m.name.clone())
+          } else {
+            text(m.name.clone())
+          },
+        ),
         rate(m.rx_bytes_per_sec, theme::DOWNLOAD),
         rate(m.tx_bytes_per_sec, theme::UPLOAD),
         Cell::from(Line::from(dim(network_bytes(m.rx_bytes as f64))).right_aligned()),
@@ -376,12 +396,17 @@ impl App {
     });
     let widths = widths[..columns].iter().copied().map(Constraint::Length);
     let header = Row::new(headers.into_iter().take(columns).enumerate().map(|(i, label)| {
-      let line = Line::from(heading(label));
+      let color = match i {
+        1 => theme::DOWNLOAD,
+        2 => theme::UPLOAD,
+        _ => theme::DIM,
+      };
+      let line = Line::from(Span::styled(label, color));
       if i == 0 { line } else { line.right_aligned() }
     }));
     f.render_widget(
       Table::new(rows, widths).header(header).style(Style::new().fg(theme::TEXT)),
-      inner,
+      table,
     );
   }
 
@@ -416,7 +441,7 @@ impl App {
   /// bottom border when it is the lowest box.
   pub(super) fn render_metrics_box(&self, f: &mut Frame, plan: &LayoutPlan) {
     let Some(area) = plan.top else { return };
-    draw_box(f, area, self.metrics_titles());
+    draw_box(f, area, self.metrics_titles(area.width));
 
     let fans = self.fans.label();
     for &(kind, r) in &plan.boxes {
@@ -434,7 +459,8 @@ impl App {
       }
       let graph_area =
         inner.inner(Margin::new(u16::from(inner.width > 4), u16::from(inner.height > 3)));
-      let graph = Graph::new(metric.data).color(accent).three_levels(self.three_level_bars);
+      let graph =
+        Graph::new(metric.data).color(accent).emphasis().three_levels(self.three_level_bars);
       match metric.scale {
         Scale::Load { load, .. } if self.cfg.view_type == ViewType::Gauge => {
           f.render_widget(Gauge::new(load), inner)
@@ -457,11 +483,27 @@ impl App {
     render_bottom_border(f, area, hints, |_| vec![]);
   }
 
-  /// Chip as in the original UI (`Apple M3 Pro (6E+6P+18GPU 36GB)`) left, `macmon vX` right; the
-  /// version gives way to the chip.
-  fn metrics_titles(&self) -> Titles<'static> {
-    let version = format!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    Titles::new(self.chip_title()).right(dim(version))
+  /// Brand and hardware on the left, version on the right. Components drop whole as needed.
+  fn metrics_titles(&self, width: u16) -> Titles<'static> {
+    let chip = self.chip_title();
+    let mut branded = chip.clone();
+    if !self.soc.chip_name.is_empty() {
+      branded.spans.splice(0..0, [theme::value("macmon", theme::SECTION), dim(" / ")]);
+    }
+    fit_titles(
+      width,
+      vec![
+        Titles::new(branded.clone()).right(dim(format!("v{}", env!("CARGO_PKG_VERSION")))),
+        Titles::new(branded),
+        Titles::new(chip),
+        Titles::new(heading(self.chip_name().to_owned())),
+        Titles::default(),
+      ],
+    )
+  }
+
+  fn chip_name(&self) -> &str {
+    if self.soc.chip_name.is_empty() { env!("CARGO_PKG_NAME") } else { &self.soc.chip_name }
   }
 
   /// `Apple M3 Pro (6E+6P+18GPU 36GB)`, the details in parentheses dim. Core counts come from the
@@ -487,8 +529,7 @@ impl App {
     }
 
     // a chip name the library couldn't read still leaves a title
-    let name = if soc.chip_name.is_empty() { env!("CARGO_PKG_NAME") } else { &soc.chip_name };
-    let mut spans = vec![heading(name.to_string())];
+    let mut spans = vec![heading(self.chip_name().to_string())];
     if !details.is_empty() {
       spans.push(dim(format!(" ({details})")));
     }
@@ -542,7 +583,14 @@ impl App {
     let mem = &self.mem;
     let gib = |bytes: u64| bytes as f64 / GIB;
     let (used, load) = (gib(mem.ram_usage), ratio(gib(mem.ram_usage), gib(mem.ram_total)));
-    let full = [heading("RAM"), text(format!(" {used:.2} GB (")), self.percent(load, 1), text(")")];
+    let full = [
+      heading("RAM"),
+      text(" "),
+      theme::value(format!("{used:.2}"), theme::MEMORY),
+      dim(" GB ("),
+      self.percent(load, 1),
+      dim(")"),
+    ];
     let short = [heading("RAM"), text(" "), self.percent(load, 0)];
 
     let mut titles = vec![];
@@ -578,7 +626,9 @@ impl App {
     let value = |precision| {
       vec![
         heading(label),
-        theme::value(format!(" {:.*}W", precision, store.top_value), theme::TEXT),
+        text(" "),
+        theme::value(format!("{:.*}", precision, store.top_value), theme::POWER),
+        dim("W"),
       ]
     };
     let short = value(2);
@@ -612,7 +662,9 @@ impl App {
       };
       titles.push(Titles::new(vec![
         heading(compact),
-        theme::value(format!(" {:.0}W", store.top_value), theme::TEXT),
+        text(" "),
+        theme::value(format!("{:.0}", store.top_value), theme::POWER),
+        dim("W"),
       ]));
     }
     if !fits(&titles) {

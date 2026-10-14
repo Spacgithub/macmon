@@ -87,6 +87,11 @@ values are bold, while secondary details are dimmed. Network receive/transmit ra
 are aligned, with arrows marking their direction. Narrow power boxes reduce precision while
 keeping each displayed number and its unit complete.
 
+The hardware header separates the brand, chip and specifications, with complete components
+omitted when space is limited. Units and process metadata are quieter than primary values;
+the latest chart sample and hot-load history stay prominent. Wide network tables align their
+totals to the panel edge while preserving the compact layout in narrow windows.
+
 The screen redraws when data, input or the window size changes. Unchanged input heartbeats skip
 drawing, and interfaces are ranked when samples arrive. The default sampling interval stays
 1000 ms; the existing controls and saved configuration remain compatible.

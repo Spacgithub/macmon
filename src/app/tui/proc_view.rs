@@ -766,14 +766,14 @@ impl ProcView {
   /// the filter as `filter_titles` shows it, then `sort`, and `info | finder | copy | kill` on the
   /// right with a process selected (neither while typing: keys are text then).
   fn titles(&self, width: u16) -> Titles<'_> {
-    let mut name = vec![heading("proc")];
+    let mut name = vec![theme::value("proc", theme::SECTION)];
     if let Some(procs) = self.procs() {
       let count = if self.filter.is_empty() {
         format!(" {}", procs.len())
       } else {
         format!(" {}/{}", self.row_count(), procs.len())
       };
-      name.push(text(count));
+      name.push(dim(count));
     }
 
     let titles = filter_titles(name, &self.filter, self.typing, width);
@@ -876,7 +876,14 @@ impl App {
 
     for (i, (selected, proc)) in self.proc_view.page_rows().enumerate() {
       let y = body.y + i as u16;
-      let cells = columns.iter().map(|&(column, _)| self.proc_cell(column, proc));
+      let cells = columns.iter().map(|&(column, _)| {
+        let cell = self.proc_cell(column, proc);
+        if column == sort {
+          cell.patch_style(Style::new().add_modifier(Modifier::BOLD))
+        } else {
+          cell
+        }
+      });
       draw_row(buf, Rect { y, height: 1, ..table }, &columns, cells);
       // from border to border, so the row reads as one bar
       if selected {
@@ -891,9 +898,9 @@ impl App {
   /// values show as a dim `-`.
   fn proc_cell(&self, column: ProcSort, proc: &ProcInfo) -> Span<'static> {
     match column {
-      ProcSort::Pid => text(proc.pid.to_string()),
-      ProcSort::Name => text(proc.name.clone()),
-      ProcSort::User => text(proc.user.clone()),
+      ProcSort::Pid => dim(proc.pid.to_string()),
+      ProcSort::Name => heading(proc.name.clone()),
+      ProcSort::User => dim(proc.user.clone()),
       ProcSort::Cpu => pct_cell(proc.cpu_pct),
       ProcSort::Mem => self.mem_cell(proc.mem_bytes),
       ProcSort::Power => power_cell(proc.power_w, false),

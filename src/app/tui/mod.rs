@@ -1575,7 +1575,11 @@ mod tests {
     app.update_metrics(Metrics { cpu_tiers, ..test_metrics() });
 
     let buf = render_buffer(&mut app, 200, 50);
-    assert!(row(&buf, 0).starts_with("╭─ Apple M6 (6E+4P+2S+12GPU 32GB) ─"), "{}", row(&buf, 0));
+    assert!(
+      row(&buf, 0).starts_with("╭─ macmon / Apple M6 (6E+4P+2S+12GPU 32GB) ─"),
+      "{}",
+      row(&buf, 0)
+    );
     let screen = screen_text(&buf);
     for title in ["E-CPU 71% @ 2940 MHz", "P-CPU 25% @ 2394 MHz", "S-CPU 50% @ 4776 MHz"] {
       assert!(screen.contains(&format!("╭─ {title} ─")), "missing {title}");
@@ -1600,7 +1604,11 @@ mod tests {
     let app = &mut with_procs(app, varied_procs());
 
     let buf = render_buffer(app, 200, 50);
-    assert!(row(&buf, 0).starts_with("╭─ Apple M2 (Virtual) (4CPU 8GB) ─"), "{}", row(&buf, 0));
+    assert!(
+      row(&buf, 0).starts_with("╭─ macmon / Apple M2 (Virtual) (4CPU 8GB) ─"),
+      "{}",
+      row(&buf, 0)
+    );
     let screen = screen_text(&buf);
     for title in ["CPU 63% ─", "GPU 0% ─"] {
       assert!(screen.contains(&format!("╭─ {title}")), "missing {title}");
@@ -1644,9 +1652,11 @@ mod tests {
       assert!(screen.contains(&format!("╭─ {title} ─")), "missing {title}");
     }
     // the chip with its core counts left on the metrics box, the version right
-    let version = format!("─ macmon v{} ─╮", env!("CARGO_PKG_VERSION"));
+    let version = format!("─ v{} ─╮", env!("CARGO_PKG_VERSION"));
     let top = row(&buf, 0);
-    assert!(top.starts_with("╭─ Apple M3 Pro (6E+6P+18GPU 36GB) ─") && top.ends_with(&version));
+    assert!(
+      top.starts_with("╭─ macmon / Apple M3 Pro (6E+6P+18GPU 36GB) ─") && top.ends_with(&version)
+    );
     // whole-degree temperatures right on the CPU / GPU power boxes, none for ANE
     assert!(box_top(&app, &buf, Metric::CpuPower).ends_with("─ 45°C ─╮"));
     assert!(box_top(&app, &buf, Metric::GpuPower).ends_with("─ 40°C ─╮"));
@@ -1654,6 +1664,47 @@ mod tests {
     // nothing right on the total power box; no summary on the bottom border of the metrics box
     assert!(box_top(&app, &buf, Metric::TotalPower).ends_with("───╮"));
     assert_eq!(row(&buf, PROC_Y - 1), format!("╰{}╯", "─".repeat(198)));
+  }
+
+  #[test]
+  fn hardware_header_drops_complete_components_at_narrow_widths() {
+    let mut app = test_app();
+    for width in [200, 80, 60, 45, 30, 18, 8] {
+      let buf = render_buffer(&mut app, width, 50);
+      let top = row(&buf, 0);
+      assert_eq!(top.contains('('), top.contains("(6E+6P+18GPU 36GB)"), "{top}");
+      if top.contains("macmon") {
+        assert!(top.contains("macmon / Apple M3 Pro"), "{top}");
+      }
+      if width >= 18 {
+        assert!(top.contains("Apple M3 Pro"), "{top}");
+      }
+    }
+    let mut app = App::default();
+    let top = row(&render_buffer(&mut app, 80, 24), 0);
+    assert!(top.contains("macmon") && !top.contains("macmon / macmon"), "{top}");
+  }
+
+  #[test]
+  fn wide_network_tables_align_to_the_panel_and_keep_units_secondary() {
+    let mut app = network_app();
+    for width in [80, 120, 200] {
+      let buf = render_buffer(&mut app, width, 50);
+      let area = app.layout(buf.area).network.unwrap();
+      let y = area.y + 2;
+      let first = row(&buf, y);
+      assert_eq!(x_of(&first, "en0"), area.x + 2);
+      assert_eq!(x_of(&first, "1.0 GiB") + 7, area.right() - 2);
+      let number = x_of(&first, "1.0 MiB/s");
+      assert_eq!(buf[(number, y)].fg, theme::DOWNLOAD);
+      assert!(buf[(number, y)].modifier.contains(Modifier::BOLD));
+      let unit = number + 4;
+      assert_eq!(buf[(unit, y)].fg, theme::DIM);
+      assert!(!buf[(unit, y)].modifier.contains(Modifier::BOLD));
+      let header = row(&buf, area.y + 1);
+      assert_eq!(buf[(x_of(&header, "↓ RX/s"), area.y + 1)].fg, theme::DOWNLOAD);
+      assert_eq!(buf[(x_of(&header, "↑ TX/s"), area.y + 1)].fg, theme::UPLOAD);
+    }
   }
 
   #[test]
@@ -1786,6 +1837,13 @@ mod tests {
     // load values on the gradient
     let cpu = x_of(&proc_row(&buf, 2), "25.0");
     assert_eq!(buf[(cpu, PROC_Y + 2)].fg, gradient(0.25));
+    assert!(buf[(cpu, PROC_Y + 2)].modifier.contains(Modifier::BOLD));
+    let body = proc_row(&buf, 2);
+    let name = x_of(&body, "WindowServer");
+    assert!(buf[(name, PROC_Y + 2)].modifier.contains(Modifier::BOLD));
+    for metadata in ["631", "vlad"] {
+      assert_eq!(buf[(x_of(&body, metadata), PROC_Y + 2)].fg, theme::DIM);
+    }
   }
 
   #[test]
@@ -1797,13 +1855,13 @@ mod tests {
     let wide = title(&mut app, 200);
     assert!(wide.starts_with("╭─ proc 3 ─ / filter ─ sort ───"), "{wide}");
     assert!(wide.ends_with("─ info | finder | copy | kill ─╮"), "{wide}");
-    // the count bold and plain, the hint keys cyan, their labels faint, the separators dim
+    // section name emphasized, count secondary, hint keys cyan and labels faint
     let buf = render_buffer(&mut app, 200, 50);
     let style = |text| {
       let cell = &buf[(x_of(&wide, text), PROC_Y)];
       (cell.fg, cell.modifier)
     };
-    let (bold, plain) = ((theme::TEXT, Modifier::BOLD), (theme::TEXT, Modifier::empty()));
+    let (bold, plain) = ((theme::SECTION, Modifier::BOLD), (theme::DIM, Modifier::empty()));
     let (cyan, faint) = ((theme::KEY, Modifier::empty()), (theme::TEXT, Modifier::DIM));
     let sep = (theme::DIM, Modifier::empty());
     let cells = ["proc", " 3", "/ ", " filter", "sort", "ort", "info", "nfo", " | "];

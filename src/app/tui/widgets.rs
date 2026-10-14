@@ -7,10 +7,10 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
-use super::theme::{gradient, graph_color};
+use super::theme::{gradient, graph_color, history_emphasis};
 
 /// Bar heights in one row: `▁` (1/8) up to `█` (8/8).
 const BAR_LEVELS: u64 = 8;
@@ -57,19 +57,26 @@ pub(super) struct Graph<'a> {
   max: Option<u64>,
   color: Option<Color>,
   warn_hot: bool,
+  emphasis: bool,
   three_levels: bool,
 }
 
 impl<'a> Graph<'a> {
   /// Graph scaled to its largest visible sample, each bar in its load color.
   pub(super) fn new(data: &'a [u64]) -> Self {
-    Self { data, max: None, color: None, warn_hot: false, three_levels: false }
+    Self { data, max: None, color: None, warn_hot: false, emphasis: false, three_levels: false }
   }
 
   /// Bars in three levels (blank, `▄`, `█`) instead of eighths, for Apple Terminal, which draws
   /// gaps between the eighth blocks.
   pub(super) fn three_levels(mut self, three_levels: bool) -> Self {
     self.three_levels = three_levels;
+    self
+  }
+
+  /// Distinguish the current sample from older history, retaining prominent warnings.
+  pub(super) fn emphasis(mut self) -> Self {
+    self.emphasis = true;
     self
   }
 
@@ -121,6 +128,13 @@ impl Widget for Graph<'_> {
         let symbol = bar_symbol(eighths, self.three_levels);
         if symbol != ' ' {
           buf[(x, y)].set_char(symbol).set_fg(color);
+          if self.emphasis {
+            buf[(x, y)].set_style(
+              Style::new()
+                .remove_modifier(Modifier::BOLD | Modifier::DIM)
+                .add_modifier(history_emphasis(x + 1 == area.right(), color)),
+            );
+          }
         }
         level -= eighths;
       }
@@ -155,7 +169,7 @@ fn bar_level(value: u64, max: u64, levels: u64) -> u64 {
 mod tests {
   use ratatui::buffer::Buffer;
   use ratatui::layout::Rect;
-  use ratatui::style::Color;
+  use ratatui::style::{Color, Modifier};
   use ratatui::widgets::Widget;
 
   use super::{Gauge, Graph};
@@ -177,6 +191,20 @@ mod tests {
     assert_eq!(buf[(2, 1)].fg, Color::Red);
     let power = draw(Graph::new(&levels).max(100).color(accent), 3, 2);
     assert!(power.content.iter().filter(|cell| cell.symbol() != " ").all(|cell| cell.fg == accent));
+  }
+
+  #[test]
+  fn newest_and_hot_history_stay_prominent_over_older_samples() {
+    let accent = crate::tui::theme::CPU;
+    let buf = draw(Graph::new(&[33, 90, 20]).max(100).accent(accent).emphasis(), 3, 2);
+    assert_eq!(buf[(0, 1)].fg, accent);
+    assert!(buf[(0, 1)].modifier.contains(Modifier::DIM));
+    assert!(!buf[(0, 1)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buf[(1, 1)].fg, Color::Red);
+    assert!(buf[(1, 1)].modifier.contains(Modifier::BOLD));
+    assert!(!buf[(1, 1)].modifier.contains(Modifier::DIM));
+    assert_eq!(buf[(2, 1)].fg, accent);
+    assert!(buf[(2, 1)].modifier.contains(Modifier::BOLD));
   }
 
   fn rows(buf: &Buffer) -> Vec<String> {
