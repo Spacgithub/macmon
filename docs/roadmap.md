@@ -99,7 +99,7 @@ what we need.
       upstream VM improvements, coordinate the network layout, and validate the combined fork.
       Plan: [docs/plans/completed/20261014-first-upstream-sync.md](plans/completed/20261014-first-upstream-sync.md).
 
-- [ ] **16. Polish the terminal UI while avoiding unchanged redraws.** Add terminal-theme metric
+- [x] **16. Polish the terminal UI while avoiding unchanged redraws.** Add terminal-theme metric
       accents and aligned network values, retain complete narrow power titles, and redraw on
       resize, input or fresh data while preserving Network Monitoring and VM behavior.
-      Plan: [docs/plans/20261014-ui-polish.md](plans/20261014-ui-polish.md).
+      Plan: [docs/plans/completed/20261014-ui-polish.md](plans/completed/20261014-ui-polish.md).
