@@ -433,7 +433,12 @@ impl App {
     let modes = [RatioMode::Scaled, RatioMode::Active].map(|mode| mode.label().len());
     let mode = format!("{:1$}", self.cfg.ratio_mode.label(), modes.into_iter().max().unwrap_or(0));
     let interval = format!("{:>1$}ms", self.cfg.interval(), TUI_MAX_MS.to_string().len());
-    hints.extend([hint("v", "view"), hint("r", mode), hint("-/+", interval)]);
+    hints.extend([
+      hint("v", "view"),
+      hint("r", mode),
+      hint("a", if self.cfg.animate_fans { "animate" } else { "still" }),
+      hint("-/+", interval),
+    ]);
     hints
   }
 
@@ -443,10 +448,38 @@ impl App {
     let Some(area) = plan.top else { return };
     draw_box(f, area, self.metrics_titles(area.width));
 
-    let fans = self.fans.label();
+    if let Some(compute) = plan.compute {
+      let mode = if self.cfg.view_type == ViewType::Gauge { "gauge" } else { "history" };
+      draw_box(f, compute, Titles::new(theme::value("Compute", theme::CPU)).right(dim(mode)));
+    }
+
     for &(kind, r) in &plan.boxes {
       let metric = self.metric_box(kind, r.width);
-      let inner = draw_box(f, r, fit_titles(r.width, metric.titles));
+      let overview = kind == Metric::Ram && plan.compute.is_some();
+      let titles = if overview {
+        let load = ratio(self.mem.ram_usage as f64, self.mem.ram_total as f64);
+        let mut title =
+          vec![theme::value("Memory", theme::MEMORY), text(" "), self.percent(load, 0)];
+        if self.mem.swap_total > 0 {
+          title.extend([
+            dim(" · SWAP "),
+            self.percent(ratio(self.mem.swap_usage as f64, self.mem.swap_total as f64), 0),
+          ]);
+        }
+        Titles::new(title)
+      } else {
+        fit_titles(r.width, metric.titles)
+      };
+      let mut inner = draw_box(f, r, titles);
+      if overview && inner.height > 1 {
+        let quantity = vec![
+          theme::value(format!("{:.2}", self.mem.ram_usage as f64 / GIB), theme::MEMORY),
+          dim(format!(" / {:.1} GiB", self.mem.ram_total as f64 / GIB)),
+        ];
+        f.render_widget(Paragraph::new(Line::from(quantity)), Rect { height: 1, ..inner });
+        inner.y += 1;
+        inner.height -= 1;
+      }
       let accent = match kind {
         Metric::Cluster(_) => theme::CPU,
         Metric::Gpu => theme::GPU,
@@ -468,11 +501,13 @@ impl App {
         Scale::Load { max, .. } => f.render_widget(graph.accent(accent).max(max), graph_area),
         Scale::Power => f.render_widget(graph, graph_area),
       }
+    }
 
-      // the fans (`1200 rpm`) right on the bottom border of the total power box
-      if kind == Metric::TotalPower && !fans.is_empty() && r.height >= 2 {
-        render_bottom_border(f, r, vec![vec![text(fans.clone())]], |_| vec![]);
-      }
+    if let Some(telemetry) = plan.telemetry {
+      self.render_telemetry(f, telemetry);
+    }
+    if let Some(area) = self.fan_area(plan) {
+      self.render_fan(f, area);
     }
 
     if let Some(area) = plan.network {
@@ -488,7 +523,7 @@ impl App {
     let chip = self.chip_title();
     let mut branded = chip.clone();
     if !self.soc.chip_name.is_empty() {
-      branded.spans.splice(0..0, [theme::value("macmon", theme::SECTION), dim(" / ")]);
+      branded.spans.splice(0..0, [theme::value("MACMON", theme::SECTION), dim(" / ")]);
     }
     fit_titles(
       width,
@@ -686,6 +721,63 @@ impl App {
     } else {
       self.power_box("Power", &self.all_power, None, width)
     }
+  }
+
+  /// Wide console ledger: the existing total-power policy and real temperature readings.
+  fn render_telemetry(&self, f: &mut Frame, area: Rect) {
+    let (label, total) = if self.sys_power.items.first().is_some_and(|&mw| mw > 0) {
+      ("Total", &self.sys_power)
+    } else {
+      ("CPU+GPU+ANE", &self.all_power)
+    };
+    let right = vec![
+      dim(format!("{label} ")),
+      theme::value(format!("{:.2}", total.top_value), theme::POWER),
+      dim(" W"),
+    ];
+    let inner = draw_box(f, area, Titles::new(theme::value("Power", theme::POWER)).right(right));
+    let quantity = |value: f64| {
+      Line::from(vec![theme::value(format!("{value:.2}"), theme::POWER), dim(" W")]).right_aligned()
+    };
+    let mut rows: Vec<Row> =
+      [("CPU", &self.cpu_power), ("GPU", &self.gpu_power), ("ANE", &self.ane_power)]
+        .into_iter()
+        .map(|(label, store)| Row::new([Line::from(dim(label)), quantity(store.top_value)]))
+        .collect();
+    rows.push(Row::new([Line::from(heading("Temperature")), Line::default()]));
+    for (label, temp) in [("CPU", self.cpu_temp.last()), ("GPU", self.gpu_temp.last())] {
+      let value = temp.map_or_else(
+        || dim("—"),
+        |value| Span::styled(format!("{value:.0}°C"), gradient(temp_ratio(value))),
+      );
+      rows.push(Row::new([Line::from(dim(label)), Line::from(value).right_aligned()]));
+    }
+    f.render_widget(
+      Table::new(rows, [Constraint::Min(14), Constraint::Length(12)]),
+      inner.inner(Margin::new(1, 0)),
+    );
+  }
+
+  pub(super) fn fan_area(&self, plan: &LayoutPlan) -> Option<Rect> {
+    plan
+      .telemetry
+      .or_else(|| plan.boxes.iter().find(|(m, _)| *m == Metric::TotalPower).map(|(_, r)| *r))
+      .filter(|area| area.height >= 2)
+  }
+
+  fn render_fan(&self, f: &mut Frame, area: Rect) {
+    let label = self.fans.label();
+    if label.is_empty() {
+      return;
+    }
+    let mut spans = vec![];
+    if self.fan_motion_visible {
+      let glyph = if self.fan_phase { '╳' } else { '╋' };
+      let color = if self.fans.spinning() { theme::POWER } else { theme::DIM };
+      spans.extend([Span::styled(glyph.to_string(), color), text(" ")]);
+    }
+    spans.push(dim(label));
+    render_bottom_border(f, area, vec![spans], |_| vec![]);
   }
 }
 

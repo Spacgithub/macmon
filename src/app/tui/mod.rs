@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use info::Info;
 use kill::Kill;
-use layout::{LayoutPlan, compute_layout};
+use layout::{LayoutPlan, compute_console_layout};
 use macmon::{Metrics, NetworkMetric, Sampler, SocInfo};
 use proc_view::ProcView;
 use ratatui::crossterm::event::{
@@ -120,13 +120,15 @@ enum Event {
   Mouse(MouseEvent),
   /// The terminal window lost focus.
   FocusLost,
+  /// The terminal window regained focus.
+  FocusGained,
   /// A resized terminal needs fresh layout and mouse targets even without a sample.
   Resize,
-  /// Input-thread heartbeat; no display data changed.
+  /// Input-thread heartbeat, also used by the visible fan indicator.
   Tick,
 }
 
-/// App event of a terminal event: keys, left clicks and the wheel, focus loss, and a resize as a
+/// App event of a terminal event: keys, left clicks and the wheel, focus changes, and a resize as a
 /// redraw.
 /// Mouse capture reports every move too; moves, drags and releases are dropped here, so they
 /// don't cost a frame each.
@@ -143,6 +145,7 @@ fn input_event(event: event::Event) -> Option<Event> {
       action.then_some(Event::Mouse(mouse))
     }
     event::Event::FocusLost => Some(Event::FocusLost),
+    event::Event::FocusGained => Some(Event::FocusGained),
     event::Event::Resize(..) => Some(Event::Resize),
     _ => None,
   }
@@ -306,6 +309,11 @@ pub struct App {
   cpu_temp: TempStore,
   gpu_temp: TempStore,
   fans: FanStore,
+  fan_tick: u8,
+  fan_phase: bool,
+  /// Set by rendering only while the fan indicator is actually on screen and uncovered.
+  fan_motion_visible: bool,
+  unfocused: bool,
   network: Option<Vec<NetworkMetric>>,
 
   /// CPU clusters, lowest tier first (E / P on M1–M4, E / S on M5, P / S on M5 Pro/Max, E / P / S
@@ -421,8 +429,13 @@ impl App {
       }
       // switching away is done typing: keys back as shortcuts, the filter stays
       Event::FocusLost => {
+        self.unfocused = true;
         self.proc_view.end_typing();
         self.info.iter_mut().for_each(|info| info.typing = false);
+        return ControlFlow::Continue(());
+      }
+      Event::FocusGained => {
+        self.unfocused = false;
         return ControlFlow::Continue(());
       }
       Event::Tick | Event::Resize => return ControlFlow::Continue(()),
@@ -438,8 +451,21 @@ impl App {
     if let Event::Failed(err) = event {
       return Err(err.into());
     }
-    let redraw = !matches!(event, Event::Tick);
-    Ok(self.handle_event(event, msec).map_continue(|()| redraw))
+    if matches!(event, Event::Tick) {
+      if !self.cfg.animate_fans
+        || self.unfocused
+        || !self.fan_motion_visible
+        || !self.fans.spinning()
+      {
+        return Ok(ControlFlow::Continue(false));
+      }
+      let before = self.fans.motion_glyph(self.fan_tick);
+      self.fan_tick = self.fan_tick.wrapping_add(1);
+      let changed = self.fans.motion_glyph(self.fan_tick) != before;
+      self.fan_phase ^= changed;
+      return Ok(ControlFlow::Continue(changed));
+    }
+    Ok(self.handle_event(event, msec).map_continue(|()| true))
   }
 
   /// Applies a key press to the app state. Returns `Break` when the app should quit. The help
@@ -484,6 +510,7 @@ impl App {
       KeyCode::Char('q') => return ControlFlow::Break(()),
       KeyCode::Char('?') => self.help = Some(0),
       KeyCode::Char('r') => self.cfg.toggle_ratio_mode(),
+      KeyCode::Char('a') => self.cfg.toggle_animate_fans(),
       KeyCode::Char('+') => self.cfg.inc_interval(),
       KeyCode::Char('=') => self.cfg.inc_interval(), // fallback to press without shift
       KeyCode::Char('-') => self.cfg.dec_interval(),
@@ -544,13 +571,14 @@ impl App {
   /// Screen layout for the current settings and metrics.
   fn layout(&self, area: Rect) -> LayoutPlan {
     let (procs, clusters) = (self.cfg.show_procs, self.clusters.items.len());
-    compute_layout(area, procs, clusters, !self.soc.vm)
+    compute_console_layout(area, procs, clusters, !self.soc.vm)
   }
 
   /// Layout of a frame for the window `area`, with the state that follows the window updated
   /// before anything is drawn: whether the process list fits, and whether it is on screen.
   fn layout_frame(&mut self, area: Rect) -> LayoutPlan {
-    self.procs_fit = layout::procs_fit(area);
+    self.procs_fit =
+      compute_console_layout(area, true, self.clusters.items.len(), !self.soc.vm).proc.is_some();
     let plan = self.layout(area);
     self.set_procs_visible(plan.proc.is_some());
     plan
@@ -558,6 +586,9 @@ impl App {
 
   fn render(&mut self, f: &mut Frame) {
     let plan = self.layout_frame(f.area());
+    self.fan_motion_visible = self.help.is_none()
+      && self.fans.motion_glyph(0).is_some()
+      && self.fan_area(&plan).is_some_and(|r| usize::from(r.width) >= self.fans.label().len() + 8);
 
     // the key hints go on the lowest box: the process box, or the metrics box without it
     self.render_metrics_box(f, &plan);
@@ -640,6 +671,7 @@ mod tests {
   #[test]
   fn idle_heartbeats_do_not_draw_but_samples_and_resize_do() {
     let mut app = network_app();
+    app.cfg.animate_fans = false;
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let interval = RwLock::new(1000);
     let mut frames = 1;
@@ -662,6 +694,181 @@ mod tests {
     let resized = super::input_event(ratatui::crossterm::event::Event::Resize(60, 18)).unwrap();
     assert!(matches!(resized, Event::Resize));
     assert_eq!(app.apply_event(resized, &interval).unwrap(), ControlFlow::Continue(true));
+  }
+
+  #[test]
+  fn fan_heartbeats_redraw_only_changed_frames_and_wrap_at_every_speed() {
+    let interval = RwLock::new(10_000);
+    for (rpms, changes) in [
+      (vec![1, 1499], [false, false, false, true]),
+      (vec![1200, 1500], [false, true, false, true]),
+      (vec![2999], [false, true, false, true]),
+      (vec![1200, 3000], [true; 4]),
+      (vec![u32::MAX], [true; 4]),
+    ] {
+      let mut app = test_app();
+      app.fan_motion_visible = true;
+      app.fans.push(
+        rpms.iter().map(|&rpm| FanMetric { name: "fan".into(), rpm, max_rpm: None }).collect(),
+      );
+      for changed in changes.into_iter().cycle().take(8) {
+        assert_eq!(
+          app.apply_event(Event::Tick, &interval).unwrap(),
+          ControlFlow::Continue(changed)
+        );
+      }
+      assert_eq!(app.fan_tick, 8);
+      app.fan_tick = 255;
+      assert_eq!(app.fans.motion_glyph(app.fan_tick), Some('╳'));
+      assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(true));
+      assert_eq!(app.fan_tick, 0);
+      assert_eq!(app.fans.motion_glyph(app.fan_tick), Some('╋'));
+      assert_eq!(*interval.read().unwrap(), 10_000);
+    }
+  }
+
+  #[test]
+  fn fan_motion_pauses_without_advancing_and_resumes_on_focus_gain() {
+    let interval = RwLock::new(1000);
+    let mut app = test_app();
+    assert!(!app.fan_motion_visible);
+    assert!(!app.unfocused);
+    assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
+    assert_eq!(app.fan_tick, 0);
+    let fan = |rpm| FanMetric { name: "fan".into(), rpm, max_rpm: Some(6000) };
+    for (enabled, visible, unfocused, fans) in [
+      (false, true, false, vec![fan(3000)]),
+      (true, false, false, vec![fan(3000)]),
+      (true, true, true, vec![fan(3000)]),
+      (true, true, false, vec![fan(0)]),
+      (true, true, false, vec![]),
+    ] {
+      app.cfg.animate_fans = enabled;
+      app.fan_motion_visible = visible;
+      app.unfocused = unfocused;
+      app.fans.push(fans);
+      app.fan_tick = 7;
+      for _ in 0..8 {
+        assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
+      }
+      assert_eq!(app.fan_tick, 7);
+      app.cfg.animate_fans = true;
+      app.fan_motion_visible = true;
+      app.unfocused = false;
+      app.fans.push(vec![fan(3000)]);
+      assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(true));
+      assert_eq!(app.fan_tick, 8);
+    }
+    let lost = super::input_event(ratatui::crossterm::event::Event::FocusLost).unwrap();
+    assert!(matches!(lost, Event::FocusLost));
+    assert_eq!(app.apply_event(lost, &interval).unwrap(), ControlFlow::Continue(true));
+    assert!(app.unfocused);
+    assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
+    assert_eq!(app.fan_tick, 8);
+    let gained = super::input_event(ratatui::crossterm::event::Event::FocusGained).unwrap();
+    assert!(matches!(gained, Event::FocusGained));
+    assert_eq!(app.apply_event(gained, &interval).unwrap(), ControlFlow::Continue(true));
+    assert!(!app.unfocused);
+    assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(true));
+    assert_eq!(app.fan_tick, 9);
+    assert_eq!(*interval.read().unwrap(), 1000);
+  }
+
+  #[test]
+  fn drawn_fan_indicator_gates_motion_on_resize_help_and_missing_data() {
+    let interval = RwLock::new(1000);
+    let mut app = test_app_with(|m| m.fans[0].rpm = 3000);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    for (width, height, help, visible) in [
+      (120, 40, false, true),
+      (60, 18, false, false),
+      (120, 40, false, true),
+      (120, 40, true, false),
+      (120, 40, false, true),
+    ] {
+      terminal.backend_mut().resize(width, height);
+      app.help = help.then_some(0);
+      let before = app.fan_tick;
+      terminal.draw(|f| app.render(f)).unwrap();
+      assert_eq!(app.fan_motion_visible, visible, "{width}x{height}, help {help}");
+      assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(visible));
+      assert_eq!(app.fan_tick, before + u8::from(visible));
+    }
+    app.help = None;
+    let before = terminal.draw(|f| app.render(f)).unwrap().buffer.clone();
+    app.cfg.animate_fans = false;
+    let buf = terminal.draw(|f| app.render(f)).unwrap().buffer.clone();
+    let area = app.fan_area(&app.layout(buf.area)).unwrap();
+    assert_eq!(row(&before, area.bottom() - 1), row(&buf, area.bottom() - 1));
+    assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
+
+    app.cfg.animate_fans = true;
+    for rpm in [Some(0), None] {
+      app.fans.push(
+        rpm.into_iter().map(|rpm| FanMetric { name: "fan".into(), rpm, max_rpm: None }).collect(),
+      );
+      let buf = terminal.draw(|f| app.render(f)).unwrap().buffer.clone();
+      let screen = screen_text(&buf);
+      assert_eq!(screen.contains("0 rpm"), rpm.is_some());
+      assert_eq!(app.fan_motion_visible, rpm.is_some());
+      assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
+    }
+  }
+
+  #[test]
+  fn changing_rpm_bands_never_change_orientation_without_an_allowed_heartbeat() {
+    let interval = RwLock::new(250);
+    let mut app = test_app_with(|m| m.fans[0].rpm = 1499);
+    let displayed = |app: &mut App| {
+      let buf = render_buffer(app, 120, 40);
+      buf
+        .content
+        .iter()
+        .filter_map(|c| match c.symbol() {
+          "╋" => Some('╋'),
+          "╳" => Some('╳'),
+          _ => None,
+        })
+        .collect::<String>()
+    };
+    assert_eq!(displayed(&mut app), "╋");
+    for _ in 0..2 {
+      assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
+    }
+    assert_eq!(app.fan_tick, 2);
+    let mut last = displayed(&mut app);
+    for focused in [false, true] {
+      assert_eq!(
+        app
+          .apply_event(if focused { Event::FocusGained } else { Event::FocusLost }, &interval)
+          .unwrap(),
+        ControlFlow::Continue(true)
+      );
+      for rpm in [1500, 1499, 3000, 2999, 1500, 3000] {
+        let mut metrics = test_metrics();
+        metrics.fans[0].rpm = rpm;
+        assert_eq!(
+          app.apply_event(Event::Update(Box::new(metrics)), &interval).unwrap(),
+          ControlFlow::Continue(true)
+        );
+        assert_eq!(displayed(&mut app), last, "sampling {rpm} must not turn the fan");
+        if !focused {
+          assert_eq!(
+            app.apply_event(Event::Tick, &interval).unwrap(),
+            ControlFlow::Continue(false)
+          );
+          assert_eq!(displayed(&mut app), last);
+        }
+      }
+    }
+    // With the window focused, only the next eligible Tick advances the saved orientation.
+    for _ in 0..4 {
+      assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(true));
+      let current = displayed(&mut app);
+      assert_ne!(current, last);
+      last = current;
+    }
+    assert_eq!(*interval.read().unwrap(), 250);
   }
 
   #[test]
@@ -1120,6 +1327,17 @@ mod tests {
     let file = TempConfig::new("setting_keys_change_and_save_the_config");
     let mut app = saving_app(&file);
 
+    // a: saves only the motion choice, preserving the saved and active sample intervals
+    assert!(app.cfg.animate_fans);
+    for enabled in [false, true] {
+      assert!(app.handle_key(key('a')).is_continue());
+      assert_eq!(app.cfg.animate_fans, enabled);
+      assert_eq!(file.saved()["animate_fans"], enabled);
+      assert_eq!(app.cfg.interval(), 1000);
+      assert_eq!(file.saved()["interval"], 1000);
+      assert_eq!(file.saved()["view_type"], "Sparkline");
+    }
+
     // r: active ratios, E-CPU 50 % instead of 42 %
     assert!(app.handle_key(key('r')).is_continue());
     assert_eq!(file.saved()["ratio_mode"], "Active");
@@ -1144,7 +1362,7 @@ mod tests {
       assert_eq!(cells, line, "row {y}");
     }
     // the key hints show the settings
-    let hints = " view | raw  | -/+  1250ms ─╯";
+    let hints = " view | raw  | animate | -/+  1250ms ─╯";
     assert!(row(&buf, 49).ends_with(hints), "{}", row(&buf, 49));
 
     assert!(app.handle_key(key('v')).is_continue());
@@ -1160,6 +1378,8 @@ mod tests {
     };
     let start = width(&app);
     app.cfg.ratio_mode = RatioMode::Active;
+    assert_eq!(width(&app), start);
+    app.cfg.animate_fans = false;
     assert_eq!(width(&app), start);
     for interval in [TUI_MIN_MS, TUI_MAX_MS] {
       app.cfg.set_run_interval(interval);
@@ -1506,7 +1726,8 @@ mod tests {
         let ctx = format!("app {i} at {width}x{height}");
         if i < 2 && height >= 8 {
           let boxes: Vec<Metric> = plan.boxes.iter().map(|(metric, _)| *metric).collect();
-          assert_eq!(boxes, every_box, "{ctx}");
+          let expected = if plan.compute.is_some() { &every_box[..4] } else { &every_box[..] };
+          assert_eq!(boxes, expected, "{ctx}");
         }
 
         // every box drawn where the layout puts it: no title, summary, hint, graph or table cell
@@ -1516,6 +1737,8 @@ mod tests {
           .into_iter()
           .chain(plan.proc)
           .chain(plan.network)
+          .chain(plan.compute)
+          .chain(plan.telemetry)
           .chain(plan.boxes.iter().map(|b| b.1));
         for r in boxes.filter(|r| r.width >= 2 && r.height >= 2) {
           let (right, bottom) = (r.right() - 1, r.bottom() - 1);
@@ -1576,7 +1799,7 @@ mod tests {
 
     let buf = render_buffer(&mut app, 200, 50);
     assert!(
-      row(&buf, 0).starts_with("╭─ macmon / Apple M6 (6E+4P+2S+12GPU 32GB) ─"),
+      row(&buf, 0).starts_with("╭─ MACMON / Apple M6 (6E+4P+2S+12GPU 32GB) ─"),
       "{}",
       row(&buf, 0)
     );
@@ -1605,7 +1828,7 @@ mod tests {
 
     let buf = render_buffer(app, 200, 50);
     assert!(
-      row(&buf, 0).starts_with("╭─ macmon / Apple M2 (Virtual) (4CPU 8GB) ─"),
+      row(&buf, 0).starts_with("╭─ MACMON / Apple M2 (Virtual) (4CPU 8GB) ─"),
       "{}",
       row(&buf, 0)
     );
@@ -1632,11 +1855,12 @@ mod tests {
   #[test]
   fn only_a_vm_drops_the_power_row_and_process_power() {
     // processes sampled before the first metrics sample: the chip already tells a VM
-    for (vm, boxes, power, note) in [(false, 8, "1.50W", true), (true, 4, "-", false)] {
+    for (vm, boxes, power, note) in [(false, 4, "1.50W", true), (true, 4, "-", false)] {
       let soc = SocInfo { vm, ..test_soc() };
       let app = &mut with_procs(App::from_parts(soc, Config::default()), varied_procs());
       let buf = render_buffer(app, 200, 50);
       assert_eq!(app.layout(buf.area).boxes.len(), boxes, "vm {vm}");
+      assert_eq!(app.layout(buf.area).telemetry.is_some(), !vm, "vm {vm}");
       let words = proc_row(&buf, 2).split_whitespace().map(str::to_string).collect::<Vec<_>>();
       assert_eq!((words[2].as_str(), words[6].as_str()), ("WindowServer", power));
       assert_eq!(row(&buf, 49).contains("POWER: own processes only"), note);
@@ -1646,7 +1870,7 @@ mod tests {
   #[test]
   fn renders_original_titles() {
     let mut app = test_app();
-    let buf = render_buffer(&mut app, 200, 50);
+    let buf = render_buffer(&mut app, 200, 24);
     let screen = screen_text(&buf);
     for title in TITLES {
       assert!(screen.contains(&format!("╭─ {title} ─")), "missing {title}");
@@ -1655,7 +1879,7 @@ mod tests {
     let version = format!("─ v{} ─╮", env!("CARGO_PKG_VERSION"));
     let top = row(&buf, 0);
     assert!(
-      top.starts_with("╭─ macmon / Apple M3 Pro (6E+6P+18GPU 36GB) ─") && top.ends_with(&version)
+      top.starts_with("╭─ MACMON / Apple M3 Pro (6E+6P+18GPU 36GB) ─") && top.ends_with(&version)
     );
     // whole-degree temperatures right on the CPU / GPU power boxes, none for ANE
     assert!(box_top(&app, &buf, Metric::CpuPower).ends_with("─ 45°C ─╮"));
@@ -1663,7 +1887,60 @@ mod tests {
     assert!(box_top(&app, &buf, Metric::AnePower).ends_with("───╮"));
     // nothing right on the total power box; no summary on the bottom border of the metrics box
     assert!(box_top(&app, &buf, Metric::TotalPower).ends_with("───╮"));
-    assert_eq!(row(&buf, PROC_Y - 1), format!("╰{}╯", "─".repeat(198)));
+    assert_eq!(
+      row(&buf, app.layout(buf.area).top.unwrap().bottom() - 1),
+      format!("╰{}╯", "─".repeat(198))
+    );
+  }
+
+  #[test]
+  fn wide_console_groups_real_values_and_keeps_gauge_and_sensor_fallbacks() {
+    for view in [ViewType::Graph, ViewType::Gauge] {
+      let mut app = network_app();
+      app.cfg.view_type = view;
+      let buf = render_buffer(&mut app, 100, 30);
+      let plan = app.layout(buf.area);
+      let screen = screen_text(&buf);
+      for label in [
+        "Compute",
+        "Memory 56%",
+        "20.00 / 36.0 GiB",
+        "Power",
+        "Total 12.00 W",
+        "Temperature",
+        "45°C",
+        "40°C",
+        "╋ 1200 rpm",
+        "Network",
+        "proc",
+      ] {
+        assert!(screen.contains(label), "missing {label}: {screen}");
+      }
+      assert!(row(&buf, plan.compute.unwrap().y).contains(if view == ViewType::Gauge {
+        "gauge"
+      } else {
+        "history"
+      }));
+      let memory = plan.boxes.last().unwrap().1.inner(Margin::new(1, 1));
+      assert_eq!(buf[(memory.x, memory.y)].fg, theme::MEMORY);
+      assert!(buf[(memory.x, memory.y)].modifier.contains(Modifier::BOLD));
+      if view == ViewType::Gauge {
+        assert_eq!(buf[(memory.x, memory.y + 1)].symbol(), "█");
+      }
+
+      // The ledger follows the existing first-zero system-sensor fallback and leaves missing
+      // temperatures absent rather than inventing a zero reading.
+      app.update_metrics(Metrics { sys_power: 0.0, ..test_metrics() });
+      let buf = render_buffer(&mut app, 100, 30);
+      let screen = screen_text(&buf);
+      assert!(screen.contains("CPU+GPU+ANE 6.60 W"), "{screen}");
+      assert!(!screen.contains("Total 12.00 W"));
+      let mut missing = test_app_with(|m| m.temp = TempMetrics::default());
+      let buf = render_buffer(&mut missing, 100, 30);
+      assert!(!screen_text(&buf).contains("°C"));
+      let area = missing.layout(buf.area).telemetry.unwrap();
+      assert!(row(&buf, area.y + 5).contains('—') && row(&buf, area.y + 6).contains('—'));
+    }
   }
 
   #[test]
@@ -1673,8 +1950,8 @@ mod tests {
       let buf = render_buffer(&mut app, width, 50);
       let top = row(&buf, 0);
       assert_eq!(top.contains('('), top.contains("(6E+6P+18GPU 36GB)"), "{top}");
-      if top.contains("macmon") {
-        assert!(top.contains("macmon / Apple M3 Pro"), "{top}");
+      if top.contains("MACMON") {
+        assert!(top.contains("MACMON / Apple M3 Pro"), "{top}");
       }
       if width >= 18 {
         assert!(top.contains("Apple M3 Pro"), "{top}");
@@ -1710,14 +1987,14 @@ mod tests {
   #[test]
   fn fans_on_the_bottom_border_of_the_total_power_box() {
     let cases: [(&[u32], &str); 3] = [
-      (&[1200], "─ 1200 rpm ─╯"),
-      (&[1200, 1300], "─ 1200/1300 rpm ─╯"),
+      (&[1200], "─ ╋ 1200 rpm ─╯"),
+      (&[1200, 1300], "─ ╋ 1200/1300 rpm ─╯"),
       (&[], "─────────────────────────╯"),
     ];
     for (rpms, end) in cases {
       let fan = |&rpm: &u32| FanMetric { name: "fan".to_string(), rpm, max_rpm: None };
       let mut app = test_app_with(|m| m.fans = rpms.iter().map(fan).collect());
-      let buf = render_buffer(&mut app, 200, 50);
+      let buf = render_buffer(&mut app, 200, 24);
       let bottom = box_row(&app, &buf, Metric::TotalPower, true);
       assert!(bottom.starts_with("╰───") && bottom.ends_with(end), "{bottom}");
     }
@@ -1730,14 +2007,14 @@ mod tests {
       m.sys_power = 0.0;
       m.fans.clear();
     });
-    let buf = render_buffer(&mut app, 200, 50);
+    let buf = render_buffer(&mut app, 200, 24);
     let top = box_top(&app, &buf, Metric::TotalPower);
     assert!(top.starts_with("╭─ Power 6.60W (6.60, 6.60) ───") && top.ends_with("───╮"), "{top}");
 
     // a sensor that stops reading falls back with its first zero sample
     let mut app = test_app();
     app.update_metrics(Metrics { sys_power: 0.0, ..test_metrics() });
-    let buf = render_buffer(&mut app, 200, 50);
+    let buf = render_buffer(&mut app, 200, 24);
     let top = box_top(&app, &buf, Metric::TotalPower);
     assert!(top.starts_with("╭─ Power 6.60W (6.60, 6.60) ───"), "{top}");
   }
@@ -1802,7 +2079,7 @@ mod tests {
       let mut app = ram_app(has_swap);
       for &(width, title) in cases {
         // the clusters, GPU and RAM boxes `width` cells each, side by side
-        let buf = render_buffer(&mut app, width * 4 + 2, 50);
+        let buf = render_buffer(&mut app, width * 4 + 2, 24);
         let title = if title.is_empty() { String::new() } else { format!("─ {title} ") };
         let dashes = "─".repeat(usize::from(width) - 2 - title.chars().count());
         let top = box_top(&app, &buf, Metric::Ram);

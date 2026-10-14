@@ -71,6 +71,10 @@ pub struct Config {
   #[serde_inline_default(true)]
   pub show_procs: bool,
 
+  /// Motion of the fan indicator (`a`), driven by reported RPM.
+  #[serde_inline_default(true)]
+  pub animate_fans: bool,
+
   #[serde_inline_default(ProcSort::Cpu)]
   pub proc_sort: ProcSort,
 
@@ -223,6 +227,11 @@ impl Config {
     self.save();
   }
 
+  pub fn toggle_animate_fans(&mut self) {
+    self.animate_fans = !self.animate_fans;
+    self.save();
+  }
+
   pub fn set_proc_sort(&mut self, sort: ProcSort, desc: bool) {
     self.proc_sort = sort;
     self.proc_sort_desc = desc;
@@ -297,6 +306,7 @@ mod tests {
     assert_eq!(cfg.view_type, ViewType::Gauge);
     assert_eq!((cfg.interval, cfg.ratio_mode), (500, RatioMode::Active));
     assert_eq!((cfg.show_procs, cfg.proc_sort, cfg.proc_sort_desc), (true, ProcSort::Cpu, true));
+    assert!(cfg.animate_fans);
 
     // the graph keeps its released name both ways, so released versions read our configs too
     assert_eq!(parse(r#"{"view_type": "Sparkline"}"#).view_type, ViewType::Graph);
@@ -315,6 +325,7 @@ mod tests {
         "interval": 500,
         "ratio_mode": 3,
         "show_procs": "no",
+        "animate_fans": "no",
         "proc_sort": "Bogus",
         "proc_sort_desc": false
       }"#,
@@ -322,6 +333,7 @@ mod tests {
     assert_eq!((cfg.view_type, cfg.ratio_mode), (ViewType::Graph, RatioMode::Scaled));
     assert_eq!((cfg.show_procs, cfg.proc_sort), (true, ProcSort::Cpu));
     assert_eq!((cfg.interval, cfg.proc_sort_desc), (500, false));
+    assert!(cfg.animate_fans);
 
     // anything but a JSON object gives the defaults
     assert_eq!(parse("not json").interval, 1000);
@@ -337,6 +349,8 @@ mod tests {
     let saved = |field: &str| file.saved()[field].clone();
     cfg.toggle_procs();
     assert_eq!(saved("show_procs"), false);
+    cfg.toggle_animate_fans();
+    assert_eq!(saved("animate_fans"), false);
     cfg.toggle_view_type();
     assert_eq!(saved("view_type"), "Gauge");
     cfg.toggle_ratio_mode();
@@ -351,6 +365,7 @@ mod tests {
     assert_eq!((cfg.show_procs, cfg.view_type), (false, ViewType::Gauge));
     assert_eq!((cfg.ratio_mode, cfg.interval), (RatioMode::Active, 1250));
     assert_eq!((cfg.proc_sort, cfg.proc_sort_desc), (ProcSort::Name, false));
+    assert!(!cfg.animate_fans);
   }
 
   #[test]

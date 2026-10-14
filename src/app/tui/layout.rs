@@ -1,9 +1,5 @@
-//! Screen layout: the metric boxes of the original macmon in the top part of the screen and the
-//! process list in the rest.
-//!
-//! The metrics box holds CPU/GPU/RAM and power rows, followed by an interface table when it fits.
-//! Graph boxes split their rows evenly; the network table keeps at most three visible interfaces.
-//! Without power sources (a VM) the power row is left out and the top row takes the height.
+//! Adaptive metrics above the process list: a grouped wide console or the compact metric grid.
+//! Both keep a full-width network table when it fits; VMs omit unavailable power sources.
 
 use ratatui::layout::{Margin, Rect};
 
@@ -38,6 +34,9 @@ pub(super) struct LayoutPlan {
   /// Metric boxes inside the metrics box, borders included: the top row left to right, then the
   /// bottom row.
   pub(super) boxes: Vec<(Metric, Rect)>,
+  /// Wide console's compute group and power/temperature ledger; absent in compact/VM layouts.
+  pub(super) compute: Option<Rect>,
+  pub(super) telemetry: Option<Rect>,
   /// Full-width interface table, when the metric graphs also have room.
   pub(super) network: Option<Rect>,
   /// Process box, borders included.
@@ -121,11 +120,132 @@ pub(super) fn compute_layout(area: Rect, procs: bool, clusters: usize, power: bo
   plan
 }
 
+/// The selected console on wide, tall windows; compact windows and VMs use the original grid.
+pub(super) fn compute_console_layout(
+  area: Rect,
+  procs: bool,
+  clusters: usize,
+  power: bool,
+) -> LayoutPlan {
+  let count = clusters.saturating_add(1);
+  let minimum = u16::try_from(count.saturating_mul(3).saturating_add(2).max(12).saturating_add(8))
+    .unwrap_or(u16::MAX);
+  if !power || area.width < 100 || area.height < 30 || area.height < minimum {
+    return compute_layout(area, procs, clusters, power);
+  }
+  let mut top = area;
+  top.height = metrics_height(area.height).max(minimum);
+  let proc = (procs && area.height - top.height >= PROC_MIN_ROWS + PROC_CHROME).then_some(Rect {
+    y: top.bottom(),
+    height: area.height - top.height,
+    ..area
+  });
+  if proc.is_none() {
+    top = area;
+  }
+  let mut inner = top.inner(Margin::new(1, 1));
+  let network = Rect { y: inner.bottom() - 6, height: 6, ..inner };
+  inner.height -= 6;
+  let compute = Rect { width: (u32::from(inner.width) * 3 / 5) as u16, ..inner };
+  let right = Rect { x: compute.right() + 1, width: inner.width - compute.width - 1, ..inner };
+  let memory = Rect { height: 4, ..right };
+  let telemetry = Rect { y: right.y + 4, height: right.height - 4, ..right };
+  let body = compute.inner(Margin::new(1, 1));
+  let edge = |i: usize| (u64::from(body.height) * i as u64 / count as u64) as u16;
+  let mut boxes: Vec<_> = (0..clusters)
+    .map(Metric::Cluster)
+    .chain([Metric::Gpu])
+    .enumerate()
+    .map(|(i, metric)| {
+      (metric, Rect { y: body.y + edge(i), height: edge(i + 1) - edge(i), ..body })
+    })
+    .collect();
+  boxes.push((Metric::Ram, memory));
+  LayoutPlan {
+    top: Some(top),
+    boxes,
+    compute: Some(compute),
+    telemetry: Some(telemetry),
+    network: Some(network),
+    proc,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use ratatui::layout::{Margin, Rect};
 
-  use super::{LayoutPlan, PROC_CHROME, PROC_MIN_ROWS, compute_layout, procs_fit};
+  use super::{
+    LayoutPlan, PROC_CHROME, PROC_MIN_ROWS, compute_console_layout, compute_layout, procs_fit,
+  };
+
+  #[test]
+  fn console_thresholds_and_cpu_tier_counts_keep_room_for_their_content() {
+    for (width, height, clusters, power, console, procs) in [
+      (99, 30, 2, true, false, true),
+      (100, 29, 2, true, false, true),
+      (100, 30, 2, false, false, true),
+      (100, 30, 0, true, true, true),
+      (100, 30, 2, true, true, true),
+      (100, 30, 3, true, true, true),
+      (100, 30, 4, true, true, false),
+      (100, 30, 6, true, false, true),
+    ] {
+      let area = Rect::new(3, 2, width, height);
+      let plan = compute_console_layout(area, true, clusters, power);
+      let ctx = format!("{area:?}, clusters {clusters}, power {power}");
+      assert_eq!(plan.compute.is_some(), console, "{ctx}");
+      assert_eq!(plan.proc.is_some(), procs, "{ctx}");
+      if let Some(compute) = plan.compute {
+        assert_eq!(plan.boxes.len(), clusters + 2, "{ctx}");
+        let body = compute.inner(Margin::new(1, 1));
+        for (_, r) in plan.boxes.iter().take(clusters + 1) {
+          assert!(r.height >= 3 && body.intersection(*r) == *r, "{ctx}: {r:?}");
+        }
+        assert_eq!(plan.boxes.last().unwrap().1.height, 4);
+        assert!(plan.telemetry.unwrap().height >= 8);
+        assert_eq!(plan.network.unwrap().height, 6);
+      } else {
+        assert_eq!(plan, compute_layout(area, true, clusters, power), "{ctx}");
+      }
+    }
+  }
+
+  #[test]
+  fn console_siblings_stay_inside_and_do_not_overlap() {
+    for area in
+      [Rect::new(3, 2, 100, 30), Rect::new(7, 5, 400, 120), Rect::new(0, 0, u16::MAX, u16::MAX)]
+    {
+      for (clusters, procs) in [(0, true), (2, true), (3, false), (6, true)] {
+        let plan = compute_console_layout(area, procs, clusters, true);
+        let ctx = format!("{area:?}, clusters {clusters}, procs {procs}");
+        let top = plan.top.unwrap();
+        assert_eq!(area.intersection(top), top, "{ctx}");
+        if let Some(proc) = plan.proc {
+          assert_eq!(proc.bottom(), area.bottom());
+          assert_eq!(proc.y, top.bottom());
+          assert!(proc.height >= PROC_MIN_ROWS + PROC_CHROME);
+        } else {
+          assert_eq!(top, area);
+        }
+        let inner = top.inner(Margin::new(1, 1));
+        let siblings: Vec<_> = if let Some(compute) = plan.compute {
+          vec![
+            compute,
+            plan.boxes.last().unwrap().1,
+            plan.telemetry.unwrap(),
+            plan.network.unwrap(),
+          ]
+        } else {
+          plan.boxes.iter().map(|(_, r)| *r).chain(plan.network).collect()
+        };
+        for (i, a) in siblings.iter().enumerate() {
+          assert!(!a.is_empty() && inner.intersection(*a) == *a, "{ctx}: {a:?}");
+          assert!(siblings[i + 1..].iter().all(|b| !a.intersects(*b)), "{ctx}: {a:?}");
+        }
+      }
+    }
+  }
 
   #[test]
   fn metrics_take_40_percent_and_procs_the_rest() {
