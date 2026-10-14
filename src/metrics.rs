@@ -6,6 +6,7 @@ use std::time::Duration;
 use core_foundation::dictionary::CFDictionaryRef;
 use serde::Serialize;
 
+use crate::network::{NetworkMetric, NetworkSampler};
 use crate::shared::{
   ioreport_channels_filter, is_clpc_energy_channel, is_pmp_ane_channel, zero_div,
 };
@@ -152,6 +153,8 @@ pub struct Metrics {
   pub memory: MemMetrics,
   /// Fan metrics ordered by stable SMC fan key order.
   pub fans: Vec<FanMetric>,
+  /// Up, non-loopback interfaces sorted by name, or None when collection is unavailable.
+  pub network: Option<Vec<NetworkMetric>>,
   /// Combined frequency-weighted active residency across all CPU cores.
   pub cpu_scaled_ratio: f32,
   /// Combined fraction of the sampling interval spent in active CPU frequency states.
@@ -530,6 +533,7 @@ pub struct Sampler {
   use_cpu_ticks: bool,
   /// CPU ticks at the end of the last sample; the first sample takes its own baseline.
   cpu_ticks: Option<Vec<[u32; 4]>>,
+  network: NetworkSampler,
   hid: IOHIDSensors,
   smc: Option<SMC>,
   smc_cpu_keys: Vec<String>,
@@ -554,6 +558,7 @@ impl Sampler {
       ior,
       use_cpu_ticks,
       cpu_ticks: None,
+      network: NetworkSampler::default(),
       hid,
       smc: smc_sensors.smc,
       smc_cpu_keys: smc_sensors.cpu_keys,
@@ -748,6 +753,7 @@ impl Sampler {
     //           and include cluster/core separators (e.g. "DIE_0_PCPU1_CPU0").
 
     let duration = Duration::from_millis(duration as u64);
+    self.network.begin();
     // like the IOReport baseline, taken when the first interval begins
     let ticks = self.cpu_ticks.take().or_else(|| self.use_cpu_ticks.then(cpu_load_ticks).flatten());
     let mut rs = match self.ior.as_mut() {
@@ -770,6 +776,7 @@ impl Sampler {
       self.cpu_ticks = Some(cur);
     }
     let mut rs = aggregate_ioreport_metrics(rs, &self.soc);
+    rs.network = self.network.sample();
 
     rs.memory = self.get_mem()?;
     rs.temp = self.get_temp()?;
@@ -878,6 +885,7 @@ mod tests {
       ior: None,
       use_cpu_ticks: true,
       cpu_ticks: None,
+      network: Default::default(),
       hid: IOHIDSensors::new().unwrap(),
       smc: None,
       smc_cpu_keys: vec![],
