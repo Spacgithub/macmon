@@ -95,6 +95,6 @@ what we need.
       inherited publication jobs remain restricted to the original repository.
       Plan: [docs/plans/completed/20261013-upstream-sync.md](plans/completed/20261013-upstream-sync.md).
 
-- [ ] **15. Complete the first upstream sync with Network Monitoring preserved.** Integrate
+- [x] **15. Complete the first upstream sync with Network Monitoring preserved.** Integrate
       upstream VM improvements, coordinate the network layout, and validate the combined fork.
-      Plan: [docs/plans/20261014-first-upstream-sync.md](plans/20261014-first-upstream-sync.md).
+      Plan: [docs/plans/completed/20261014-first-upstream-sync.md](plans/completed/20261014-first-upstream-sync.md).
