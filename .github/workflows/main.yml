@@ -26,6 +26,7 @@ jobs:
       - run: make test
 
   dev:
+    if: ${{ github.repository == 'vladkens/macmon' }}
     runs-on: macos-latest
     needs: test
     permissions:
@@ -67,7 +68,7 @@ jobs:
           fi
 
   release:
-    if: ${{ startsWith(github.event.head_commit.message, 'release:') }}
+    if: ${{ github.repository == 'vladkens/macmon' && startsWith(github.event.head_commit.message, 'release:') }}
     runs-on: macos-latest
     needs: test
     permissions:

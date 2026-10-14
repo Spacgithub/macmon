@@ -391,3 +391,45 @@ Distributed under the [MIT License](LICENSE).
 - [op06072/NeoAsitop](https://github.com/op06072/NeoAsitop) – Written in Swift, sudoless.
 - [graelo/pumas](https://github.com/graelo/pumas) – Written in Rust, requires sudo.
 - [context-labs/mactop](https://github.com/context-labs/mactop) – Written in Go, requires sudo.
+
+## Maintaining this personal fork
+
+`Spacgithub/macmon` keeps personal features, including Network Monitoring once its feature PR is
+merged. `origin` points to this fork; `vladkens/macmon` is a read-only `upstream`. Upstream fixes,
+performance improvements and new features are merged into the fork's history, preserving personal
+commits. Changes to the same code can still require conflict resolution and testing.
+
+With Git and authenticated GitHub CLI (`gh auth login`), configure a fresh clone once:
+
+```sh
+git remote add upstream https://github.com/vladkens/macmon.git
+git remote set-url --push upstream /dev/null
+git config --local remote.pushDefault origin
+gh repo set-default github.com/Spacgithub/macmon
+```
+
+To prepare an update, install the Rust tools used by `make check` / `make test`, including nightly
+rustfmt, then run:
+
+```sh
+make upstream-sync
+```
+
+The command validates every effective remote URL, fetches both main branches, and prepares a merge
+in a separate `.worktrees/upstream-sync-…` checkout. It runs the checks before committing, pushes
+only the candidate branch to `Spacgithub/macmon`, and opens a PR there. Your current checkout and
+main branch stay intact. Repeating the command returns an existing open sync PR, or reports that
+upstream is already integrated. Unmerged personal feature branches are not included automatically.
+
+Review the sync PR and choose **Create a merge commit** when merging it. This retains upstream
+ancestry, so later updates continue from the previous sync. Personal feature PRs can still use
+squash; sync PRs must not use squash or rebase. There is no automatic main update or recurring job.
+
+On a conflict or failed check, the command publishes nothing and prints the retained worktree path.
+Resolve the candidate there, stage the resolution, run `make check` and `make test`, and commit the
+merge. Rerun `make upstream-sync` to publish a clean candidate with the expected merge parents.
+It refuses to overwrite dirty or incomplete existing candidates. Review upstream workflow changes
+as well as source changes: the inherited crate and Homebrew publishing jobs are restricted to the
+original author's repository; tests continue to run in this fork.
+
+Run `make test-upstream-sync` for local Git fixture tests; they do not contact or publish to GitHub.
