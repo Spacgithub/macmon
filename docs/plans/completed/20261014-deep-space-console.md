@@ -1,3 +1,5 @@
+Done: 2026-10-14, PR #5
+
 # Deep-space console and bounded fan motion
 
 Implement the person's selected first concept from the side conversation as a native Rust TUI,
@@ -23,7 +25,15 @@ with optional fan motion. All commits and PRs target `Spacgithub/macmon`; upstre
 
 - [x] Adapt the selected layout and provide the companion Warp theme instructions.
 - [x] Implement bounded fan motion, the saved switch and visibility/focus gating.
-- [ ] Validate configuration compatibility, VM/Gauge behavior, widths, keys and terminal exit.
-- [ ] Measure static/motion CPU, RSS and redraw frequency with stated workload limits.
-- [ ] Complete integrated reviews, required checks and the personal-fork feature PR.
-- [ ] Refresh and verify the installed command and fresh zsh entry point.
+- [x] Validate configuration compatibility, VM/Gauge behavior, widths, keys and terminal exit.
+- [x] Measure static/motion CPU, RSS and redraw frequency with stated workload limits.
+- [x] Complete integrated reviews, required checks and the personal-fork feature PR.
+- [x] Refresh and verify the installed command and fresh zsh entry point.
+
+## Result
+
+The native wide console and optional Warp palette are implemented, with compact/VM fallbacks.
+Reported-RPM fan motion is bounded, saved with `a`, and pauses without changing orientation.
+Network Monitoring and existing output/configuration compatibility are preserved. The personal
+fork PR passes checks; the installed command matches the tested release build and is verified
+from fresh zsh and real rootless network/TUI runs, with the previous executable retained.

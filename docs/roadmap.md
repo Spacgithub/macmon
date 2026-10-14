@@ -109,7 +109,7 @@ what we need.
       Continue PR #4 with the existing sampling, controls and terminal-theme compatibility.
       Plan: [docs/plans/completed/20261014-ui-refinement.md](plans/completed/20261014-ui-refinement.md).
 
-- [ ] **18. Add the selected deep-space console and bounded fan motion.** Group wide-screen
+- [x] **18. Add the selected deep-space console and bounded fan motion.** Group wide-screen
       telemetry, supply an ANSI-compatible Warp theme and add a saved motion switch with
       visibility/focus gating, real RPM and measured resource cost.
-      Plan: [docs/plans/20261014-deep-space-console.md](plans/20261014-deep-space-console.md).
+      Plan: [docs/plans/completed/20261014-deep-space-console.md](plans/completed/20261014-deep-space-console.md).
