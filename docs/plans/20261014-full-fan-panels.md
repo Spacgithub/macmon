@@ -29,7 +29,7 @@ target `Spacgithub/macmon`; `vladkens/macmon` remains a read-only upstream.
 ## Tasks
 
 - [x] Port and test the rasterizer and independent 60 FPS rotor clock.
-- [ ] Implement bounded terminal capability detection and safe reply handling.
+- [x] Implement bounded terminal capability detection and safe reply handling.
 - [ ] Implement owned image transmission and complete cleanup paths.
 - [ ] Integrate real fan identities, adaptive cooling panels and manual/focus/visibility gating.
 - [ ] Validate output/config compatibility, resize, zero/missing RPM, terminal recovery and
