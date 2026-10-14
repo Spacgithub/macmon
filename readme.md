@@ -178,7 +178,7 @@ macmon_cpu_tier_active_ratio{chip="Apple M3 Pro",tier="E"} 0.18
 macmon_cpu_tier_active_ratio{chip="Apple M3 Pro",tier="P"} 0.04
 ```
 
-`macmon_ecpu_*` and `macmon_pcpu_*` are still exported for the lowest and the highest tier.
+`macmon_ecpu_*` and `macmon_pcpu_*` are still exported for the lowest and the highest tier. In a macOS VM the power and frequency gauges are left out.
 
 </details>
 
@@ -232,7 +232,7 @@ gauges, labeled by `interface`. Unavailable rates have no gauge series for that 
 
 ### Output format
 
-The `pipe` command and the HTTP `/json` endpoint return the same metrics:
+The `pipe` command and the HTTP `/json` endpoint return the same metrics. In a macOS VM (`"vm": true` in the `soc` object of `pipe --soc-info` and `/json`) power and frequencies read 0, temperatures `null` and fans are empty:
 
 <details>
 <summary>JSON example</summary>

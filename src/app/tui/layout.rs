@@ -3,6 +3,7 @@
 //!
 //! The metrics box holds CPU/GPU/RAM and power rows, followed by an interface table when it fits.
 //! Graph boxes split their rows evenly; the network table keeps at most three visible interfaces.
+//! Without power sources (a VM) the power row is left out and the top row takes the height.
 
 use ratatui::layout::{Margin, Rect};
 
@@ -83,8 +84,9 @@ pub(super) fn procs_fit(area: Rect) -> bool {
 ///
 /// With the process list on (`procs`), the metrics box takes `METRICS_HEIGHT_PCT` of the height
 /// and the process box the rest; left with fewer than `PROC_MIN_ROWS` process rows, the process
-/// list is auto-hidden. Without it, the metrics box takes the whole screen.
-pub(super) fn compute_layout(area: Rect, procs: bool, clusters: usize) -> LayoutPlan {
+/// list is auto-hidden. Without it, the metrics box takes the whole screen. Without `power`, the
+/// top row of boxes takes the graph area above the network table.
+pub(super) fn compute_layout(area: Rect, procs: bool, clusters: usize, power: bool) -> LayoutPlan {
   let mut plan = LayoutPlan::default();
   if area.is_empty() {
     return plan;
@@ -103,7 +105,7 @@ pub(super) fn compute_layout(area: Rect, procs: bool, clusters: usize) -> Layout
     plan.network = Some(Rect { y: inner.bottom() - height, height, ..inner });
     inner.height -= height;
   }
-  let upper = inner.height.div_ceil(2);
+  let upper = if power { inner.height.div_ceil(2) } else { inner.height };
   let rows = [
     (Rect { height: upper, ..inner }, top_row(clusters)),
     (Rect { y: inner.y + upper, height: inner.height - upper, ..inner }, BOTTOM_ROW.to_vec()),
@@ -123,14 +125,14 @@ pub(super) fn compute_layout(area: Rect, procs: bool, clusters: usize) -> Layout
 mod tests {
   use ratatui::layout::{Margin, Rect};
 
-  use super::{PROC_CHROME, PROC_MIN_ROWS, compute_layout, procs_fit};
+  use super::{LayoutPlan, PROC_CHROME, PROC_MIN_ROWS, compute_layout, procs_fit};
 
   #[test]
   fn metrics_take_40_percent_and_procs_the_rest() {
     // (width, height, metrics box height): 40 % of the height, rounded, but at least two rows of
     // boxes with a graph row each
     for (width, height, top) in [(200, 50, 20), (110, 32, 14), (80, 24, 14), (100, 20, 14)] {
-      let plan = compute_layout(Rect::new(0, 0, width, height), true, 2);
+      let plan = compute_layout(Rect::new(0, 0, width, height), true, 2, true);
       let ctx = format!("{width}x{height}");
       assert_eq!(plan.top, Some(Rect::new(0, 0, width, top)), "{ctx}");
       assert_eq!(plan.proc, Some(Rect::new(0, top, width, height - top)), "{ctx}");
@@ -140,16 +142,48 @@ mod tests {
   #[test]
   fn hidden_or_auto_hidden_list_gives_metrics_the_full_height() {
     let area = Rect::new(0, 0, 120, 40);
-    let plan = compute_layout(area, false, 2);
+    let plan = compute_layout(area, false, 2, true);
     assert_eq!((plan.top, plan.proc), (Some(area), None));
     // 38 rows inside, six for the network table and 16 for each row of graphs.
     assert!(plan.boxes.iter().all(|(_, r)| r.height == 16), "{plan:?}");
 
     // A 14-row metrics box would leave five rows, one short of the smallest process box.
     let small = Rect::new(0, 0, 100, 19);
-    let plan = compute_layout(small, true, 2);
+    let plan = compute_layout(small, true, 2, true);
     assert_eq!((plan.top, plan.proc), (Some(small), None));
     assert!(!procs_fit(small) && procs_fit(Rect { height: 20, ..small }));
+  }
+
+  #[test]
+  fn without_power_the_top_row_takes_the_power_row_height() {
+    use super::Metric::*;
+    // 200x50 with the process list: 18 inner rows, six reserved for the network table.
+    let area = Rect::new(0, 0, 200, 50);
+    let with = compute_layout(area, true, 1, true);
+    let rows =
+      |plan: &LayoutPlan| plan.boxes.iter().map(|(m, r)| (*m, r.y, r.height)).collect::<Vec<_>>();
+    assert_eq!(
+      rows(&with),
+      [
+        (Cluster(0), 1, 6),
+        (Gpu, 1, 6),
+        (Ram, 1, 6),
+        (CpuPower, 7, 6),
+        (GpuPower, 7, 6),
+        (AnePower, 7, 6),
+        (TotalPower, 7, 6)
+      ]
+    );
+
+    // the same metrics and process boxes, one row of boxes
+    let without = compute_layout(area, true, 1, false);
+    assert_eq!((without.top, without.proc), (with.top, with.proc));
+    assert_eq!(rows(&without), [(Cluster(0), 1, 12), (Gpu, 1, 12), (Ram, 1, 12)]);
+    assert_eq!(without.network, with.network);
+    let widths = |plan: &LayoutPlan| {
+      plan.boxes.iter().map(|(_, r)| (r.x, r.width)).take(3).collect::<Vec<_>>()
+    };
+    assert_eq!(widths(&without), widths(&with));
   }
 
   #[test]
@@ -158,9 +192,11 @@ mod tests {
     let heights = [1, 2, 3, 5, 8, 13, 14, 24, 50, 120];
     for (width, height) in widths.into_iter().flat_map(|w| heights.map(|h| (w, h))) {
       let area = Rect::new(3, 2, width, height);
-      for (clusters, procs) in [(0, true), (2, false), (2, true), (3, true)] {
-        let plan = compute_layout(area, procs, clusters);
-        let ctx = format!("{area:?} clusters={clusters} procs={procs}");
+      let cases = [(0, true, true), (2, false, true), (2, true, true), (3, true, true)];
+      for (clusters, procs, power) in cases.into_iter().chain([(1, true, false), (2, false, false)])
+      {
+        let plan = compute_layout(area, procs, clusters, power);
+        let ctx = format!("{area:?} clusters={clusters} procs={procs} power={power}");
 
         // the metrics box on top, the process box right under it to the bottom
         let top = plan.top.expect("metrics box");

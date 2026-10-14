@@ -67,9 +67,10 @@ POWER does today.
 - [ ] **12. Run in a VM.** macmon in a macOS VM (Apple Virtualization, UTM), where IOReport,
       the SMC and the frequency tables are missing. Three PRs: start without IOReport hardware
       counters, with CPU usage from `host_processor_info`; hide unavailable power, with
-      availability flags in the JSON and the Prometheus gauges left out; GPU usage from the
+      a VM flag in the SoC info and the Prometheus gauges left out; GPU usage from the
       IOAccelerator client time.
       Plan (first PR): [docs/plans/completed/20261012-vm-start.md](plans/completed/20261012-vm-start.md).
+      Plan (second PR): [docs/plans/completed/20261012-vm-power.md](plans/completed/20261012-vm-power.md).
 
 - [x] **13. Per-interface network monitoring.** Real-time receive/transmit rates and cumulative
       byte counters without sudo, in the TUI, JSON, Rust library, and Prometheus exporter.
@@ -93,3 +94,7 @@ what we need.
       with checks and a PR in `Spacgithub/macmon`; sync PRs preserve upstream history, and
       inherited publication jobs remain restricted to the original repository.
       Plan: [docs/plans/completed/20261013-upstream-sync.md](plans/completed/20261013-upstream-sync.md).
+
+- [ ] **15. Complete the first upstream sync with Network Monitoring preserved.** Integrate
+      upstream VM improvements, coordinate the network layout, and validate the combined fork.
+      Plan: [docs/plans/20261014-first-upstream-sync.md](plans/20261014-first-upstream-sync.md).
