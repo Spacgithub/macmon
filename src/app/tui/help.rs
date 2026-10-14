@@ -27,6 +27,7 @@ const HELP: &[Row] = &[
   Key("p", "show / hide the processes"),
   Key("v", "graph / gauge"),
   Key("r", "CPU and GPU usage: freq / raw"),
+  Key("a", "fan motion on / off"),
   Key("- / +", "update interval"),
   Key("/", "filter the processes"),
   Key("s / S", "sort by the next column / reverse"),
@@ -173,6 +174,7 @@ mod tests {
 
     // keys cyan, the ` / ` between them faint, what they do plain
     assert_eq!(style("quit", "q"), [key]);
+    assert_eq!(style("fan motion", "a"), [key]);
     assert_eq!(style("update interval", "- / +"), [key, faint, faint, faint, key]);
     assert_eq!(style("select a process", "↑ ↓"), [key; 3]);
     assert_eq!(style("clear the selection", "Esc"), [key; 3]);

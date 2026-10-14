@@ -120,13 +120,15 @@ enum Event {
   Mouse(MouseEvent),
   /// The terminal window lost focus.
   FocusLost,
+  /// The terminal window regained focus.
+  FocusGained,
   /// A resized terminal needs fresh layout and mouse targets even without a sample.
   Resize,
-  /// Input-thread heartbeat; no display data changed.
+  /// Input-thread heartbeat, also used by the visible fan indicator.
   Tick,
 }
 
-/// App event of a terminal event: keys, left clicks and the wheel, focus loss, and a resize as a
+/// App event of a terminal event: keys, left clicks and the wheel, focus changes, and a resize as a
 /// redraw.
 /// Mouse capture reports every move too; moves, drags and releases are dropped here, so they
 /// don't cost a frame each.
@@ -143,6 +145,7 @@ fn input_event(event: event::Event) -> Option<Event> {
       action.then_some(Event::Mouse(mouse))
     }
     event::Event::FocusLost => Some(Event::FocusLost),
+    event::Event::FocusGained => Some(Event::FocusGained),
     event::Event::Resize(..) => Some(Event::Resize),
     _ => None,
   }
@@ -306,6 +309,10 @@ pub struct App {
   cpu_temp: TempStore,
   gpu_temp: TempStore,
   fans: FanStore,
+  fan_tick: u8,
+  /// Set by rendering only while the fan indicator is actually on screen and uncovered.
+  fan_motion_visible: bool,
+  unfocused: bool,
   network: Option<Vec<NetworkMetric>>,
 
   /// CPU clusters, lowest tier first (E / P on M1–M4, E / S on M5, P / S on M5 Pro/Max, E / P / S
@@ -421,8 +428,13 @@ impl App {
       }
       // switching away is done typing: keys back as shortcuts, the filter stays
       Event::FocusLost => {
+        self.unfocused = true;
         self.proc_view.end_typing();
         self.info.iter_mut().for_each(|info| info.typing = false);
+        return ControlFlow::Continue(());
+      }
+      Event::FocusGained => {
+        self.unfocused = false;
         return ControlFlow::Continue(());
       }
       Event::Tick | Event::Resize => return ControlFlow::Continue(()),
@@ -438,8 +450,19 @@ impl App {
     if let Event::Failed(err) = event {
       return Err(err.into());
     }
-    let redraw = !matches!(event, Event::Tick);
-    Ok(self.handle_event(event, msec).map_continue(|()| redraw))
+    if matches!(event, Event::Tick) {
+      if !self.cfg.animate_fans
+        || self.unfocused
+        || !self.fan_motion_visible
+        || !self.fans.spinning()
+      {
+        return Ok(ControlFlow::Continue(false));
+      }
+      let before = self.fans.motion_glyph(self.fan_tick);
+      self.fan_tick = self.fan_tick.wrapping_add(1);
+      return Ok(ControlFlow::Continue(self.fans.motion_glyph(self.fan_tick) != before));
+    }
+    Ok(self.handle_event(event, msec).map_continue(|()| true))
   }
 
   /// Applies a key press to the app state. Returns `Break` when the app should quit. The help
@@ -484,6 +507,7 @@ impl App {
       KeyCode::Char('q') => return ControlFlow::Break(()),
       KeyCode::Char('?') => self.help = Some(0),
       KeyCode::Char('r') => self.cfg.toggle_ratio_mode(),
+      KeyCode::Char('a') => self.cfg.toggle_animate_fans(),
       KeyCode::Char('+') => self.cfg.inc_interval(),
       KeyCode::Char('=') => self.cfg.inc_interval(), // fallback to press without shift
       KeyCode::Char('-') => self.cfg.dec_interval(),
@@ -640,6 +664,7 @@ mod tests {
   #[test]
   fn idle_heartbeats_do_not_draw_but_samples_and_resize_do() {
     let mut app = network_app();
+    app.cfg.animate_fans = false;
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let interval = RwLock::new(1000);
     let mut frames = 1;
@@ -662,6 +687,84 @@ mod tests {
     let resized = super::input_event(ratatui::crossterm::event::Event::Resize(60, 18)).unwrap();
     assert!(matches!(resized, Event::Resize));
     assert_eq!(app.apply_event(resized, &interval).unwrap(), ControlFlow::Continue(true));
+  }
+
+  #[test]
+  fn fan_heartbeats_redraw_only_changed_frames_and_wrap_at_every_speed() {
+    let interval = RwLock::new(10_000);
+    for (rpms, changes) in [
+      (vec![1, 1499], [false, false, false, true]),
+      (vec![1200, 1500], [false, true, false, true]),
+      (vec![2999], [false, true, false, true]),
+      (vec![1200, 3000], [true; 4]),
+      (vec![u32::MAX], [true; 4]),
+    ] {
+      let mut app = test_app();
+      app.fan_motion_visible = true;
+      app.fans.push(
+        rpms.iter().map(|&rpm| FanMetric { name: "fan".into(), rpm, max_rpm: None }).collect(),
+      );
+      for changed in changes.into_iter().cycle().take(8) {
+        assert_eq!(
+          app.apply_event(Event::Tick, &interval).unwrap(),
+          ControlFlow::Continue(changed)
+        );
+      }
+      assert_eq!(app.fan_tick, 8);
+      app.fan_tick = 255;
+      assert_eq!(app.fans.motion_glyph(app.fan_tick), Some('╳'));
+      assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(true));
+      assert_eq!(app.fan_tick, 0);
+      assert_eq!(app.fans.motion_glyph(app.fan_tick), Some('╋'));
+      assert_eq!(*interval.read().unwrap(), 10_000);
+    }
+  }
+
+  #[test]
+  fn fan_motion_pauses_without_advancing_and_resumes_on_focus_gain() {
+    let interval = RwLock::new(1000);
+    let mut app = test_app();
+    assert!(!app.fan_motion_visible);
+    assert!(!app.unfocused);
+    assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
+    assert_eq!(app.fan_tick, 0);
+    let fan = |rpm| FanMetric { name: "fan".into(), rpm, max_rpm: Some(6000) };
+    for (enabled, visible, unfocused, fans) in [
+      (false, true, false, vec![fan(3000)]),
+      (true, false, false, vec![fan(3000)]),
+      (true, true, true, vec![fan(3000)]),
+      (true, true, false, vec![fan(0)]),
+      (true, true, false, vec![]),
+    ] {
+      app.cfg.animate_fans = enabled;
+      app.fan_motion_visible = visible;
+      app.unfocused = unfocused;
+      app.fans.push(fans);
+      app.fan_tick = 7;
+      for _ in 0..8 {
+        assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
+      }
+      assert_eq!(app.fan_tick, 7);
+      app.cfg.animate_fans = true;
+      app.fan_motion_visible = true;
+      app.unfocused = false;
+      app.fans.push(vec![fan(3000)]);
+      assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(true));
+      assert_eq!(app.fan_tick, 8);
+    }
+    let lost = super::input_event(ratatui::crossterm::event::Event::FocusLost).unwrap();
+    assert!(matches!(lost, Event::FocusLost));
+    assert_eq!(app.apply_event(lost, &interval).unwrap(), ControlFlow::Continue(true));
+    assert!(app.unfocused);
+    assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
+    assert_eq!(app.fan_tick, 8);
+    let gained = super::input_event(ratatui::crossterm::event::Event::FocusGained).unwrap();
+    assert!(matches!(gained, Event::FocusGained));
+    assert_eq!(app.apply_event(gained, &interval).unwrap(), ControlFlow::Continue(true));
+    assert!(!app.unfocused);
+    assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(true));
+    assert_eq!(app.fan_tick, 9);
+    assert_eq!(*interval.read().unwrap(), 1000);
   }
 
   #[test]
@@ -1119,6 +1222,17 @@ mod tests {
   fn setting_keys_change_and_save_the_config() {
     let file = TempConfig::new("setting_keys_change_and_save_the_config");
     let mut app = saving_app(&file);
+
+    // a: saves only the motion choice, preserving the saved and active sample intervals
+    assert!(app.cfg.animate_fans);
+    for enabled in [false, true] {
+      assert!(app.handle_key(key('a')).is_continue());
+      assert_eq!(app.cfg.animate_fans, enabled);
+      assert_eq!(file.saved()["animate_fans"], enabled);
+      assert_eq!(app.cfg.interval(), 1000);
+      assert_eq!(file.saved()["interval"], 1000);
+      assert_eq!(file.saved()["view_type"], "Sparkline");
+    }
 
     // r: active ratios, E-CPU 50 % instead of 42 %
     assert!(app.handle_key(key('r')).is_continue());

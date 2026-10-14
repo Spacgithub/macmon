@@ -198,6 +198,23 @@ impl FanStore {
     self.items = value;
   }
 
+  /// Whether any fan's latest reported RPM is positive.
+  pub(super) fn spinning(&self) -> bool {
+    self.items.iter().any(|fan| fan.rpm > 0)
+  }
+
+  /// One-cell fan frame at a 250 ms heartbeat; absent readings stay absent, zero RPM stays still.
+  pub(super) fn motion_glyph(&self, tick: u8) -> Option<char> {
+    let rpm = self.items.iter().map(|fan| fan.rpm).max()?;
+    let ticks = match rpm {
+      0 => return Some('╋'),
+      1..=1499 => 4,
+      1500..=2999 => 2,
+      _ => 1,
+    };
+    Some(if (tick / ticks).is_multiple_of(2) { '╋' } else { '╳' })
+  }
+
   /// `1200 rpm`, `1200/1300 rpm` with several fans; empty without fans.
   pub(super) fn label(&self) -> String {
     if self.items.is_empty() {
@@ -221,15 +238,54 @@ pub(super) fn ratio(value: f64, total: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-  use macmon::MemMetrics;
+  use macmon::{FanMetric, MemMetrics};
 
   use super::{
-    FreqSample, FreqStore, HISTORY_LEN, MAX_TEMPS, MemoryStore, PowerStore, STATS_LEN, TempStore,
+    FanStore, FreqSample, FreqStore, HISTORY_LEN, MAX_TEMPS, MemoryStore, PowerStore, STATS_LEN,
+    TempStore,
   };
   use crate::config::RatioMode;
 
   fn assert_close(actual: f64, expected: f64) {
     assert!((actual - expected).abs() < 1e-9, "expected {expected}, got {actual}");
+  }
+
+  #[test]
+  fn fan_frames_use_the_highest_actual_rpm_and_keep_absence_and_zero_distinct() {
+    let mut fans = FanStore::default();
+    assert!(!fans.spinning());
+    assert_eq!(fans.motion_glyph(0), None);
+    let fan = |rpm| FanMetric { name: "fan".into(), rpm, max_rpm: Some(6000) };
+    fans.push(vec![fan(0), fan(0)]);
+    assert!(!fans.spinning());
+    for tick in 0..=u8::MAX {
+      assert_eq!(fans.motion_glyph(tick), Some('╋'));
+    }
+    for rpm in [1, 1499] {
+      fans.push(vec![fan(rpm), fan(0)]);
+      assert!(fans.spinning());
+      assert_eq!(fans.motion_glyph(1), Some('╋')); // max_rpm never drives motion
+      assert_eq!(fans.motion_glyph(3), Some('╋'));
+      assert_eq!(fans.motion_glyph(4), Some('╳'));
+      assert_eq!(fans.motion_glyph(8), Some('╋'));
+    }
+    for rpm in [1500, 2999] {
+      fans.push(vec![fan(1200), fan(rpm)]);
+      assert_eq!(fans.motion_glyph(1), Some('╋'));
+      assert_eq!(fans.motion_glyph(2), Some('╳'));
+      assert_eq!(fans.motion_glyph(4), Some('╋'));
+    }
+    for rpm in [3000, u32::MAX] {
+      fans.push(vec![fan(rpm), fan(1200)]);
+      assert_eq!(fans.motion_glyph(1), Some('╳'));
+      assert_eq!(fans.motion_glyph(2), Some('╋'));
+    }
+    for glyph in ['╋', '╳'] {
+      assert_eq!(ratatui::text::Span::raw(glyph.to_string()).width(), 1);
+    }
+    fans.push(vec![]);
+    assert!(!fans.spinning());
+    assert_eq!(fans.motion_glyph(255), None);
   }
 
   #[test]
