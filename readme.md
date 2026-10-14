@@ -95,11 +95,18 @@ omitted when space is limited. Units and process metadata are quieter than prima
 the latest chart sample and hot-load history stay prominent. Wide network tables align their
 totals to the panel edge while preserving the compact layout in narrow windows.
 
-Fans have a small character indicator driven by their reported RPM. Zero RPM stays stationary;
-unavailable fans stay absent. Press `a` to toggle motion (enabled by default, saved as
-`animate_fans`); it changes at most four times per second using the existing input heartbeat.
-Motion pauses on focus loss, under help and when its indicator does not fit. It never controls
-hardware fans or changes the 1000 ms default sampling interval.
+Compatible Warp, Kitty and WezTerm sessions can show a complete, shaded seven-blade fan for
+each reported fan, normally 180–240 pixels across. Images use the terminal's queried colors and
+require a successful file-image capability query; other terminals and small windows keep the
+compact RPM indicator. Window resizing adapts the panels. Restart macmon after changing the
+terminal font size to query fresh pixel dimensions.
+
+Each rotor follows its own reported RPM; zero RPM stays stationary and unavailable fans stay
+absent. Press `a` to toggle animation (enabled by default, saved as `animate_fans`). Native images
+target 60 updates per second independently of metric/process sampling; compact indicators
+change at most four times per second. Animation pauses on focus loss, under help and when
+hidden, preserving your manual choice. It never controls hardware fans or changes the saved
+sampling interval (1000 ms by default).
 
 The screen redraws when data, input, the window size or a visible fan frame changes. Other input
 heartbeats skip drawing, and interfaces are ranked when samples arrive. Existing configuration

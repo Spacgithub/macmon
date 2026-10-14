@@ -101,7 +101,7 @@ mod ui_preview {
     let interval = RwLock::new(1000);
     let (tx, rx) = mpsc::channel();
     let (mut terminal, guard) = super::super::enter_term().unwrap();
-    super::super::run_inputs_thread(tx, 250);
+    super::super::run_inputs_thread(tx, 250, None);
     let start = Instant::now();
     let mut next_sample = start + Duration::from_secs(1);
     let (mut redraw, mut frames, mut ticks, mut fan_frames, mut samples) = (true, 0, 0, 0, 0);

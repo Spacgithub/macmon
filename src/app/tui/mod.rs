@@ -1,17 +1,11 @@
 //! Terminal user interface.
 
 mod boxes;
-#[allow(dead_code)] // App wiring follows the shared cooling state and layout.
 mod cooling;
-#[allow(dead_code)] // Used by the following stacked cooling-panel integration.
 mod fan_clock;
-#[allow(dead_code)] // Runtime wiring follows the owned file-image transport.
 mod fan_images;
-#[allow(dead_code)] // The following UI integration consumes the completed graphics evidence.
 mod fan_protocol;
-#[allow(dead_code)] // Used by the following stacked cooling-panel integration.
 mod fan_raster;
-#[allow(dead_code)] // Startup capability detection follows this framed input parser.
 mod fan_replies;
 mod help;
 mod info;
@@ -29,9 +23,13 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use cooling::{Cooling, Placement};
+use fan_clock::FrameClock;
+use fan_images::FanImages;
+use fan_protocol::{Capabilities, PendingQueries};
 use info::Info;
 use kill::Kill;
-use layout::{LayoutPlan, compute_console_layout};
+use layout::LayoutPlan;
 use macmon::{Metrics, NetworkMetric, Sampler, SocInfo};
 use proc_view::ProcView;
 use ratatui::crossterm::event::{
@@ -100,6 +98,7 @@ fn restore_term_once(
 
   let _ = out.execute(DisableMouseCapture);
   let _ = out.execute(DisableFocusChange);
+  fan_images::cleanup(out);
   let _ = out.execute(terminal::LeaveAlternateScreen);
   let _ = out.execute(cursor::Show);
   let _ = disable_raw_mode();
@@ -136,6 +135,8 @@ enum Event {
   FocusGained,
   /// A resized terminal needs fresh layout and mouse targets even without a sample.
   Resize,
+  /// Completed graphics evidence from the remaining startup replies.
+  Capabilities(Capabilities),
   /// Input-thread heartbeat, also used by the visible fan indicator.
   Tick,
 }
@@ -167,14 +168,47 @@ fn input_event(event: event::Event) -> Option<Event> {
 const PROCS_WARMUP: Duration = Duration::from_millis(TUI_MIN_MS as u64);
 
 /// Sends input events and a `Tick` every `tick` ms; stops once the app is gone.
-fn run_inputs_thread(tx: mpsc::Sender<Event>, tick: u64) {
+fn run_inputs_thread(tx: mpsc::Sender<Event>, tick: u64, mut pending: Option<PendingQueries>) {
   let tick_rate = Duration::from_millis(tick);
 
   thread::spawn(move || {
     let mut last_tick = Instant::now();
+    let mut size = terminal::size().ok();
+    let mut capabilities = pending.as_ref().and_then(PendingQueries::capabilities);
 
     loop {
-      if event::poll(tick_rate).unwrap()
+      if let Some(query) = &mut pending {
+        match query.read(tick_rate) {
+          Ok(events) => {
+            for event in events.into_iter().filter_map(input_event) {
+              if tx.send(event).is_err() {
+                return;
+              }
+            }
+          }
+          Err(err) => {
+            let _ = tx.send(Event::Failed(err.to_string()));
+            return;
+          }
+        }
+        let fresh = query.capabilities();
+        if let Some(fresh) = fresh.filter(|fresh| Some(*fresh) != capabilities) {
+          capabilities = Some(fresh);
+          if tx.send(Event::Capabilities(fresh)).is_err() {
+            return;
+          }
+        }
+        if query.finished() {
+          pending = None;
+        }
+        let current = terminal::size().ok();
+        if current != size {
+          size = current;
+          if tx.send(Event::Resize).is_err() {
+            return;
+          }
+        }
+      } else if event::poll(tick_rate).unwrap()
         && let Some(event) = input_event(event::read().unwrap())
         && tx.send(event).is_err()
       {
@@ -321,6 +355,9 @@ pub struct App {
   cpu_temp: TempStore,
   gpu_temp: TempStore,
   fans: FanStore,
+  cooling: Cooling,
+  capabilities: Option<Capabilities>,
+  placements: Vec<Placement>,
   fan_tick: u8,
   fan_phase: bool,
   /// Set by rendering only while the fan indicator is actually on screen and uncovered.
@@ -375,6 +412,7 @@ impl App {
 
     self.cpu_temp.push(data.temp.cpu_temp_avg);
     self.gpu_temp.push(data.temp.gpu_temp_avg);
+    self.cooling.sync(&data.fans);
     self.fans.push(data.fans);
     self.network = data.network;
     if let Some(metrics) = &mut self.network {
@@ -450,7 +488,17 @@ impl App {
         self.unfocused = false;
         return ControlFlow::Continue(());
       }
-      Event::Tick | Event::Resize => return ControlFlow::Continue(()),
+      Event::Capabilities(caps) => {
+        self.set_capabilities(caps);
+        return ControlFlow::Continue(());
+      }
+      Event::Resize => {
+        if self.capabilities.is_some_and(|caps| !Self::cell_size_safe(caps)) {
+          self.capabilities = None;
+        }
+        return ControlFlow::Continue(());
+      }
+      Event::Tick => return ControlFlow::Continue(()),
       Event::Failed(_) => return ControlFlow::Break(()),
     };
 
@@ -464,6 +512,9 @@ impl App {
       return Err(err.into());
     }
     if matches!(event, Event::Tick) {
+      if self.graphics_visible() {
+        return Ok(ControlFlow::Continue(false));
+      }
       if !self.cfg.animate_fans
         || self.unfocused
         || !self.fan_motion_visible
@@ -581,17 +632,68 @@ impl App {
   }
 
   /// Screen layout for the current settings and metrics.
+  #[cfg(test)]
   fn layout(&self, area: Rect) -> LayoutPlan {
-    let (procs, clusters) = (self.cfg.show_procs, self.clusters.items.len());
-    compute_console_layout(area, procs, clusters, !self.soc.vm)
+    self.cooling_layout(area, self.cfg.show_procs).0
+  }
+
+  fn cooling_layout(&self, area: Rect, procs: bool) -> (LayoutPlan, Vec<Placement>) {
+    cooling::layout(
+      area,
+      procs,
+      self.clusters.items.len(),
+      !self.soc.vm,
+      self.cooling.items().len(),
+      self.capabilities.map(|caps| caps.cell_pixels),
+    )
+  }
+
+  fn graphics_visible(&self) -> bool {
+    self.help.is_none() && self.capabilities.is_some() && !self.placements.is_empty()
+  }
+
+  fn fan_frames_active(&self) -> bool {
+    self.graphics_visible() && self.cfg.animate_fans && !self.unfocused && self.cooling.moving()
+  }
+
+  fn cell_size_safe(caps: Capabilities) -> bool {
+    terminal::window_size().ok().is_none_or(|size| {
+      size.width.checked_div(size.columns).zip(size.height.checked_div(size.rows)).is_none_or(
+        |(width, height)| {
+          width == 0 || height == 0 || width >= caps.cell_pixels.0 && height >= caps.cell_pixels.1
+        },
+      )
+    })
+  }
+
+  fn set_capabilities(&mut self, caps: Capabilities) {
+    self.capabilities = Self::cell_size_safe(caps).then_some(caps);
+  }
+
+  fn draw_fan_images(&mut self, images: &mut FanImages, moving_only: bool) -> io::Result<()> {
+    if !self.graphics_visible() {
+      return images.hide(&mut stdout());
+    }
+    let caps = self.capabilities.unwrap();
+    let side = self.placements[0].side;
+    if !self.cooling.rasterize(side, theme::fan_palette(caps), moving_only) {
+      return Err(io::Error::other("fan image rasterization failed"));
+    }
+    for (slot, (image, place)) in self.cooling.items().iter().zip(&self.placements).enumerate() {
+      if !moving_only || image.rotor.moving() {
+        let r = place.image;
+        images.render(&mut stdout(), &image.rgba, side, slot, (r.x, r.y), (r.width, r.height))?;
+      }
+    }
+    Ok(())
   }
 
   /// Layout of a frame for the window `area`, with the state that follows the window updated
   /// before anything is drawn: whether the process list fits, and whether it is on screen.
   fn layout_frame(&mut self, area: Rect) -> LayoutPlan {
-    self.procs_fit =
-      compute_console_layout(area, true, self.clusters.items.len(), !self.soc.vm).proc.is_some();
-    let plan = self.layout(area);
+    self.procs_fit = self.cooling_layout(area, true).0.proc.is_some();
+    let (plan, placements) = self.cooling_layout(area, self.cfg.show_procs);
+    self.placements = placements;
     self.set_procs_visible(plan.proc.is_some());
     plan
   }
@@ -604,6 +706,7 @@ impl App {
 
     // the key hints go on the lowest box: the process box, or the metrics box without it
     self.render_metrics_box(f, &plan);
+    self.cooling.render(f, &self.placements);
     if let Some(r) = plan.proc {
       self.render_proc_box(f, r);
       self.info.iter_mut().for_each(|info| info.render(f, r));
@@ -626,19 +729,75 @@ impl App {
     run_procs_thread(tx.clone(), msec.clone(), self.procs_shown.clone(), proc_sampler);
 
     // the guard restores the terminal on every way out of here, `?` included
+    self.run_terminal(tx, rx, &msec)
+  }
+
+  fn run_terminal(
+    &mut self,
+    tx: mpsc::Sender<Event>,
+    rx: mpsc::Receiver<Event>,
+    msec: &RwLock<u32>,
+  ) -> WithError<()> {
     let (mut term, _guard) = enter_term()?;
-    run_inputs_thread(tx.clone(), 250);
+    let mut images = FanImages::new().ok();
+    let detection = if let Some(images) = &mut images {
+      Some(fan_protocol::detect(&mut stdout(), images)?)
+    } else {
+      None
+    };
+    let mut pending = None;
+    if let Some(detection) = detection {
+      if let Some(caps) = detection.capabilities {
+        self.set_capabilities(caps);
+      }
+      for event in detection.early_events.into_iter().filter_map(input_event) {
+        if self.apply_event(event, msec)?.is_break() {
+          return Ok(());
+        }
+      }
+      pending = detection.pending;
+    }
+    run_inputs_thread(tx, 250, pending);
     self.three_level_bars = theme::detect_three_level_bars();
 
     let mut mouse = false;
     let mut redraw = true;
+    let mut clock = FrameClock::default();
     loop {
       if redraw {
+        let next = self.cooling_layout(term.size()?.into(), self.cfg.show_procs).1;
+        if (self.help.is_some() || next != self.placements)
+          && let Some(images) = &mut images
+        {
+          images.hide(&mut stdout())?;
+        }
         term.draw(|f| self.render(f))?;
         mouse = set_mouse_capture(&mut stdout(), mouse, self.wants_mouse())?;
+        if let Some(images) = &mut images {
+          self.draw_fan_images(images, false)?;
+        }
       }
-      let event = rx.recv()?;
-      match self.apply_event(event, &msec)? {
+      let active = images.is_some() && self.fan_frames_active();
+      clock.set_active(active, Instant::now());
+      let event = if let Some(wait) = clock.wait(Instant::now()) {
+        match rx.recv_timeout(wait) {
+          Ok(event) => event,
+          Err(mpsc::RecvTimeoutError::Timeout) => {
+            if let Some(delta) = clock.frame(Instant::now()) {
+              self.cooling.frame(delta);
+              if let Some(images) = &mut images {
+                self.draw_fan_images(images, true)?;
+              }
+            }
+            redraw = false;
+            continue;
+          }
+          Err(err) => return Err(err.into()),
+        }
+      } else {
+        rx.recv()?
+      };
+      match self.apply_event(event, msec)? {
         ControlFlow::Continue(changed) => redraw = changed,
         ControlFlow::Break(()) => break,
       }
@@ -679,6 +838,7 @@ mod tests {
   use crate::procs::ProcInfo;
 
   include!("ui_preview.rs");
+  include!("fan_preview.rs");
 
   #[test]
   fn idle_heartbeats_do_not_draw_but_samples_and_resize_do() {
@@ -1291,6 +1451,7 @@ mod tests {
 
   #[test]
   fn restoring_the_terminal_turns_mouse_capture_off_once() {
+    let _session = super::fan_images::TEST_SESSION.lock().unwrap();
     let active = AtomicBool::new(true);
     let mut out = vec![];
     let mut raw_off = 0;

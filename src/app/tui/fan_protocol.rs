@@ -3,7 +3,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{Event, KeyCode, KeyModifiers};
+use ratatui::crossterm::event::Event;
 
 use super::fan_images::FanImages;
 use super::fan_replies::ReplyParser;
@@ -116,7 +116,7 @@ impl PendingQueries {
           }
         }
       }
-      if Instant::now() >= deadline || events.iter().any(|event| matches!(event, Event::Key(key) if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))) {
+      if Instant::now() >= deadline || !events.is_empty() {
         break;
       }
     }
@@ -222,7 +222,9 @@ mod tests {
   use std::os::fd::{AsRawFd, FromRawFd};
   use std::thread;
 
-  use ratatui::crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+  use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+  };
 
   use super::*;
 
@@ -395,6 +397,18 @@ mod tests {
     let events = pending.read(Duration::from_millis(700)).unwrap();
     assert!(started.elapsed() < Duration::from_millis(250));
     assert_eq!(events, vec![Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))]);
+    assert!(!pending.finished());
+  }
+
+  #[test]
+  fn manual_pause_and_focus_events_return_without_waiting_for_missing_queries() {
+    let (input, mut terminal) = pipe();
+    let detected = detect_fd(&mut Vec::new(), input.as_raw_fd(), Duration::ZERO, PROBE_ID).unwrap();
+    let mut pending = detected.pending.unwrap();
+    terminal.write_all(b"a\x1b[O").unwrap();
+    let started = Instant::now();
+    assert_eq!(pending.read(Duration::from_millis(700)).unwrap(), vec![key('a'), Event::FocusLost]);
+    assert!(started.elapsed() < Duration::from_millis(100));
     assert!(!pending.finished());
   }
 

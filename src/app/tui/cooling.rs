@@ -13,6 +13,7 @@ use super::fan_raster::{FanRaster, Palette};
 use super::layout::{LayoutPlan, Metric, compute_console_layout};
 use super::theme;
 
+#[derive(Debug)]
 pub(super) struct FanImage {
   pub(super) name: String,
   pub(super) rpm: u32,
@@ -20,7 +21,7 @@ pub(super) struct FanImage {
   pub(super) rotor: Rotor,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct Cooling {
   items: Vec<FanImage>,
   raster: Option<FanRaster>,
@@ -64,12 +65,15 @@ impl Cooling {
   }
 
   /// Only geometry or fan-count changes allocate; frames reuse each output buffer.
-  pub(super) fn rasterize(&mut self, side: u16, palette: Palette) -> bool {
+  pub(super) fn rasterize(&mut self, side: u16, palette: Palette, moving_only: bool) -> bool {
     if self.raster.as_ref().is_none_or(|raster| raster.size() != usize::from(side)) {
       self.raster = FanRaster::new(usize::from(side));
     }
     let Some(raster) = &self.raster else { return false };
     for image in &mut self.items {
+      if moving_only && !image.rotor.moving() {
+        continue;
+      }
       image.rgba.resize(raster.rgba_len(), 0);
       if !raster.render_into(image.rotor.angle, palette, &mut image.rgba) {
         return false;
@@ -227,16 +231,16 @@ mod tests {
     let mut cooling = Cooling::default();
     cooling.sync(&[fan("actual", 1700)]);
     let palette = Palette { background: [1, 2, 3], foreground: [4, 5, 6], accent: [7, 8, 9] };
-    assert!(cooling.rasterize(180, palette));
+    assert!(cooling.rasterize(180, palette, false));
     let allocation = cooling.items()[0].rgba.as_ptr();
     let geometry = cooling.raster.as_ref().unwrap().geometry_ptr();
     cooling.frame(Duration::from_millis(17));
-    assert!(cooling.rasterize(180, palette));
+    assert!(cooling.rasterize(180, palette, false));
     assert_eq!(cooling.items()[0].rgba.as_ptr(), allocation);
     assert_eq!(cooling.raster.as_ref().unwrap().geometry_ptr(), geometry);
     assert_eq!(cooling.items()[0].name, "actual");
     assert_eq!(cooling.items()[0].rpm, 1700);
-    assert!(!cooling.rasterize(0, palette));
+    assert!(!cooling.rasterize(0, palette, false));
   }
 
   #[test]

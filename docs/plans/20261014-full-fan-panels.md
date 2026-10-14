@@ -30,8 +30,8 @@ target `Spacgithub/macmon`; `vladkens/macmon` remains a read-only upstream.
 
 - [x] Port and test the rasterizer and independent 60 FPS rotor clock.
 - [x] Implement bounded terminal capability detection and safe reply handling.
-- [ ] Implement owned image transmission and complete cleanup paths.
-- [ ] Integrate real fan identities, adaptive cooling panels and manual/focus/visibility gating.
+- [x] Implement owned image transmission and complete cleanup paths.
+- [x] Integrate real fan identities, adaptive cooling panels and manual/focus/visibility gating.
 - [ ] Validate output/config compatibility, resize, zero/missing RPM, terminal recovery and
       static/animated CPU, RSS and submitted-frame rate; distinguish actual Warp display checks.
 - [ ] Complete integrated reviews, required checks and feature PRs in the personal fork.
