@@ -15,6 +15,7 @@ check:
 
 test:
 	cargo test $(CARGO_FLAGS)
+	sh scripts/test-upstream-sync.sh
 
 build:
 	cargo build $(CARGO_FLAGS)
@@ -23,7 +24,13 @@ build:
 update:
 	cargo upgrade -i
 
-.PHONY: loc bench remote
+.PHONY: loc bench remote upstream-sync test-upstream-sync
+
+upstream-sync:
+	@sh scripts/upstream-sync.sh
+
+test-upstream-sync:
+	@sh scripts/test-upstream-sync.sh
 
 loc: # production lines, tests excluded; REF=origin/main compares with a git ref
 	@python3 scripts/loc.py $(REF)

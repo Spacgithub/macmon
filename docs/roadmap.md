@@ -81,3 +81,10 @@ Cleanup, no hurry: the Mach calls (`mach_host_self`, `mach_task_self`) come from
 deprecates them in favor of the `mach2` crate, so they sit under `#[allow(deprecated)]`
 (JohnTitor/mach2#34). Declare them with our own `extern "C"`, or move to `mach2` once it has
 what we need.
+
+## Personal fork maintenance
+
+- [ ] **14. Keep personal fork features while syncing upstream.** A one-command, isolated merge
+      with checks and a PR in `Spacgithub/macmon`; sync PRs preserve upstream history, and
+      inherited publication jobs remain restricted to the original repository.
+      Plan: [docs/plans/20261013-upstream-sync.md](plans/20261013-upstream-sync.md).

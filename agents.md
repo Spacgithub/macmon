@@ -4,6 +4,21 @@ Rootless Apple Silicon monitor and Rust library. Shared sampling and metric type
 
 The TUI is in `src/app/tui/`. Per-process usage (`src/app/procs.rs`) comes from libproc for the user's own processes, the setuid `/bin/ps` for other users' processes, and GPU time from the IORegistry (`IOAccelerator` children).
 
+## Personal fork rules
+
+- This checkout maintains `Spacgithub/macmon`; `vladkens/macmon` is a read-only upstream.
+  All pushes and pull requests target the personal fork. Configure upstream's push URL as
+  `/dev/null` and the local `remote.pushDefault` as `origin`.
+- Keep personal features on fork `main` after the person merges their feature PRs. Integrate
+  upstream through `make upstream-sync`: an isolated worktree, a real merge, checks, and a PR.
+  Never replace fork main with upstream, force-update main, or discard local user changes.
+- Upstream sync PRs are the exception to the squash/rebase rules below: the person uses
+  **Create a merge commit** to preserve upstream ancestry. Do not squash or rebase these PRs.
+  Resolve conflicts while retaining both histories; failed checks stop publication.
+- Preserve these fork rules and the original-repository guards on inherited publication
+  jobs when reviewing upstream workflow changes. Adding a publisher requires an explicit
+  personal-fork release plan; inherited crate/Homebrew publishing stays disabled here.
+
 ## Development
 
 - Keep CLI-only code and dependencies behind the `app` feature; preserve library builds with `--no-default-features`.
