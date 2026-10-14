@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use info::Info;
 use kill::Kill;
 use layout::{LayoutPlan, compute_layout};
-use macmon::{Metrics, Sampler, SocInfo};
+use macmon::{Metrics, NetworkMetric, Sampler, SocInfo};
 use proc_view::ProcView;
 use ratatui::crossterm::event::{
   self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, KeyCode,
@@ -304,6 +304,7 @@ pub struct App {
   cpu_temp: TempStore,
   gpu_temp: TempStore,
   fans: FanStore,
+  network: Option<Vec<NetworkMetric>>,
 
   /// CPU clusters, lowest tier first (E / P on M1–M4, E / S on M5, P / S on M5 Pro/Max, E / P / S
   /// on M6).
@@ -353,6 +354,7 @@ impl App {
     self.cpu_temp.push(data.temp.cpu_temp_avg);
     self.gpu_temp.push(data.temp.gpu_temp_avg);
     self.fans.push(data.fans);
+    self.network = data.network;
 
     self.mem.push(data.memory);
   }
@@ -586,7 +588,10 @@ mod tests {
   use std::sync::{Arc, Mutex, RwLock, mpsc};
   use std::time::Duration;
 
-  use macmon::{CpuTierInfo, CpuTierMetrics, FanMetric, MemMetrics, Metrics, SocInfo, TempMetrics};
+  use macmon::{
+    CpuTierInfo, CpuTierMetrics, FanMetric, MemMetrics, Metrics, NetworkMetric, SocInfo,
+    TempMetrics,
+  };
   use ratatui::Terminal;
   use ratatui::backend::TestBackend;
   use ratatui::buffer::{Buffer, CellDiffOption};
@@ -594,7 +599,7 @@ mod tests {
   use ratatui::crossterm::event::{
     EnableMouseCapture, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
   };
-  use ratatui::layout::Margin;
+  use ratatui::layout::{Margin, Rect};
   use ratatui::style::Modifier;
 
   use super::kill::tests::FakeSys;
@@ -680,6 +685,83 @@ mod tests {
 
   fn test_app() -> App {
     test_app_with(|_| {})
+  }
+
+  fn network_app() -> App {
+    test_app_with(|m| {
+      m.network = Some(vec![
+        NetworkMetric { name: "anpi0".into(), ..Default::default() },
+        NetworkMetric {
+          name: "en0".into(),
+          rx_bytes: 1u64 << 40,
+          tx_bytes: 1u64 << 30,
+          rx_bytes_per_sec: Some(1048576.0),
+          tx_bytes_per_sec: Some(0.0),
+        },
+        NetworkMetric {
+          name: "utun0".into(),
+          rx_bytes: 10000,
+          tx_bytes: 20000,
+          rx_bytes_per_sec: Some(512.0),
+          tx_bytes_per_sec: None,
+        },
+        NetworkMetric { name: "awdl0".into(), rx_bytes: 1024, ..Default::default() },
+      ]);
+    })
+  }
+
+  #[test]
+  fn network_table_fits_totals_at_80_columns_and_orders_busiest_interfaces_first() {
+    for height in [24, 50] {
+      let mut app = network_app();
+      let buf = render_buffer(&mut app, 80, height);
+      let area = app.layout(buf.area).network.unwrap();
+      assert_eq!(area.width, 78);
+      assert!(row(&buf, area.y).contains("Network 3/4"));
+      let header = row(&buf, area.y + 1);
+      for label in ["Interface", "RX/s", "TX/s", "RX total", "TX total"] {
+        assert!(header.contains(label), "{header}");
+      }
+      let first = row(&buf, area.y + 2);
+      for text in ["en0", "1.0 MiB/s", "0.0 B/s", "1.0 TiB", "1.0 GiB"] {
+        assert!(first.contains(text), "{first}");
+      }
+      assert!(row(&buf, area.y + 3).contains("utun0"));
+      assert!(row(&buf, area.y + 3).contains('—'));
+      assert!(row(&buf, area.y + 4).contains("awdl0"));
+      // The unused interface sorts before awdl0 by name, so this proves the history tiebreak.
+      assert!(!screen_text(&buf).contains("anpi0"));
+    }
+  }
+
+  #[test]
+  fn network_table_drops_whole_columns_and_shows_how_many_interfaces_fit() {
+    for (width, columns) in [(80, 5), (60, 4), (45, 3), (33, 2), (20, 1)] {
+      let mut app = network_app();
+      let buf = render_buffer(&mut app, width, 50);
+      let area = app.layout(buf.area).network.unwrap();
+      let header = row(&buf, area.y + 1);
+      for (i, label) in
+        ["Interface", "RX/s", "TX/s", "RX total", "TX total"].into_iter().enumerate()
+      {
+        assert_eq!(header.contains(label), i < columns, "{width}: {header}");
+      }
+    }
+    let mut app = network_app();
+    let buf = render_buffer(&mut app, 80, 12);
+    let area = app.layout(buf.area).network.unwrap();
+    assert!(row(&buf, area.y).contains("Network 1/4"));
+    assert!(row(&buf, area.y + 2).contains("en0"));
+    assert!(app.layout(Rect::new(0, 0, 80, 8)).network.is_none());
+  }
+
+  #[test]
+  fn network_table_distinguishes_unavailable_from_no_active_interfaces() {
+    for (network, status) in [(None, "unavailable"), (Some(vec![]), "no active interfaces")] {
+      let mut app = test_app();
+      app.network = network;
+      assert!(render_to_string(&mut app, 80, 24).contains(status));
+    }
   }
 
   /// `test_app` saving its settings to `file`.
@@ -1237,7 +1319,12 @@ mod tests {
 
         // every box drawn where the layout puts it: no title, summary, hint, graph or table cell
         // lands on a corner
-        let boxes = plan.top.into_iter().chain(plan.proc).chain(plan.boxes.iter().map(|b| b.1));
+        let boxes = plan
+          .top
+          .into_iter()
+          .chain(plan.proc)
+          .chain(plan.network)
+          .chain(plan.boxes.iter().map(|b| b.1));
         for r in boxes.filter(|r| r.width >= 2 && r.height >= 2) {
           let (right, bottom) = (r.right() - 1, r.bottom() - 1);
           let corners =

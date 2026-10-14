@@ -77,6 +77,7 @@ mod clpc;
 pub mod diagnostics;
 #[doc(hidden)]
 pub mod metrics;
+mod network;
 mod shared;
 pub mod sources;
 
@@ -85,5 +86,7 @@ pub mod sources;
 pub use metrics::{
   CpuCoreMetrics, CpuTierMetrics, FanMetric, MemMetrics, Metrics, Sampler, TempMetrics,
 };
+#[doc(inline)]
+pub use network::NetworkMetric;
 #[doc(inline)]
 pub use sources::{CpuTierInfo, SocInfo};

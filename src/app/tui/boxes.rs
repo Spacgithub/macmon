@@ -6,10 +6,12 @@ use std::ops::Range;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+  Block, BorderType, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+};
 
 use super::App;
 use super::layout::{LayoutPlan, Metric};
@@ -29,6 +31,16 @@ const BORDER_TEXT_MIN: u16 = 8;
 /// Temperature position on the load gradient: 30 °C is cool, 100 °C is hot.
 fn temp_ratio(celsius: f32) -> f64 {
   (f64::from(celsius) - 30.0) / 70.0
+}
+
+fn network_bytes(mut bytes: f64) -> String {
+  let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+  let mut unit = 0;
+  while bytes >= 1024.0 && unit < units.len() - 1 {
+    bytes /= 1024.0;
+    unit += 1;
+  }
+  format!("{bytes:.1} {}", units[unit])
 }
 
 /// `width` cells as `u16`, the type of screen coordinates; saturating, as no text on screen is
@@ -331,6 +343,48 @@ struct MetricBox<'a> {
 }
 
 impl App {
+  pub(super) fn render_network_box(&self, f: &mut Frame, area: Rect) {
+    let mut metrics: Vec<_> = self.network.iter().flatten().collect();
+    let busy = |x: &macmon::NetworkMetric| {
+      x.rx_bytes_per_sec.unwrap_or(0.0) + x.tx_bytes_per_sec.unwrap_or(0.0)
+    };
+    let total = |x: &macmon::NetworkMetric| u128::from(x.rx_bytes) + u128::from(x.tx_bytes);
+    metrics.sort_by(|a, b| {
+      busy(b).total_cmp(&busy(a)).then_with(|| total(b).cmp(&total(a))).then(a.name.cmp(&b.name))
+    });
+    let shown = usize::from(area.height.saturating_sub(3)).min(3).min(metrics.len());
+    let title = format!("Network {shown}/{}", metrics.len());
+    let inner = draw_box(f, area, Titles::new(heading(title)));
+    if metrics.is_empty() {
+      let status = if self.network.is_none() { "unavailable" } else { "no active interfaces" };
+      f.render_widget(Paragraph::new(dim(status)), inner);
+      return;
+    }
+    let widths = [15u16, 12, 12, 11, 11];
+    let headers = ["Interface", "RX/s", "TX/s", "RX total", "TX total"];
+    let mut columns = widths.len();
+    while columns > 1 && widths[..columns].iter().sum::<u16>() + columns as u16 - 1 > inner.width {
+      columns -= 1;
+    }
+    let rate = |v: Option<f64>| v.map_or_else(|| "—".into(), |v| format!("{}/s", network_bytes(v)));
+    let rows = metrics.into_iter().take(shown).map(|m| {
+      let values = [
+        m.name.clone(),
+        rate(m.rx_bytes_per_sec),
+        rate(m.tx_bytes_per_sec),
+        network_bytes(m.rx_bytes as f64),
+        network_bytes(m.tx_bytes as f64),
+      ];
+      Row::new(values.into_iter().take(columns))
+    });
+    let widths = widths[..columns].iter().copied().map(Constraint::Length);
+    let header = Row::new(headers.into_iter().take(columns).map(heading));
+    f.render_widget(
+      Table::new(rows, widths).header(header).style(Style::new().fg(theme::TEXT)),
+      inner,
+    );
+  }
+
   /// `load` (`0.0..=1.0`) as a percent with `decimals`, in its load color.
   fn percent(&self, load: f64, decimals: usize) -> Span<'static> {
     Span::styled(format!("{:.decimals$}%", load * 100.0), gradient(load))
@@ -381,6 +435,10 @@ impl App {
       if kind == Metric::TotalPower && !fans.is_empty() && r.height >= 2 {
         render_bottom_border(f, r, vec![vec![text(fans.clone())]], |_| vec![]);
       }
+    }
+
+    if let Some(area) = plan.network {
+      self.render_network_box(f, area);
     }
 
     let hints = if plan.proc.is_none() { self.footer_hints() } else { vec![] };

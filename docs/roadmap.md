@@ -71,6 +71,11 @@ POWER does today.
       IOAccelerator client time.
       Plan (first PR): [docs/plans/completed/20261012-vm-start.md](plans/completed/20261012-vm-start.md).
 
+- [x] **13. Per-interface network monitoring.** Real-time receive/transmit rates and cumulative
+      byte counters without sudo, in the TUI, JSON, Rust library, and Prometheus exporter.
+      Keep interfaces separate to avoid double-counting VPN or bridge traffic.
+      Plan: [docs/plans/completed/20261013-network-monitor.md](plans/completed/20261013-network-monitor.md).
+
 Later, only on request: automatic grouping of an app's processes (filter terms with totals
 cover the known-app case), per-process network (only `nettop` has it without root), history
 graphs per process, Activity Monitor's Memory and Statistics tabs (context switches, faults,

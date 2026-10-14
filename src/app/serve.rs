@@ -102,6 +102,25 @@ fn to_prometheus(m: &Metrics, soc: &SocInfo) -> String {
     }
     out.push('\n');
   }
+  if let Some(network) = &m.network {
+    for (transmit, direction) in [(false, "receive"), (true, "transmit")] {
+      for (rates, kind, suffix) in [(false, "counter", "bytes_total"), (true, "gauge", "bytes_per_second")] {
+        let name = format!("macmon_network_{direction}_{suffix}");
+        let help = if rates { "Bytes per second" } else { "Cumulative bytes, reset when the interface restarts" };
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+        for metric in network {
+          let interface = escape_label_value(&metric.name);
+          let bytes = if transmit { metric.tx_bytes } else { metric.rx_bytes };
+          let rate = if transmit { metric.tx_bytes_per_sec } else { metric.rx_bytes_per_sec };
+          let value = if rates { rate.map(|x| x.to_string()) } else { Some(bytes.to_string()) };
+          if let Some(value) = value {
+            out.push_str(&format!("{name}{{{l},interface=\"{interface}\"}} {value}\n"));
+          }
+        }
+        out.push('\n');
+      }
+    }
+  }
   out
 }
 
@@ -277,9 +296,50 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-  use macmon::{CpuTierMetrics, Metrics, SocInfo};
+  use macmon::{CpuTierMetrics, Metrics, NetworkMetric, SocInfo};
 
   use super::{escape_label_value, escape_xml, serve_url, to_json, to_prometheus};
+
+  #[test]
+  fn exports_all_interfaces_with_escaped_labels_and_omits_unknown_rates() {
+    let old = to_prometheus(&Metrics::default(), &SocInfo::default());
+    let metric = NetworkMetric {
+      name: "en\\\"\n0".into(),
+      rx_bytes: 1u64 << 50,
+      tx_bytes: 20,
+      rx_bytes_per_sec: Some(1234.5),
+      tx_bytes_per_sec: None,
+    };
+    let metrics = Metrics {
+      network: Some(vec![metric, NetworkMetric { name: "utun0".into(), ..Default::default() }]),
+      ..Default::default()
+    };
+    let output = to_prometheus(&metrics, &SocInfo::default());
+    assert!(output.starts_with(&old));
+    let label = r#"chip="",interface="en\\\"\n0""#;
+    assert!(
+      output.contains(&format!("macmon_network_receive_bytes_total{{{label}}} 1125899906842624\n"))
+    );
+    assert!(output.contains(&format!("macmon_network_transmit_bytes_total{{{label}}} 20\n")));
+    assert!(
+      output.contains(&format!("macmon_network_receive_bytes_per_second{{{label}}} 1234.5\n"))
+    );
+    assert!(!output.contains(&format!("macmon_network_transmit_bytes_per_second{{{label}}}")));
+    assert!(
+      output.contains("macmon_network_receive_bytes_total{chip=\"\",interface=\"utun0\"} 0\n")
+    );
+    assert_eq!(output.matches("# TYPE macmon_network_receive_bytes_total counter").count(), 1);
+    assert_eq!(output.matches("# TYPE macmon_network_receive_bytes_per_second gauge").count(), 1);
+    assert!(!old.contains("macmon_network_"));
+    let json: serde_json::Value =
+      serde_json::from_str(&to_json(&metrics, &SocInfo::default())).unwrap();
+    assert_eq!(json["network"][0]["rx_bytes"].as_u64(), Some(1u64 << 50));
+    assert_eq!(json["network"][0]["rx_bytes_per_sec"], 1234.5);
+    assert!(json["network"][0]["tx_bytes_per_sec"].is_null());
+    assert_eq!(json["network"].as_array().unwrap().len(), 2);
+    assert_eq!(json["cpu_power"], 0.0);
+    assert!(json.get("cpu_usage_pct").is_some());
+  }
 
   #[test]
   fn unavailable_temperature_has_no_prometheus_gauge() {
