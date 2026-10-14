@@ -855,7 +855,7 @@ impl App {
 
     let (sort, desc) = (self.proc_view.sort, self.proc_view.sort_desc);
     let header = columns.iter().map(|&(column, _)| {
-      let color = if column == sort { theme::TEXT } else { theme::DIM };
+      let color = if column == sort { theme::KEY } else { theme::DIM };
       let style = Style::new().fg(color).add_modifier(Modifier::BOLD);
       Span::styled(column.header_text(sort, desc), style)
     });

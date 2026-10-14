@@ -6,11 +6,11 @@ use std::ops::Range;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::{Constraint, Margin, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-  Block, BorderType, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+  Block, BorderType, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
 };
 
 use super::App;
@@ -344,14 +344,7 @@ struct MetricBox<'a> {
 
 impl App {
   pub(super) fn render_network_box(&self, f: &mut Frame, area: Rect) {
-    let mut metrics: Vec<_> = self.network.iter().flatten().collect();
-    let busy = |x: &macmon::NetworkMetric| {
-      x.rx_bytes_per_sec.unwrap_or(0.0) + x.tx_bytes_per_sec.unwrap_or(0.0)
-    };
-    let total = |x: &macmon::NetworkMetric| u128::from(x.rx_bytes) + u128::from(x.tx_bytes);
-    metrics.sort_by(|a, b| {
-      busy(b).total_cmp(&busy(a)).then_with(|| total(b).cmp(&total(a))).then(a.name.cmp(&b.name))
-    });
+    let metrics = self.network.as_deref().unwrap_or_default();
     let shown = usize::from(area.height.saturating_sub(3)).min(3).min(metrics.len());
     let title = format!("Network {shown}/{}", metrics.len());
     let inner = draw_box(f, area, Titles::new(heading(title)));
@@ -361,24 +354,31 @@ impl App {
       return;
     }
     let widths = [15u16, 12, 12, 11, 11];
-    let headers = ["Interface", "RX/s", "TX/s", "RX total", "TX total"];
+    let headers = ["Interface", "↓ RX/s", "↑ TX/s", "RX total", "TX total"];
     let mut columns = widths.len();
     while columns > 1 && widths[..columns].iter().sum::<u16>() + columns as u16 - 1 > inner.width {
       columns -= 1;
     }
-    let rate = |v: Option<f64>| v.map_or_else(|| "—".into(), |v| format!("{}/s", network_bytes(v)));
-    let rows = metrics.into_iter().take(shown).map(|m| {
+    let rate = |v: Option<f64>, color| {
+      let label = v.map_or_else(|| "—".into(), |v| format!("{}/s", network_bytes(v)));
+      let value = if v.is_some_and(|v| v > 0.0) { theme::value(label, color) } else { dim(label) };
+      Cell::from(Line::from(value).right_aligned())
+    };
+    let rows = metrics.iter().take(shown).map(|m| {
       let values = [
-        m.name.clone(),
-        rate(m.rx_bytes_per_sec),
-        rate(m.tx_bytes_per_sec),
-        network_bytes(m.rx_bytes as f64),
-        network_bytes(m.tx_bytes as f64),
+        Cell::from(heading(m.name.clone())),
+        rate(m.rx_bytes_per_sec, theme::DOWNLOAD),
+        rate(m.tx_bytes_per_sec, theme::UPLOAD),
+        Cell::from(Line::from(dim(network_bytes(m.rx_bytes as f64))).right_aligned()),
+        Cell::from(Line::from(dim(network_bytes(m.tx_bytes as f64))).right_aligned()),
       ];
       Row::new(values.into_iter().take(columns))
     });
     let widths = widths[..columns].iter().copied().map(Constraint::Length);
-    let header = Row::new(headers.into_iter().take(columns).map(heading));
+    let header = Row::new(headers.into_iter().take(columns).enumerate().map(|(i, label)| {
+      let line = Line::from(heading(label));
+      if i == 0 { line } else { line.right_aligned() }
+    }));
     f.render_widget(
       Table::new(rows, widths).header(header).style(Style::new().fg(theme::TEXT)),
       inner,
@@ -387,7 +387,7 @@ impl App {
 
   /// `load` (`0.0..=1.0`) as a percent with `decimals`, in its load color.
   fn percent(&self, load: f64, decimals: usize) -> Span<'static> {
-    Span::styled(format!("{:.decimals$}%", load * 100.0), gradient(load))
+    theme::value(format!("{:.decimals$}%", load * 100.0), gradient(load))
   }
 
   /// Key hints for the bottom border of the lowest box (see `hint`): the global keys, help first as
@@ -420,15 +420,27 @@ impl App {
 
     let fans = self.fans.label();
     for &(kind, r) in &plan.boxes {
-      let metric = self.metric_box(kind);
+      let metric = self.metric_box(kind, r.width);
       let inner = draw_box(f, r, fit_titles(r.width, metric.titles));
-      let graph = Graph::new(metric.data).three_levels(self.three_level_bars);
+      let accent = match kind {
+        Metric::Cluster(_) => theme::CPU,
+        Metric::Gpu => theme::GPU,
+        Metric::Ram => theme::MEMORY,
+        _ => theme::POWER,
+      };
+      if r.width > 1 && r.height > 2 {
+        let stripe = Rect { y: r.y + 1, width: 1, height: r.height - 2, ..r };
+        f.buffer_mut().set_style(stripe, Style::new().fg(accent));
+      }
+      let graph_area =
+        inner.inner(Margin::new(u16::from(inner.width > 4), u16::from(inner.height > 3)));
+      let graph = Graph::new(metric.data).color(accent).three_levels(self.three_level_bars);
       match metric.scale {
         Scale::Load { load, .. } if self.cfg.view_type == ViewType::Gauge => {
           f.render_widget(Gauge::new(load), inner)
         }
-        Scale::Load { max, .. } => f.render_widget(graph.max(max), inner),
-        Scale::Power => f.render_widget(graph.color(gradient(0.0)), inner),
+        Scale::Load { max, .. } => f.render_widget(graph.accent(accent).max(max), graph_area),
+        Scale::Power => f.render_widget(graph, graph_area),
       }
 
       // the fans (`1200 rpm`) right on the bottom border of the total power box
@@ -449,7 +461,7 @@ impl App {
   /// version gives way to the chip.
   fn metrics_titles(&self) -> Titles<'static> {
     let version = format!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    Titles::new(self.chip_title()).right(text(version))
+    Titles::new(self.chip_title()).right(dim(version))
   }
 
   /// `Apple M3 Pro (6E+6P+18GPU 36GB)`, the details in parentheses dim. Core counts come from the
@@ -476,7 +488,7 @@ impl App {
 
     // a chip name the library couldn't read still leaves a title
     let name = if soc.chip_name.is_empty() { env!("CARGO_PKG_NAME") } else { &soc.chip_name };
-    let mut spans = vec![text(name.to_string())];
+    let mut spans = vec![heading(name.to_string())];
     if !details.is_empty() {
       spans.push(dim(format!(" ({details})")));
     }
@@ -484,7 +496,7 @@ impl App {
   }
 
   /// Titles and history of `metric`; its cluster comes from the same list the layout counts.
-  fn metric_box(&self, metric: Metric) -> MetricBox<'_> {
+  fn metric_box(&self, metric: Metric, width: u16) -> MetricBox<'_> {
     match metric {
       Metric::Cluster(i) => {
         let cluster = &self.clusters.items[i];
@@ -497,10 +509,10 @@ impl App {
       }
       Metric::Gpu => self.freq_box("GPU".to_string(), &self.igpu_freq),
       Metric::Ram => self.ram_box(),
-      Metric::CpuPower => self.power_box("CPU", &self.cpu_power, self.cpu_temp.last()),
-      Metric::GpuPower => self.power_box("GPU", &self.gpu_power, self.gpu_temp.last()),
-      Metric::AnePower => self.power_box("ANE", &self.ane_power, None),
-      Metric::TotalPower => self.total_power_box(),
+      Metric::CpuPower => self.power_box("CPU", &self.cpu_power, self.cpu_temp.last(), width),
+      Metric::GpuPower => self.power_box("GPU", &self.gpu_power, self.gpu_temp.last(), width),
+      Metric::AnePower => self.power_box("ANE", &self.ane_power, None, width),
+      Metric::TotalPower => self.total_power_box(width),
     }
   }
 
@@ -511,7 +523,7 @@ impl App {
     let short = vec![heading(label), text(" "), self.percent(series.ratio, 0)];
     let mut full = short.clone();
     if freq.freq_mhz > 0 {
-      full.push(text(format!(" @ {} MHz", freq.freq_mhz)));
+      full.push(dim(format!(" @ {} MHz", freq.freq_mhz)));
     }
 
     MetricBox {
@@ -554,39 +566,73 @@ impl App {
 
   /// `CPU 4.50W (3.10, 8.20)` (current, average, maximum; original format), or `CPU 4.50W` when
   /// that doesn't fit, with the temperature (`45°C`) on the right when the sensor exists, over the
-  /// power history in the low load color, scaled to its largest visible sample. Always a graph,
-  /// as in the original.
+  /// power history, scaled to its largest visible sample. Narrow boxes reduce precision before
+  /// dropping the value, so the number and its unit are never cut. Always a graph.
   fn power_box<'a>(
     &self,
     label: &'static str,
     store: &'a PowerStore,
     temp: Option<f32>,
+    width: u16,
   ) -> MetricBox<'a> {
-    let short = vec![heading(label), text(format!(" {:.2}W", store.top_value))];
+    let value = |precision| {
+      vec![
+        heading(label),
+        theme::value(format!(" {:.*}W", precision, store.top_value), theme::TEXT),
+      ]
+    };
+    let short = value(2);
     let mut full = short.clone();
     full.push(dim(format!(" ({:.2}, {:.2})", store.avg_value, store.max_value)));
 
-    let titles = [full, short].map(|left| {
-      let titles = Titles::new(left);
-      match temp {
-        Some(temp) => {
-          titles.right(Span::styled(format!("{temp:.0}°C"), gradient(temp_ratio(temp))))
+    let mut titles: Vec<_> = [full, short]
+      .into_iter()
+      .map(|left| {
+        let titles = Titles::new(left);
+        match temp {
+          Some(temp) => {
+            titles.right(Span::styled(format!("{temp:.0}°C"), gradient(temp_ratio(temp))))
+          }
+          None => titles,
         }
-        None => titles,
+      })
+      .collect();
+    let fits = |titles: &[Titles]| titles.last().is_some_and(|title| title.fits(width));
+    for precision in [2, 1, 0] {
+      if fits(&titles) {
+        break;
       }
-    });
+      titles.push(Titles::new(value(precision)));
+    }
+    if !fits(&titles) {
+      let compact = match label {
+        "Total" => "Tot",
+        "Power" => "Pwr",
+        label => label,
+      };
+      titles.push(Titles::new(vec![
+        heading(compact),
+        theme::value(format!(" {:.0}W", store.top_value), theme::TEXT),
+      ]));
+    }
+    if !fits(&titles) {
+      titles.push(Titles::new(heading(label)));
+    }
+    if !fits(&titles) {
+      titles.push(Titles::default());
+    }
 
-    MetricBox { titles: titles.into(), data: &store.items, scale: Scale::Power }
+    MetricBox { titles, data: &store.items, scale: Scale::Power }
   }
 
   /// `Total 12.00W (12.00, 12.00)`, the whole system, or `Power 6.60W (6.60, 6.60)`, CPU + GPU +
   /// ANE, without the system power sensor. The fans go on its bottom border (`render_metrics_box`).
-  fn total_power_box(&self) -> MetricBox<'_> {
+  fn total_power_box(&self, width: u16) -> MetricBox<'_> {
     // the newest sample, not the smoothed `top_value`, so the box switches as soon as it reads 0
     if self.sys_power.items.first().is_some_and(|&mw| mw > 0) {
-      self.power_box("Total", &self.sys_power, None)
+      self.power_box("Total", &self.sys_power, None, width)
     } else {
-      self.power_box("Power", &self.all_power, None)
+      self.power_box("Power", &self.all_power, None, width)
     }
   }
 }

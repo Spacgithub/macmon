@@ -82,6 +82,15 @@ Options:
 
 Run `macmon` without a subcommand to open the terminal UI: the metric boxes on top and the process list below. Press `?` in the app to see the keys.
 
+CPU, GPU and RAM charts use terminal-theme accents; high-load history remains red. Primary
+values are bold, while secondary details are dimmed. Network receive/transmit rates and totals
+are aligned, with arrows marking their direction. Narrow power boxes reduce precision while
+keeping each displayed number and its unit complete.
+
+The screen redraws when data, input or the window size changes. Unchanged input heartbeats skip
+drawing, and interfaces are ranked when samples arrive. The default sampling interval stays
+1000 ms; the existing controls and saved configuration remain compatible.
+
 Press `/` to filter the process list. A filter is a comma-separated list of terms, each matched case-insensitively against the process name or pid: `safari, cargo` shows processes matching any term, and a term starting with `!` hides its matches (`chrome, !helper`). `Enter` keeps the filter, `Esc` clears it.
 
 ### JSON output

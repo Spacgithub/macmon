@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::widgets::Widget;
 
-use super::theme::gradient;
+use super::theme::{gradient, graph_color};
 
 /// Bar heights in one row: `▁` (1/8) up to `█` (8/8).
 const BAR_LEVELS: u64 = 8;
@@ -56,13 +56,14 @@ pub(super) struct Graph<'a> {
   data: &'a [u64],
   max: Option<u64>,
   color: Option<Color>,
+  warn_hot: bool,
   three_levels: bool,
 }
 
 impl<'a> Graph<'a> {
   /// Graph scaled to its largest visible sample, each bar in its load color.
   pub(super) fn new(data: &'a [u64]) -> Self {
-    Self { data, max: None, color: None, three_levels: false }
+    Self { data, max: None, color: None, warn_hot: false, three_levels: false }
   }
 
   /// Bars in three levels (blank, `▄`, `█`) instead of eighths, for Apple Terminal, which draws
@@ -81,6 +82,14 @@ impl<'a> Graph<'a> {
   /// Draws every bar in `color` instead of its load color.
   pub(super) fn color(mut self, color: Color) -> Self {
     self.color = Some(color);
+    self.warn_hot = false;
+    self
+  }
+
+  /// An accent below the hot-load threshold, red above it.
+  pub(super) fn accent(mut self, color: Color) -> Self {
+    self.color = Some(color);
+    self.warn_hot = true;
     self
   }
 }
@@ -97,7 +106,12 @@ impl Widget for Graph<'_> {
     let levels = u64::from(area.height) * BAR_LEVELS;
     for (x, &value) in (area.left()..area.right()).rev().zip(visible) {
       let mut level = bar_level(value, max, levels);
-      let color = self.color.unwrap_or_else(|| gradient(value as f64 / max as f64));
+      let load = value as f64 / max as f64;
+      let color = match self.color {
+        Some(accent) if self.warn_hot => graph_color(accent, load),
+        Some(color) => color,
+        None => gradient(load),
+      };
       for y in (area.top()..area.bottom()).rev() {
         if level == 0 {
           break;
@@ -151,6 +165,18 @@ mod tests {
     let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
     widget.render(buf.area, &mut buf);
     buf
+  }
+
+  #[test]
+  fn chart_accents_keep_hot_history_red_without_changing_power_colors() {
+    let accent = crate::tui::theme::CPU;
+    let levels = [67, 66, 33];
+    let buf = draw(Graph::new(&levels).max(100).accent(accent), 3, 2);
+    assert_eq!(buf[(0, 1)].fg, accent);
+    assert_eq!(buf[(1, 1)].fg, accent);
+    assert_eq!(buf[(2, 1)].fg, Color::Red);
+    let power = draw(Graph::new(&levels).max(100).color(accent), 3, 2);
+    assert!(power.content.iter().filter(|cell| cell.symbol() != " ").all(|cell| cell.fg == accent));
   }
 
   fn rows(buf: &Buffer) -> Vec<String> {
