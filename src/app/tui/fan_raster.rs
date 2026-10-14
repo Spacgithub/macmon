@@ -61,6 +61,11 @@ impl FanRaster {
     self.size * self.size * 4
   }
 
+  #[cfg(test)]
+  pub(super) fn geometry_ptr(&self) -> *const () {
+    self.samples.as_ptr().cast()
+  }
+
   /// Renders a continuous angle in radians. Positive angles turn clockwise in image coordinates.
   /// The highlighted first blade turns with the rotor; the rim and center shaft do not turn.
   /// Requires an exact-size output buffer and a finite angle; otherwise leaves it untouched.
