@@ -1,3 +1,5 @@
+Done: 2026-10-14, PR #11
+
 # Full graphical fan panels
 
 Implement the selected deep-space cooling panels in the native terminal UI. All branches and PRs
@@ -39,6 +41,18 @@ target `Spacgithub/macmon`; `vladkens/macmon` remains a read-only upstream.
 - [x] Integrate real fan identities, adaptive cooling panels and manual/focus/visibility gating.
 - [x] Validate output/config compatibility, resize, zero/missing RPM, terminal recovery and
       static/animated CPU, RSS and submitted-frame rate; distinguish actual Warp display checks.
-- [ ] Verify visible fan images and terminal restoration in the person's actual Warp session.
-- [ ] Complete integrated reviews, required checks and one feature PR in the personal fork.
+- [x] Verify visible fan images and terminal restoration in the person's actual Warp session.
+- [x] Complete integrated reviews, required checks and one feature PR in the personal fork.
 - [x] Refresh and verify the installed command with the previous binary retained.
+
+## Result
+
+Delivered as one complete PR, #11, retaining the earlier feature commits. Warp uses inline
+RGBA because the installed terminal rejects local-file image transmission. The person
+confirmed both complete fans and the Network panel; the ten-second native run completed
+1,202 image submissions and restored the terminal without changing saved settings.
+Required checks, 258 unit/doc tests and 14 upstream-sync fixtures passed. Private PTYs
+verified controls, resize, file/fallback terminals and aborting-panic cleanup; real rootless
+M2 Max checks verified the installed command, two actual fans and 21 network interfaces,
+including JSON and Prometheus. Moving/static resource costs were measured separately;
+actual display FPS was not measured. The prior installed executable remains recoverable.
