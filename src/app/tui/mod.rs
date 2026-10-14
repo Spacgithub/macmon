@@ -1,6 +1,10 @@
 //! Terminal user interface.
 
 mod boxes;
+#[allow(dead_code)] // Used by the following stacked cooling-panel integration.
+mod fan_clock;
+#[allow(dead_code)] // Used by the following stacked cooling-panel integration.
+mod fan_raster;
 mod help;
 mod info;
 mod kill;
