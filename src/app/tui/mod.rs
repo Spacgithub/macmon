@@ -5,6 +5,8 @@ mod boxes;
 mod cooling;
 #[allow(dead_code)] // Used by the following stacked cooling-panel integration.
 mod fan_clock;
+#[allow(dead_code)] // Runtime wiring follows the owned file-image transport.
+mod fan_images;
 #[allow(dead_code)] // Used by the following stacked cooling-panel integration.
 mod fan_raster;
 #[allow(dead_code)] // Startup capability detection follows this framed input parser.
