@@ -310,6 +310,7 @@ pub struct App {
   gpu_temp: TempStore,
   fans: FanStore,
   fan_tick: u8,
+  fan_phase: bool,
   /// Set by rendering only while the fan indicator is actually on screen and uncovered.
   fan_motion_visible: bool,
   unfocused: bool,
@@ -460,7 +461,9 @@ impl App {
       }
       let before = self.fans.motion_glyph(self.fan_tick);
       self.fan_tick = self.fan_tick.wrapping_add(1);
-      return Ok(ControlFlow::Continue(self.fans.motion_glyph(self.fan_tick) != before));
+      let changed = self.fans.motion_glyph(self.fan_tick) != before;
+      self.fan_phase ^= changed;
+      return Ok(ControlFlow::Continue(changed));
     }
     Ok(self.handle_event(event, msec).map_continue(|()| true))
   }
@@ -792,9 +795,11 @@ mod tests {
       assert_eq!(app.fan_tick, before + u8::from(visible));
     }
     app.help = None;
+    let before = terminal.draw(|f| app.render(f)).unwrap().buffer.clone();
     app.cfg.animate_fans = false;
     let buf = terminal.draw(|f| app.render(f)).unwrap().buffer.clone();
-    assert!(screen_text(&buf).contains("╋ 3000 rpm"));
+    let area = app.fan_area(&app.layout(buf.area)).unwrap();
+    assert_eq!(row(&before, area.bottom() - 1), row(&buf, area.bottom() - 1));
     assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
 
     app.cfg.animate_fans = true;
@@ -804,10 +809,66 @@ mod tests {
       );
       let buf = terminal.draw(|f| app.render(f)).unwrap().buffer.clone();
       let screen = screen_text(&buf);
-      assert_eq!(screen.contains("╋ 0 rpm"), rpm.is_some());
+      assert_eq!(screen.contains("0 rpm"), rpm.is_some());
       assert_eq!(app.fan_motion_visible, rpm.is_some());
       assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
     }
+  }
+
+  #[test]
+  fn changing_rpm_bands_never_change_orientation_without_an_allowed_heartbeat() {
+    let interval = RwLock::new(250);
+    let mut app = test_app_with(|m| m.fans[0].rpm = 1499);
+    let displayed = |app: &mut App| {
+      let buf = render_buffer(app, 120, 40);
+      buf
+        .content
+        .iter()
+        .filter_map(|c| match c.symbol() {
+          "╋" => Some('╋'),
+          "╳" => Some('╳'),
+          _ => None,
+        })
+        .collect::<String>()
+    };
+    assert_eq!(displayed(&mut app), "╋");
+    for _ in 0..2 {
+      assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
+    }
+    assert_eq!(app.fan_tick, 2);
+    let mut last = displayed(&mut app);
+    for focused in [false, true] {
+      assert_eq!(
+        app
+          .apply_event(if focused { Event::FocusGained } else { Event::FocusLost }, &interval)
+          .unwrap(),
+        ControlFlow::Continue(true)
+      );
+      for rpm in [1500, 1499, 3000, 2999, 1500, 3000] {
+        let mut metrics = test_metrics();
+        metrics.fans[0].rpm = rpm;
+        assert_eq!(
+          app.apply_event(Event::Update(Box::new(metrics)), &interval).unwrap(),
+          ControlFlow::Continue(true)
+        );
+        assert_eq!(displayed(&mut app), last, "sampling {rpm} must not turn the fan");
+        if !focused {
+          assert_eq!(
+            app.apply_event(Event::Tick, &interval).unwrap(),
+            ControlFlow::Continue(false)
+          );
+          assert_eq!(displayed(&mut app), last);
+        }
+      }
+    }
+    // With the window focused, only the next eligible Tick advances the saved orientation.
+    for _ in 0..4 {
+      assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(true));
+      let current = displayed(&mut app);
+      assert_ne!(current, last);
+      last = current;
+    }
+    assert_eq!(*interval.read().unwrap(), 250);
   }
 
   #[test]

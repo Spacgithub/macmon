@@ -772,8 +772,7 @@ impl App {
     }
     let mut spans = vec![];
     if self.fan_motion_visible {
-      let tick = if self.cfg.animate_fans { self.fan_tick } else { 0 };
-      let glyph = self.fans.motion_glyph(tick).unwrap();
+      let glyph = if self.fan_phase { '╳' } else { '╋' };
       let color = if self.fans.spinning() { theme::POWER } else { theme::DIM };
       spans.extend([Span::styled(glyph.to_string(), color), text(" ")]);
     }
