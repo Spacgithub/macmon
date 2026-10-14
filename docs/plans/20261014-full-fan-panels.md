@@ -1,5 +1,3 @@
-Done: 2026-10-14, PR #11
-
 # Full graphical fan panels
 
 Implement the selected deep-space cooling panels in the native terminal UI. All branches and PRs
@@ -23,8 +21,9 @@ target `Spacgithub/macmon`; `vladkens/macmon` remains a read-only upstream.
   delayed replies and fragmented replies cannot act as keyboard shortcuts. Image ownership is
   limited to this macmon process; hide, resize, error, panic and exit remove its own images.
 - Keep rootless metric sources, Network Monitoring, JSON, Prometheus, the library API and
-  dependency versions compatible. Organize rendering, terminal capability/ownership and UI
-  integration as small reviewable PRs, with each incremental production change measured.
+  dependency versions compatible. Deliver rendering, terminal capability/ownership and UI
+  integration in one feature PR, with the person's approved exception to the production-line
+  budget. Keep the full production change measured against fork main.
 - Refresh the installed executable only after integrated checks pass, retain a recoverable
   previous executable and verify fresh-zsh command resolution and real rootless operation.
 
@@ -36,15 +35,6 @@ target `Spacgithub/macmon`; `vladkens/macmon` remains a read-only upstream.
 - [x] Integrate real fan identities, adaptive cooling panels and manual/focus/visibility gating.
 - [x] Validate output/config compatibility, resize, zero/missing RPM, terminal recovery and
       static/animated CPU, RSS and submitted-frame rate; distinguish actual Warp display checks.
-- [x] Complete integrated reviews, required checks and feature PRs in the personal fork.
+- [ ] Verify visible fan images and terminal restoration in the person's actual Warp session.
+- [ ] Complete integrated reviews, required checks and one feature PR in the personal fork.
 - [x] Refresh and verify the installed command with the previous binary retained.
-
-## Result
-
-Implemented the graphical fan panels through the small PR stack #6–#11. Required checks,
-257 unit/doc tests and 14 upstream-sync fixtures passed. Native private-PTY tests submitted
-about 60 frames per second per moving fan and covered controls, queue pressure, late/missing
-replies, resize, zero/missing RPM, and normal/error/aborting-panic recovery. Real rootless
-M2 Max checks preserved Network Monitoring, JSON, Prometheus and the saved configuration.
-The installed preview matches the checked release build, with the previous binary retained.
-Actual Warp GUI rendering and presentation FPS remain unverified.
