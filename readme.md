@@ -180,6 +180,7 @@ New processes and unavailable rates show a dash. Process sampling runs once per 
 metrics cycle, independently of browsers. Only loopback clients with a matching loopback Host
 receive process names and PIDs; other requests get `processes: null`. Snapshot age is reported
 as `processes_age_ms`, and all processes remain accessible in the scrollable table.
+System metric timestamps and age include the time spent collecting the separate process snapshot.
 
 Compact mechanical fans show reported names and RPM. Zero RPM remains stationary; missing
 readings and VM-only placeholders stay unavailable. The Fan motion switch and reduced-motion
