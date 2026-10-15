@@ -1,17 +1,51 @@
 //! HTTP serving and launchd support.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use macmon::{Metrics, SocInfo};
 
+use crate::config::{TUI_MAX_MS, TUI_MIN_MS};
 use crate::metrics_to_json_value;
 use crate::procs::ProcessSnapshot;
 
 pub type SharedMetrics = Arc<RwLock<Option<Sample>>>;
+pub type SharedCadence = Arc<RwLock<Cadence>>;
+
+pub struct Cadence {
+  requested_ms: u32,
+  effective_ms: u32,
+}
+
+impl Cadence {
+  pub fn new(initial_ms: u32) -> Self {
+    Self { requested_ms: initial_ms, effective_ms: initial_ms }
+  }
+
+  pub fn begin(&mut self) -> u32 {
+    self.effective_ms = self.requested_ms;
+    self.effective_ms
+  }
+
+  fn adjust(&mut self, adjustment: &str) -> bool {
+    self.requested_ms = match adjustment {
+      "increase" => self.requested_ms.saturating_add(250) / 250 * 250,
+      "decrease" => self.requested_ms.saturating_sub(250).div_ceil(250) * 250,
+      _ => return false,
+    }
+    .clamp(TUI_MIN_MS, TUI_MAX_MS);
+    true
+  }
+
+  fn value(&self) -> serde_json::Value {
+    serde_json::json!({"requested_ms": self.requested_ms, "effective_ms": self.effective_ms,
+      "pending": self.requested_ms != self.effective_ms})
+  }
+}
 
 pub struct Sample {
   metrics: Metrics,
@@ -182,13 +216,14 @@ fn to_json(m: &Metrics, soc: &SocInfo) -> String {
   json_value(m, soc, &chrono::Utc::now().to_rfc3339()).to_string()
 }
 
-fn to_sample(sample: &Sample, soc: &SocInfo, local: bool) -> String {
+fn to_sample(sample: &Sample, soc: &SocInfo, local: bool, cadence: &Cadence) -> String {
   let processes = sample.processes.as_ref().filter(|_| local);
   serde_json::json!({
     "sequence": sample.sequence,
     "sampled_at": sample.sampled_at,
     "age_ms": sample.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64,
     "interval_ms": sample.interval_ms,
+    "cadence": cadence.value(),
     "metrics": json_value(&sample.metrics, soc, &sample.sampled_at),
     "processes": processes.map(|snapshot| &snapshot.rows),
     "processes_age_ms": processes.map(|snapshot| snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
@@ -196,7 +231,14 @@ fn to_sample(sample: &Sample, soc: &SocInfo, local: bool) -> String {
   .to_string()
 }
 
-fn read_path(stream: &mut TcpStream) -> Option<(String, bool)> {
+struct Request {
+  method: String,
+  path: String,
+  headers: HashMap<String, String>,
+  body: Vec<u8>,
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<Request> {
   let deadline = Instant::now() + Duration::from_secs(2);
   let mut header = Vec::new();
   let mut buf = [0; 1024];
@@ -211,7 +253,8 @@ fn read_path(stream: &mut TcpStream) -> Option<(String, bool)> {
     if let Some(end) = header.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
       let text = std::str::from_utf8(&header[..end]).ok()?;
       let mut line = text.lines().next()?.split_whitespace();
-      if line.next()? != "GET" {
+      let method = line.next()?;
+      if !matches!(method, "GET" | "POST") {
         return None;
       }
       let path = line.next()?;
@@ -221,36 +264,67 @@ fn read_path(stream: &mut TcpStream) -> Option<(String, bool)> {
       {
         return None;
       }
-      let mut hosts = text
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_once(':'))
-        .filter(|(name, _)| name.eq_ignore_ascii_case("Host"));
-      let port = stream.local_addr().ok()?.port();
-      let local_host = hosts.next().is_some_and(|(_, host)| local_host(host.trim(), port))
-        && hosts.next().is_none();
-      return Some((path.split('?').next().unwrap_or(path).to_string(), local_host));
+      let mut headers = HashMap::new();
+      for field in text.lines().skip(1) {
+        let (name, value) = field.split_once(':')?;
+        let name = name.to_ascii_lowercase();
+        if matches!(
+          name.as_str(),
+          "host" | "origin" | "content-type" | "content-length" | "transfer-encoding"
+        ) && headers.insert(name, value.trim().to_string()).is_some()
+        {
+          return None;
+        }
+      }
+      let mut request = Request {
+        method: method.to_string(),
+        path: path.split('?').next()?.to_string(),
+        headers,
+        body: header[end + 4..].to_vec(),
+      };
+      if method == "POST" {
+        let length: usize = request.headers.get("content-length")?.parse().ok()?;
+        if length > 64 || request.headers.contains_key("transfer-encoding") {
+          return None;
+        }
+        while request.body.len() < length {
+          stream.set_read_timeout(Some(deadline.checked_duration_since(Instant::now())?)).ok()?;
+          let n = stream.read(&mut buf[..(length - request.body.len()).min(1024)]).ok()?;
+          if n == 0 {
+            return None;
+          }
+          request.body.extend_from_slice(&buf[..n]);
+        }
+        if request.body.len() != length {
+          return None;
+        }
+      }
+      return Some(request);
     }
   }
   None
-}
-
-fn local_host(host: &str, port: u16) -> bool {
-  host.eq_ignore_ascii_case(&format!("localhost:{port}"))
-    || (port == 80 && host.eq_ignore_ascii_case("localhost"))
-    || host
-      .parse::<std::net::SocketAddr>()
-      .or_else(|_| format!("{host}:80").parse())
-      .is_ok_and(|address| loopback(address.ip()) && address.port() == port)
 }
 
 fn loopback(ip: std::net::IpAddr) -> bool {
   ip.to_canonical().is_loopback()
 }
 
+fn loopback_host(peer: SocketAddr, port: u16, host: &str) -> bool {
+  let address = host
+    .parse::<SocketAddr>()
+    .ok()
+    .or_else(|| (port == 80).then(|| format!("{host}:80").parse::<SocketAddr>().ok()).flatten());
+  loopback(peer.ip())
+    && (host.eq_ignore_ascii_case(&format!("localhost:{port}"))
+      || port == 80 && host.eq_ignore_ascii_case("localhost")
+      || address.is_some_and(|address| loopback(address.ip()) && address.port() == port))
+}
+
 fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
   let status_text = match status {
     200 => "OK",
+    400 => "Bad Request",
+    403 => "Forbidden",
     404 => "Not Found",
     503 => "Service Unavailable",
     _ => "OK",
@@ -281,14 +355,53 @@ fn escape_xml(value: &str) -> String {
     .replace('\'', "&apos;")
 }
 
-fn handle_conn(mut stream: TcpStream, shared: SharedMetrics, soc: Arc<SocInfo>) {
+fn handle_conn(
+  mut stream: TcpStream,
+  shared: SharedMetrics,
+  soc: Arc<SocInfo>,
+  cadence: SharedCadence,
+) {
   if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
     return;
   }
-  let (path, local_host) = match read_path(&mut stream) {
+  let request = match read_request(&mut stream) {
     Some(p) => p,
     None => return,
   };
+  let path = &request.path;
+  let host = request.headers.get("host").map(String::as_str).unwrap_or("");
+  let local = stream
+    .peer_addr()
+    .ok()
+    .zip(stream.local_addr().ok())
+    .is_some_and(|(peer, local)| loopback_host(peer, local.port(), host));
+  if request.method == "POST" {
+    let allowed = local
+      && request.headers.get("origin").is_some_and(|origin| origin == &format!("http://{host}"))
+      && request.headers.get("content-type").is_some_and(|kind| {
+        kind.split(';').next().unwrap().trim().eq_ignore_ascii_case("application/json")
+      });
+    let body = serde_json::from_slice::<serde_json::Value>(&request.body).unwrap_or_default();
+    let status = if path != "/api/interval" {
+      404
+    } else if !allowed {
+      403
+    } else {
+      200
+    };
+    let (status, body) = if status == 200 {
+      let mut control = cadence.write().unwrap();
+      if control.adjust(body["adjustment"].as_str().unwrap_or("")) {
+        (200, control.value().to_string())
+      } else {
+        (400, r#"{"error":"invalid adjustment"}"#.to_string())
+      }
+    } else {
+      (status, r#"{"error":"local same-origin POST required"}"#.to_string())
+    };
+    write_response(&mut stream, status, "application/json", &body);
+    return;
+  }
 
   if path == "/" {
     write_response(&mut stream, 200, "application/json", r#"{}"#);
@@ -327,8 +440,7 @@ fn handle_conn(mut stream: TcpStream, shared: SharedMetrics, soc: Arc<SocInfo>) 
       write_response(&mut stream, 200, "application/json", &body);
     }
     "/api/sample" => {
-      let local = local_host && stream.peer_addr().is_ok_and(|peer| loopback(peer.ip()));
-      let body = to_sample(sample, &soc, local);
+      let body = to_sample(sample, &soc, local, &cadence.read().unwrap());
       drop(lock);
       write_response(&mut stream, 200, "application/json", &body);
     }
@@ -411,11 +523,13 @@ pub fn run(
   port: u16,
   shared: SharedMetrics,
   soc: Arc<SocInfo>,
+  cadence: SharedCadence,
 ) -> Result<(), Box<dyn std::error::Error>> {
   let listener = TcpListener::bind((host, port))?;
   eprintln!("macmon serving on http://{}", listener.local_addr()?);
   eprintln!("  GET /dashboard/ → Local dashboard");
   eprintln!("  GET /api/sample → Latest sample with freshness metadata");
+  eprintln!("  POST /api/interval → Same-origin loopback sampling control");
   eprintln!("  GET /json    → JSON metrics");
   eprintln!("  GET /metrics → Prometheus format");
 
@@ -423,7 +537,8 @@ pub fn run(
     let Ok(stream) = stream else { continue };
     let shared = Arc::clone(&shared);
     let soc = Arc::clone(&soc);
-    thread::spawn(move || handle_conn(stream, shared, soc));
+    let cadence = Arc::clone(&cadence);
+    thread::spawn(move || handle_conn(stream, shared, soc, cadence));
   }
 
   Ok(())
@@ -440,22 +555,33 @@ mod tests {
   use macmon::{CpuTierMetrics, Metrics, NetworkMetric, SocInfo};
 
   use super::{
-    SharedMetrics, escape_label_value, escape_xml, handle_conn, publish_sample, read_path,
-    serve_url, to_json, to_prometheus, to_sample,
+    Cadence, SharedCadence, SharedMetrics, escape_label_value, escape_xml, handle_conn,
+    loopback_host, publish_sample, read_request, serve_url, to_json, to_prometheus, to_sample,
   };
 
   fn request(shared: &SharedMetrics, fragments: &[&[u8]]) -> String {
+    exchange(shared, &Arc::new(RwLock::new(Cadence::new(1000))), |_| {
+      fragments.iter().map(|part| part.to_vec()).collect()
+    })
+  }
+
+  fn exchange(
+    shared: &SharedMetrics,
+    cadence: &SharedCadence,
+    build: impl FnOnce(u16) -> Vec<Vec<u8>>,
+  ) -> String {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let shared = Arc::clone(shared);
+    let cadence = Arc::clone(cadence);
     let worker = thread::spawn(move || {
-      handle_conn(listener.accept().unwrap().0, shared, Arc::new(SocInfo::default()));
+      handle_conn(listener.accept().unwrap().0, shared, Arc::new(SocInfo::default()), cadence);
     });
     let mut client = TcpStream::connect(address).unwrap();
     client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     client.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-    for fragment in fragments {
-      client.write_all(fragment).unwrap();
+    for fragment in build(address.port()) {
+      client.write_all(&fragment).unwrap();
       thread::sleep(Duration::from_millis(5));
     }
     let _ = client.shutdown(Shutdown::Write);
@@ -470,6 +596,17 @@ mod tests {
 
   fn get(shared: &SharedMetrics, path: &str) -> String {
     request(shared, &[format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes()])
+  }
+
+  fn adjustment(shared: &SharedMetrics, cadence: &SharedCadence, action: &str) -> String {
+    exchange(shared, cadence, |port| {
+      let body = format!(r#"{{"adjustment":"{action}"}}"#);
+      let header = format!(
+        "POST /api/interval?control=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+      );
+      vec![header.as_bytes()[..17].to_vec(), header.as_bytes()[17..].to_vec(), body.into_bytes()]
+    })
   }
 
   fn body(response: &str) -> &str {
@@ -523,6 +660,7 @@ mod tests {
         lock.as_ref().unwrap(),
         &SocInfo::default(),
         false,
+        &Cadence::new(1500),
       ))
       .unwrap()
     };
@@ -556,7 +694,8 @@ mod tests {
     let lock = shared.read().unwrap();
     let sample = lock.as_ref().unwrap();
     let json: serde_json::Value =
-      serde_json::from_str(&to_sample(sample, &SocInfo::default(), true)).unwrap();
+      serde_json::from_str(&to_sample(sample, &SocInfo::default(), true, &Cadence::new(1000)))
+        .unwrap();
     assert_eq!(sample.sampled, instant);
     assert_eq!(json["sampled_at"], timestamp);
     assert_eq!(json["metrics"]["timestamp"], timestamp);
@@ -566,6 +705,7 @@ mod tests {
 
   #[test]
   fn loopback_peers_and_host_authorities_canonicalize_mapped_ipv4() {
+    let peer = "[::ffff:127.0.0.1]:54321".parse().unwrap();
     for ip in ["127.0.0.1", "127.12.0.1", "::1", "::ffff:127.0.0.1"] {
       assert!(super::loopback(ip.parse().unwrap()), "{ip}");
     }
@@ -573,15 +713,16 @@ mod tests {
       assert!(!super::loopback(ip.parse().unwrap()), "{ip}");
     }
     for host in ["localhost:9090", "127.0.0.1:9090", "[::1]:9090", "[::ffff:127.0.0.1]:9090"] {
-      assert!(super::local_host(host, 9090), "{host}");
+      assert!(loopback_host(peer, 9090, host), "{host}");
     }
     for host in ["localhost", "127.0.0.1", "[::1]", "[::ffff:127.0.0.1]"] {
-      assert!(super::local_host(host, 80), "{host}");
-      assert!(!super::local_host(host, 9090), "unported {host}");
+      assert!(loopback_host(peer, 80, host), "{host}");
+      assert!(!loopback_host(peer, 9090, host), "unported {host}");
     }
     for host in ["[::ffff:192.0.2.1]:9090", "[::ffff:127.0.0.1]:80", "foreign.example:9090"] {
-      assert!(!super::local_host(host, 9090), "{host}");
+      assert!(!loopback_host(peer, 9090, host), "{host}");
     }
+    assert!(!loopback_host("[::ffff:192.0.2.1]:54321".parse().unwrap(), 9090, "localhost:9090"));
   }
 
   #[test]
@@ -621,7 +762,14 @@ mod tests {
       eprintln!("Validated local process disclosure for peer {peer}");
       assert!(super::loopback(peer.ip()));
       let latest = Arc::clone(&shared);
-      let worker = thread::spawn(move || handle_conn(stream, latest, Arc::new(SocInfo::default())));
+      let worker = thread::spawn(move || {
+        handle_conn(
+          stream,
+          latest,
+          Arc::new(SocInfo::default()),
+          Arc::new(RwLock::new(Cadence::new(1000))),
+        )
+      });
       client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
       write!(client, "GET /api/sample HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").unwrap();
       let mut response = String::new();
@@ -656,7 +804,12 @@ mod tests {
       let address = listener.local_addr().unwrap();
       let latest = Arc::clone(&shared);
       let worker = thread::spawn(move || {
-        handle_conn(listener.accept().unwrap().0, latest, Arc::new(SocInfo::default()))
+        handle_conn(
+          listener.accept().unwrap().0,
+          latest,
+          Arc::new(SocInfo::default()),
+          Arc::new(RwLock::new(Cadence::new(1000))),
+        )
       });
       let mut client = TcpStream::connect(address).unwrap();
       client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -665,6 +818,10 @@ mod tests {
       let mut response = String::new();
       client.read_to_string(&mut response).unwrap();
       worker.join().unwrap();
+      if authority.contains("\r\n") {
+        assert!(response.is_empty(), "Duplicate Host must be rejected before routing");
+        continue;
+      }
       let json: serde_json::Value = serde_json::from_str(body(&response)).unwrap();
       assert_eq!(json["processes"].is_array(), allowed, "{authority}");
       if allowed {
@@ -675,8 +832,13 @@ mod tests {
       assert_eq!(json["sequence"], 1);
     }
     let lock = shared.read().unwrap();
-    let remote: serde_json::Value =
-      serde_json::from_str(&to_sample(lock.as_ref().unwrap(), &SocInfo::default(), false)).unwrap();
+    let remote: serde_json::Value = serde_json::from_str(&to_sample(
+      lock.as_ref().unwrap(),
+      &SocInfo::default(),
+      false,
+      &Cadence::new(1000),
+    ))
+    .unwrap();
     assert!(remote["processes"].is_null() && remote["processes_age_ms"].is_null());
     let old: serde_json::Value = serde_json::from_str(body(&get(&shared, "/json"))).unwrap();
     assert!(old.get("processes").is_none() && old.get("processes_age_ms").is_none());
@@ -738,7 +900,7 @@ mod tests {
     let worker = thread::spawn(move || {
       let mut stream = listener.accept().unwrap().0;
       let started = Instant::now();
-      assert!(read_path(&mut stream).is_none());
+      assert!(read_request(&mut stream).is_none());
       tx.send(started.elapsed()).unwrap();
     });
     let mut client = TcpStream::connect(address).unwrap();
@@ -750,6 +912,212 @@ mod tests {
     worker.join().unwrap();
     assert!(elapsed >= Duration::from_millis(1800), "{elapsed:?}");
     assert!(elapsed < Duration::from_millis(2900), "{elapsed:?}");
+  }
+
+  #[test]
+  fn interval_adjustments_match_terminal_steps_and_keep_cli_initial_values() {
+    for (initial, action, expected) in [
+      (100, "increase", 250),
+      (100, "decrease", 250),
+      (1000, "increase", 1250),
+      (1000, "decrease", 750),
+      (999, "increase", 1000),
+      (999, "decrease", 750),
+      (250, "decrease", 250),
+      (10_000, "increase", 10_000),
+      (u32::MAX, "increase", 10_000),
+    ] {
+      let mut cadence = Cadence::new(initial);
+      assert_eq!(cadence.begin(), initial, "CLI interval stays compatible");
+      assert!(cadence.adjust(action));
+      assert_eq!(cadence.value()["requested_ms"], expected);
+      assert_eq!(cadence.value()["effective_ms"], initial);
+      assert_eq!(cadence.begin(), expected);
+      assert_eq!(cadence.value()["pending"], false);
+      assert!(!cadence.adjust("set"));
+      assert_eq!(cadence.begin(), expected);
+    }
+  }
+
+  #[test]
+  fn interval_host_validation_uses_loopback_peer_literal_host_and_actual_port() {
+    let peer = "127.0.0.1:54321".parse().unwrap();
+    for host in ["127.0.0.1:9090", "127.42.0.1:9090", "localhost:9090", "[::1]:9090"] {
+      assert!(loopback_host(peer, 9090, host), "{host}");
+    }
+    for host in [
+      "",
+      "localhost",
+      "127.0.0.1",
+      "127.0.0.1:9091",
+      "localhost:9091",
+      "example.com:9090",
+      "127.0.0.1.example.com:9090",
+      "localhost.:9090",
+      "user@localhost:9090",
+      "0.0.0.0:9090",
+      "[::]:9090",
+      "192.168.1.1:9090",
+    ] {
+      assert!(!loopback_host(peer, 9090, host), "{host}");
+    }
+    for host in ["localhost", "127.0.0.1", "[::1]", "127.0.0.1:80"] {
+      assert!(loopback_host(peer, 80, host), "{host}");
+    }
+    assert!(!loopback_host("192.168.1.1:54321".parse().unwrap(), 9090, "localhost:9090"));
+    assert!(loopback_host("[::1]:54321".parse().unwrap(), 9090, "[::1]:9090"));
+  }
+
+  #[test]
+  fn local_json_post_changes_only_the_next_window_and_allows_repeated_adjustments() {
+    let shared = Arc::new(RwLock::new(None));
+    let cadence = Arc::new(RwLock::new(Cadence::new(100)));
+    let response = adjustment(&shared, &cadence, "increase");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(!response.contains("Access-Control-Allow-Origin"));
+    let pending: serde_json::Value = serde_json::from_str(body(&response)).unwrap();
+    assert_eq!(pending, serde_json::json!({"requested_ms":250,"effective_ms":100,"pending":true}));
+    adjustment(&shared, &cadence, "increase");
+    assert_eq!(cadence.read().unwrap().value()["requested_ms"], 500);
+    assert_eq!(cadence.read().unwrap().value()["effective_ms"], 100);
+    assert_eq!(cadence.write().unwrap().begin(), 500);
+    let invalid = adjustment(&shared, &cadence, "set");
+    assert!(invalid.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    assert_eq!(cadence.read().unwrap().value()["requested_ms"], 500);
+  }
+
+  #[test]
+  fn interval_post_rejects_cross_origin_rebinding_and_ambiguous_requests() {
+    let shared = Arc::new(RwLock::new(None));
+    let cadence = Arc::new(RwLock::new(Cadence::new(1000)));
+    for mutation in [
+      "missing-origin",
+      "foreign-origin",
+      "null-origin",
+      "wrong-port",
+      "rebinding-host",
+      "missing-type",
+      "form-type",
+      "duplicate-host",
+      "duplicate-origin",
+      "transfer-encoding",
+      "oversized-body",
+      "truncated-body",
+      "no-length",
+      "bad-body",
+      "get",
+    ] {
+      let response = exchange(&shared, &cadence, |port| {
+        let mut host = format!("127.0.0.1:{port}");
+        let mut origin = format!("Origin: http://{host}\r\n");
+        let mut kind = "Content-Type: application/json\r\n";
+        let mut extra = String::new();
+        let mut payload = r#"{"adjustment":"decrease"}"#.to_string();
+        let mut length = payload.len().to_string();
+        match mutation {
+          "missing-origin" => origin.clear(),
+          "foreign-origin" => origin = "Origin: https://attacker.invalid\r\n".into(),
+          "null-origin" => origin = "Origin: null\r\n".into(),
+          "wrong-port" => host = format!("127.0.0.1:{}", port.saturating_sub(1)),
+          "rebinding-host" => {
+            host = format!("localhost.attacker.invalid:{port}");
+            origin = format!("Origin: http://{host}\r\n");
+          }
+          "missing-type" => kind = "",
+          "form-type" => kind = "Content-Type: text/plain\r\n",
+          "duplicate-host" => extra = format!("Host: {host}\r\n"),
+          "duplicate-origin" => extra = origin.clone(),
+          "transfer-encoding" => extra = "Transfer-Encoding: chunked\r\n".into(),
+          "oversized-body" => length = "65".into(),
+          "truncated-body" => length = "64".into(),
+          "bad-body" => payload = "not-json".into(),
+          _ => {}
+        }
+        if mutation == "bad-body" {
+          length = payload.len().to_string();
+        }
+        let length = if mutation == "no-length" {
+          String::new()
+        } else {
+          format!("Content-Length: {length}\r\n")
+        };
+        let method = if mutation == "get" { "GET" } else { "POST" };
+        vec![format!("{method} /api/interval HTTP/1.1\r\nHost: {host}\r\n{origin}{kind}{extra}{length}\r\n{payload}").into_bytes()]
+      });
+      match mutation {
+        "duplicate-host" | "duplicate-origin" | "transfer-encoding" | "oversized-body"
+        | "truncated-body" | "no-length" => assert!(response.is_empty(), "{mutation}: {response}"),
+        "bad-body" => assert!(response.starts_with("HTTP/1.1 400"), "{response}"),
+        "get" => assert!(response.starts_with("HTTP/1.1 503"), "{response}"),
+        _ => assert!(response.starts_with("HTTP/1.1 403"), "{mutation}: {response}"),
+      }
+      assert_eq!(cadence.read().unwrap().value()["requested_ms"], 1000, "{mutation}");
+    }
+  }
+
+  #[test]
+  fn sampling_windows_consume_control_only_at_begin_and_publish_the_completed_interval() {
+    let shared = Arc::new(RwLock::new(None));
+    let cadence = Arc::new(RwLock::new(Cadence::new(100)));
+    let (start_tx, start_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
+    let samples = Arc::clone(&shared);
+    let control = Arc::clone(&cadence);
+    let sampler = thread::spawn(move || {
+      for _ in 0..2 {
+        start_rx.recv().unwrap();
+        let interval = control.write().unwrap().begin();
+        event_tx.send((interval, false, Duration::ZERO)).unwrap();
+        let started = Instant::now();
+        thread::sleep(Duration::from_millis(interval as u64));
+        let time = super::sample_time();
+        publish_sample(
+          &samples,
+          Metrics::default(),
+          interval,
+          Some(crate::procs::ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() }),
+          time,
+        );
+        event_tx.send((interval, true, started.elapsed())).unwrap();
+      }
+    });
+    start_tx.send(()).unwrap();
+    assert_eq!(event_rx.recv().unwrap().0, 100);
+    adjustment(&shared, &cadence, "increase");
+    let (interval, done, elapsed) = event_rx.recv().unwrap();
+    assert!(done && interval == 100 && elapsed >= Duration::from_millis(100));
+    let read = || {
+      exchange(&shared, &cadence, |port| {
+        vec![format!("GET /api/sample HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").into_bytes()]
+      })
+    };
+    let pending: serde_json::Value = serde_json::from_str(body(&read())).unwrap();
+    assert_eq!(pending["interval_ms"], 100);
+    assert_eq!(pending["cadence"]["effective_ms"], 100);
+    assert_eq!(pending["cadence"]["requested_ms"], 250);
+    assert!(pending["processes"].as_array().unwrap().is_empty());
+    start_tx.send(()).unwrap();
+    assert_eq!(event_rx.recv().unwrap().0, 250);
+    let in_flight: serde_json::Value = serde_json::from_str(body(&read())).unwrap();
+    assert_eq!(in_flight["sequence"], pending["sequence"]);
+    assert_eq!(in_flight["interval_ms"], 100);
+    assert_eq!(in_flight["cadence"]["effective_ms"], 250);
+    assert_eq!(in_flight["cadence"]["pending"], false);
+    assert_eq!(in_flight["processes"], pending["processes"]);
+    assert!(
+      in_flight["processes_age_ms"].as_u64().unwrap()
+        >= pending["processes_age_ms"].as_u64().unwrap()
+    );
+    adjustment(&shared, &cadence, "increase");
+    let (interval, done, elapsed) = event_rx.recv().unwrap();
+    assert!(done && interval == 250 && elapsed >= Duration::from_millis(250));
+    sampler.join().unwrap();
+    let completed: serde_json::Value = serde_json::from_str(body(&read())).unwrap();
+    assert_eq!(completed["sequence"], 2);
+    assert_eq!(completed["interval_ms"], 250);
+    assert_eq!(completed["cadence"]["requested_ms"], 500);
+    assert_eq!(completed["cadence"]["effective_ms"], 250);
+    assert_eq!(cadence.write().unwrap().begin(), 500);
   }
 
   #[test]

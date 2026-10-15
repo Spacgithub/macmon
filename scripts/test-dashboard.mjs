@@ -93,6 +93,7 @@ function boot({ reduced = false } = {}) {
     const element = new Element(match[1], /\bclass="([^"]*)"/.exec(match[2])?.[1] || '');
     element._text = match[4].replaceAll('&mdash;', '—');
     element.hidden = /\bhidden\b/.test(match[2]);
+    element.disabled = /\bdisabled\b/.test(match[2]);
     const section = new Element(), parent = new Element();
     section.append(parent); parent.append(element);
     elements.set(match[3], element);
@@ -109,8 +110,14 @@ function boot({ reduced = false } = {}) {
     return id;
   };
   const fetch = (url, options) => {
-    assert.equal(url, '/api/sample');
-    assert.equal(options.cache, 'no-store');
+    assert.ok(['/api/sample', '/api/interval'].includes(url));
+    if (url === '/api/sample') assert.equal(options.cache, 'no-store');
+    else {
+      assert.equal(options.method, 'POST');
+      assert.equal(options.headers['Content-Type'], 'application/json');
+      assert.ok(['increase', 'decrease'].includes(JSON.parse(options.body).adjustment));
+    }
+    assert.ok(!requests.some((request) => request.url === url && !request.done), `Concurrent ${url}`);
     const request = { url, options, done: false, jsonCalls: 0 };
     activeFetches++;
     maximumFetches = Math.max(maximumFetches, activeFetches);
@@ -142,7 +149,7 @@ function boot({ reduced = false } = {}) {
     cancelAnimationFrame: (id) => frames.delete(id) });
   new vm.Script(source, { filename: sourcePath }).runInContext(context, { timeout: 1000 });
   const inspect = (expression) => vm.runInContext(expression, context, { timeout: 1000 });
-  const pending = () => requests.find((request) => !request.done);
+  const pending = (url = '/api/sample') => requests.find((request) => request.url === url && !request.done);
   const advance = async (milliseconds) => {
     const until = now + milliseconds;
     let iterations = 0;
@@ -166,7 +173,9 @@ function boot({ reduced = false } = {}) {
     now: () => now,
     maximumFetches: () => maximumFetches,
     async answer(payload, status = 200) { assert.ok(pending(), 'No pending real poll'); pending().answer(payload, status); await drainMicrotasks(); },
+    async control(payload, status = 200) { assert.ok(pending('/api/interval'), 'No pending real control'); pending('/api/interval').answer(payload, status); await drainMicrotasks(); },
     async fail() { assert.ok(pending()); pending().fail(); await drainMicrotasks(); },
+    async click(id) { const element = elements.get(id); if (!element.disabled) element.emit('click'); await drainMicrotasks(); },
     advance,
     async frame(milliseconds = 1000 / 60) {
       await advance(milliseconds);
@@ -190,9 +199,10 @@ function metrics(overrides = {}) {
     network: [{ name: 'en0', rx_bytes_per_sec: 1000, tx_bytes_per_sec: 500, rx_bytes: 4096, tx_bytes: 2048 }],
     fans: [{ name: 'fan0', rpm: 1800, max_rpm: 6800 }, { name: 'fan1', rpm: 2400 }], ...overrides };
 }
-function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, data = metrics(), processes = null, processes_age_ms = null } = {}) {
-  return { sequence, sampled_at, age_ms, interval_ms, metrics: data, processes, processes_age_ms };
+function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null } = {}) {
+  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms };
 }
+const cadence = (requested_ms = 1000, effective_ms = requested_ms) => ({ requested_ms, effective_ms, pending: requested_ms !== effective_ms });
 async function nextPoll(harness) {
   for (let i = 0; !harness.pending() && i < 4; i++) await harness.advance(1000);
   assert.ok(harness.pending(), 'Expected the actual poll scheduler to fetch');
@@ -441,6 +451,93 @@ await check('process snapshots distinguish local-only, empty, stale and retained
   assert.match(h.text('process-status'), /^OFFLINE \/ retained/);
   await nextPoll(h); await h.answer(sample(), 503);
   assert.match(h.text('process-status'), /^WAITING \/ retained/);
+});
+
+await check('interval controls use intentional POSTs and show actual effective settings', async () => {
+  const h = boot();
+  assert.equal(h.elements.get('interval-up').disabled, true);
+  await h.answer(sample({ interval_ms: 100, cadence: cadence(100) }));
+  assert.equal(h.text('interval-value'), '100 ms', 'Old CLI lower bound remains visible');
+  await h.click('interval-up');
+  assert.equal(h.elements.get('interval-up').disabled, true);
+  assert.equal(h.text('interval-value'), '100 ms', 'No optimistic backend value');
+  assert.match(h.text('interval-feedback'), /Applying/);
+  assert.equal(JSON.parse(h.pending('/api/interval').options.body).adjustment, 'increase');
+  await h.control(cadence(250, 100));
+  assert.match(h.text('interval-feedback'), /Pending 250 ms/);
+  assert.equal(h.elements.get('interval-up').disabled, false);
+  assert.equal(h.elements.get('interval-down').disabled, true);
+  assert.ok(h.pending(), 'POST completion immediately refreshes the sample');
+  await h.answer(sample({ interval_ms: 100, cadence: cadence(250) }));
+  assert.equal(h.text('interval-value'), '250 ms');
+  assert.match(h.text('cadence-footer'), /250 ms sampling/);
+  assert.equal(h.state().history.length, 1, 'Same sample refreshes cadence without extra history');
+  await h.advance(249); assert.equal(h.pending(), undefined);
+  await h.advance(1); assert.ok(h.pending(), 'Effective 250 ms also changes poll cadence');
+});
+
+await check('pending intervals stay adjustable while a long window is finishing', async () => {
+  const h = boot(); await h.answer(sample({ interval_ms: 10000, cadence: cadence(10000) }));
+  assert.equal(h.elements.get('interval-up').disabled, true);
+  await h.click('interval-down'); await h.control(cadence(9750, 10000));
+  assert.match(h.text('interval-feedback'), /Pending 9750 ms/);
+  assert.equal(h.text('interval-value'), '10000 ms');
+  assert.equal(h.elements.get('interval-down').disabled, false);
+  assert.equal(h.elements.get('interval-up').disabled, false);
+  await h.click('interval-down');
+  assert.ok(h.pending('/api/interval'), 'No need to wait for a completed sample to adjust again');
+  await h.control(cadence(9500, 10000));
+  await h.answer(sample({ interval_ms: 10000, cadence: cadence(9500, 10000) }));
+  await h.advance(0);
+  if (h.pending()) await h.answer(sample({ interval_ms: 10000, cadence: cadence(9500, 10000) }));
+  await h.advance(999); assert.equal(h.pending(), undefined);
+  await h.advance(1); assert.ok(h.pending(), 'Pending long acquisitions are checked at least once a second');
+  assert.equal(h.text('interval-value'), '10000 ms');
+  assert.equal(h.state().history.length, 1);
+});
+
+await check('POST rejection and timeout keep the last server value and release controls', async () => {
+  const h = boot(); await h.answer(sample({ cadence: cadence() }));
+  await h.click('interval-up'); await h.control({ error: 'forbidden' }, 403);
+  assert.equal(h.text('interval-value'), '1000 ms');
+  assert.match(h.text('interval-feedback'), /not confirmed/);
+  assert.equal(h.elements.get('interval-up').disabled, false);
+  await h.answer(sample({ cadence: cadence() }));
+  await h.click('interval-down');
+  await h.advance(2501);
+  assert.equal(h.pending('/api/interval'), undefined);
+  assert.equal(h.text('interval-value'), '1000 ms');
+  assert.match(h.text('interval-feedback'), /not confirmed/);
+  assert.equal(h.elements.get('interval-down').disabled, false);
+  if (h.pending()) await h.answer(sample({ cadence: cadence(750, 1000) }));
+  await h.click('interval-up'); await h.control(cadence());
+  assert.match(h.text('interval-feedback'), /Service sampling/);
+  assert.equal(h.state().changing, false);
+});
+
+await check('only actual in-flight cadence can extend freshness, never a pending request', async () => {
+  const stuck = boot(); await stuck.answer(sample({ interval_ms: 250, cadence: cadence(10000, 250) }));
+  for (let elapsed = 250; elapsed <= 3000; elapsed += 250) {
+    await stuck.advance(250);
+    await stuck.answer(sample({ interval_ms: 250, age_ms: elapsed, cadence: cadence(10000, 250) }));
+  }
+  await stuck.advance(1);
+  assert.equal(stuck.status(), 'stale', 'A sampler that never begins cannot remain LIVE by accepting requests');
+  assert.equal(stuck.elements.get('interval-down').disabled, false);
+  assert.match(stuck.text('interval-feedback'), /Pending 10000 ms/);
+  const active = boot(); await active.answer(sample({ interval_ms: 250, cadence: cadence(10000, 250) }));
+  await active.advance(250);
+  await active.answer(sample({ interval_ms: 250, age_ms: 250, cadence: cadence(10000) }));
+  assert.equal(active.state().history.length, 1);
+  await active.advance(4000);
+  assert.equal(active.status(), 'live', 'A confirmed long acquisition legitimately has a longer deadline');
+  assert.equal(active.pending(), undefined);
+  assert.match(active.text('interval-value'), /10000 ms/);
+  const angle = active.state().fans.get('fan0').angle;
+  await animate(active, 30);
+  assert.ok(active.state().fans.get('fan0').angle > angle, 'Fan rAF stays independent of 10 s polling');
+  await active.advance(25001);
+  assert.notEqual(active.status(), 'live', 'An indefinitely stuck long acquisition still expires');
 });
 
 console.log(`${tests.length} dashboard checks passed.`);

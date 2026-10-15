@@ -12,7 +12,11 @@
   <main class="dashboard">
     <header class="masthead">
       <div><p class="eyebrow">MACMON / LOCAL TELEMETRY</p><h1>System observatory</h1><p id="device" class="muted">Waiting for device telemetry</p></div>
-      <div class="connection"><span id="status" role="status" aria-live="polite" data-state="connecting">CONNECTING</span><p id="sample-time" class="muted">No sample received</p></div>
+      <div class="connection"><span id="status" role="status" aria-live="polite" data-state="connecting">CONNECTING</span><p id="sample-time" class="muted">No sample received</p>
+        <div class="interval-control" aria-label="Service sampling interval">
+          <button id="interval-down" type="button" aria-label="Decrease sampling interval" disabled>−</button><span id="interval-value">Waiting</span><button id="interval-up" type="button" aria-label="Increase sampling interval" disabled>+</button>
+        </div><p id="interval-feedback" class="muted" role="status" aria-live="polite">Waiting for service settings</p>
+      </div>
     </header>
     <section class="overview" aria-label="Processor and memory overview">
       <article class="metric">
@@ -60,7 +64,7 @@
         </table>
       </div>
     </section>
-    <footer class="muted">Local metrics / 60-sample history / One-second refresh</footer>
+    <footer id="cadence-footer" class="muted">Local metrics / 60-sample history / Waiting for service settings</footer>
   </main>
   <template id="fan-template">
     <article class="fan-card">
