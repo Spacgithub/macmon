@@ -204,12 +204,14 @@ async function check(name, test) { await test(); tests.push(name); }
 await check('missing metrics and VM never invent telemetry', async () => {
   const h = boot();
   await h.answer(sample({ data: { soc: { chip_name: 'VM', vm: true }, network: null,
-    fans: [{ name: 'not-a-real-vm-fan', rpm: 9999 }], cpu_power: 99, gpu_power: 88, gpu_freq_mhz: 777 } }));
+    fans: [{ name: 'not-a-real-vm-fan', rpm: 9999 }], cpu_power: 99, gpu_power: 88,
+    gpu_active_ratio: 0, gpu_freq_mhz: 0 } }));
   assert.equal(h.text('cpu-value'), '—');
   assert.equal(h.text('gpu-value'), '—');
+  assert.equal(h.state().history[0][1], null);
   assert.equal(h.text('ram-value'), '—');
   assert.ok(!h.text('cpu-detail').includes('99'));
-  assert.ok(!h.text('gpu-detail').includes('88') && !h.text('gpu-detail').includes('777'));
+  assert.ok(!h.text('gpu-detail').includes('88') && !h.text('gpu-detail').includes('0 MHz'));
   assert.equal(h.elements.get('network-table').hidden, true);
   assert.match(h.text('network-empty'), /unavailable/i);
   assert.equal(h.state().fans.size, 0);
@@ -218,6 +220,35 @@ await check('missing metrics and VM never invent telemetry', async () => {
   await h.answer(sample({ sequence: 2, data: {} }));
   assert.match(h.text('network-empty'), /unavailable/i, 'An omitted network field must not claim zero interfaces');
   assert.equal(h.state().fans.size, 0);
+});
+
+await check('unavailable GPU tables stay distinct from measured idle GPU activity', async () => {
+  const h = boot();
+  await h.answer(sample({ data: metrics({ soc: { vm: false, gpu_freqs: [] }, gpu_active_ratio: 0 }) }));
+  assert.equal(h.text('gpu-value'), '—');
+  assert.equal(h.state().history[0][1], null);
+  assert.ok(!h.text('gpu-detail').includes('900 MHz'));
+  await nextPoll(h);
+  await h.answer(sample({ sequence: 2, data: metrics({ soc: { vm: false, gpu_freqs: [0] }, gpu_active_ratio: 0 }) }));
+  assert.equal(h.text('gpu-value'), '—');
+  await nextPoll(h);
+  await h.answer(sample({ sequence: 3, data: metrics({ soc: { vm: false, gpu_freqs: [400] }, gpu_active_ratio: 0 }) }));
+  assert.equal(h.text('gpu-value'), '—');
+  await nextPoll(h);
+  await h.answer(sample({ sequence: 4, data: metrics({ soc: { vm: false, gpu_freqs: [0, 400, 1400] }, gpu_active_ratio: 0 }) }));
+  assert.equal(h.text('gpu-value'), '0.0%');
+  assert.equal(h.state().history.at(-1)[1], 0);
+});
+
+await check('a delayed response cannot label an already expired sample live', async () => {
+  const h = boot();
+  await h.advance(2000);
+  await h.answer(sample({ age_ms: 2000 }));
+  assert.equal(h.status(), 'stale');
+  assert.equal(h.frames.size, 0);
+  await nextPoll(h);
+  await h.answer(sample({ sequence: 2 }));
+  assert.equal(h.status(), 'live');
 });
 
 await check('negative, unknown, zero and sub-byte network rates stay distinct', async () => {

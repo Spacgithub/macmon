@@ -125,17 +125,20 @@ function cooling(metrics) {
 }
 function update(sample) {
   const metrics = sample.metrics, vm = metrics.soc?.vm, memory = metrics.memory || {};
+  const frequencies = metrics.soc?.gpu_freqs;
+  const gpuUnavailable = vm || (Array.isArray(frequencies) && !frequencies.some((frequency, index) => index > 0 && finite(frequency) && frequency > 0));
+  const gpu = gpuUnavailable ? null : metrics.gpu_active_ratio;
   const ram = finite(memory.ram_usage) && finite(memory.ram_total) && memory.ram_total > 0 ? memory.ram_usage / memory.ram_total : null;
   put("cpu-value", percent(metrics.cpu_active_ratio));
-  put("gpu-value", percent(metrics.gpu_active_ratio));
+  put("gpu-value", percent(gpu));
   put("ram-value", percent(ram));
   const tiers = vm ? unknown : (Array.isArray(metrics.cpu_tiers) ? metrics.cpu_tiers : []).map((tier) => `${tier.label} ${number(tier.freq_mhz, 0)} MHz`).join(" / ") || unknown;
   put("cpu-detail", `${number(metrics.temp?.cpu_temp_avg)} C / ${number(vm ? null : metrics.cpu_power)} W / ${tiers}`);
-  put("gpu-detail", `${number(metrics.temp?.gpu_temp_avg)} C / ${number(vm ? null : metrics.gpu_power)} W / ${number(vm ? null : metrics.gpu_freq_mhz, 0)} MHz`);
+  put("gpu-detail", `${number(metrics.temp?.gpu_temp_avg)} C / ${number(vm ? null : metrics.gpu_power)} W / ${number(gpuUnavailable ? null : metrics.gpu_freq_mhz, 0)} MHz`);
   put("ram-detail", `${bytes(memory.ram_usage)} used / ${bytes(memory.ram_total)} total / ${bytes(memory.swap_usage)} swap`);
   put("device", [metrics.soc?.chip_name || "Local device", metrics.soc?.mac_model, vm ? "Virtual machine" : ""].filter(Boolean).join(" / "));
   put("sample-time", `Sample ${new Date(sample.sampled_at).toLocaleTimeString("en-US", { hour12: false })}`);
-  state.history.push([metrics.cpu_active_ratio, metrics.gpu_active_ratio, ram]);
+  state.history.push([metrics.cpu_active_ratio, gpu, ram]);
   if (state.history.length > 60) state.history.shift();
   network(metrics);
   cooling(metrics);
@@ -163,7 +166,8 @@ async function poll() {
       || typeof sample.metrics !== "object" || Array.isArray(sample.metrics)
       || !Number.isFinite(Date.parse(sample.sampled_at))) throw new Error("Invalid sample");
     state.sample = sample;
-    state.received = performance.now();
+    // Count the full request duration as a conservative bound for response transit time.
+    state.received = started;
     state.online = true;
     state.waiting = false;
     const identity = `${sample.sequence}/${sample.sampled_at}`;

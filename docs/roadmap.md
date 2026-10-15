@@ -133,6 +133,6 @@ what we need.
       text fans with the same rotor state, independent clock and controls.
       Plan: [docs/plans/completed/20261014-terminal-fans.md](plans/completed/20261014-terminal-fans.md).
 
-- [ ] **23. Add a local browser dashboard.** Reuse real samples for responsive CPU/GPU,
+- [x] **23. Add a local browser dashboard.** Reuse real samples for responsive CPU/GPU,
       memory and Network views, compact material fans and reliable connection/sample state.
-      Plan: [docs/plans/20261014-local-dashboard.md](plans/20261014-local-dashboard.md).
+      Plan: [docs/plans/completed/20261014-local-dashboard.md](plans/completed/20261014-local-dashboard.md).
