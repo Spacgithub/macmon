@@ -98,6 +98,20 @@ fn is_apple_terminal(term_program: Option<&str>) -> bool {
   term_program == Some("Apple_Terminal")
 }
 
+/// Native RGBA shades come from queried terminal colors, alongside the ANSI text palette.
+pub(super) fn fan_palette(caps: super::fan_protocol::Capabilities) -> super::fan_raster::Palette {
+  super::fan_raster::Palette {
+    background: caps.background,
+    foreground: caps.foreground,
+    accent: caps.accent.filter(|color| *color != caps.background).unwrap_or(caps.foreground),
+  }
+}
+
+/// Canonical raster data for shape extraction; text colors remain terminal ANSI colors.
+pub(super) fn fan_mask_palette() -> super::fan_raster::Palette {
+  super::fan_raster::Palette { background: [0; 3], foreground: [255; 3], accent: [0, 255, 255] }
+}
+
 #[cfg(test)]
 mod tests {
   use ratatui::style::Color;

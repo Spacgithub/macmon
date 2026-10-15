@@ -1,6 +1,14 @@
 //! Terminal user interface.
 
 mod boxes;
+mod cooling;
+mod cooling_layout;
+mod fan_clock;
+mod fan_images;
+mod fan_protocol;
+mod fan_raster;
+mod fan_replies;
+mod fan_text;
 mod help;
 mod info;
 mod kill;
@@ -17,9 +25,13 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use cooling::{Cooling, Placement};
+use fan_clock::FrameClock;
+use fan_images::FanImages;
+use fan_protocol::{Capabilities, PendingQueries};
 use info::Info;
 use kill::Kill;
-use layout::{LayoutPlan, compute_console_layout};
+use layout::LayoutPlan;
 use macmon::{Metrics, NetworkMetric, Sampler, SocInfo};
 use proc_view::ProcView;
 use ratatui::crossterm::event::{
@@ -70,13 +82,13 @@ fn enter_term() -> WithError<(Terminal<CrosstermBackend<Stdout>>, TermGuard)> {
 
 /// Restores the terminal once, whichever comes first: the normal exit, an error return or a panic.
 fn leave_term() {
-  restore_term_once(&TERM_ACTIVE, &mut stdout(), terminal::disable_raw_mode);
+  restore_term_once(&TERM_ACTIVE, &mut stdout().lock(), terminal::disable_raw_mode);
 }
 
-/// Turns mouse capture and focus reports off, leaves the alternate screen, shows the cursor
-/// (ratatui hides it while drawing, and a panic aborts before the terminal is dropped) and turns
-/// raw mode off when `active` is set, and clears it. Every step runs even if an earlier one fails.
-/// Returns whether it ran.
+/// Closes any partial image APC and deletes owned images before restoring terminal modes, so a
+/// failed image write cannot swallow the mouse/focus disable commands. Then leaves the alternate
+/// screen, shows the cursor and turns raw mode off. Clears `active` and runs every step even if
+/// an earlier one fails. Returns whether it ran.
 fn restore_term_once(
   active: &AtomicBool,
   out: &mut impl Write,
@@ -86,6 +98,7 @@ fn restore_term_once(
     return false;
   }
 
+  fan_images::cleanup(out);
   let _ = out.execute(DisableMouseCapture);
   let _ = out.execute(DisableFocusChange);
   let _ = out.execute(terminal::LeaveAlternateScreen);
@@ -124,6 +137,10 @@ enum Event {
   FocusGained,
   /// A resized terminal needs fresh layout and mouse targets even without a sample.
   Resize,
+  /// Completed graphics evidence from the remaining startup replies.
+  Capabilities(Capabilities),
+  /// Physical cell dimensions, measured independently of image protocol support.
+  CellPixels((u16, u16)),
   /// Input-thread heartbeat, also used by the visible fan indicator.
   Tick,
 }
@@ -154,19 +171,79 @@ fn input_event(event: event::Event) -> Option<Event> {
 /// Window of the first process sample after the panel shows up, so the list fills in quickly.
 const PROCS_WARMUP: Duration = Duration::from_millis(TUI_MIN_MS as u64);
 
+/// ioctl dimensions also refresh font changes that leave the character grid unchanged.
+fn measured_cell_pixels() -> Option<(u16, u16)> {
+  let size = terminal::window_size().ok()?;
+  let pixels = (size.width.checked_div(size.columns)?, size.height.checked_div(size.rows)?);
+  (pixels.0 > 0 && pixels.1 > 0).then_some(pixels)
+}
+
 /// Sends input events and a `Tick` every `tick` ms; stops once the app is gone.
-fn run_inputs_thread(tx: mpsc::Sender<Event>, tick: u64) {
+fn run_inputs_thread(tx: mpsc::Sender<Event>, tick: u64, mut pending: Option<PendingQueries>) {
   let tick_rate = Duration::from_millis(tick);
 
   thread::spawn(move || {
     let mut last_tick = Instant::now();
+    let mut size = terminal::size().ok();
+    let mut capabilities = pending.as_ref().and_then(PendingQueries::capabilities);
+    let mut cell_pixels = pending.as_ref().and_then(PendingQueries::cell_pixels);
+    let mut queried_pixels = cell_pixels;
+    let mut resized = false;
 
     loop {
-      if event::poll(tick_rate).unwrap()
+      if let Some(query) = &mut pending {
+        match query.read(tick_rate) {
+          Ok(events) => {
+            for event in events.into_iter().filter_map(input_event) {
+              if tx.send(event).is_err() {
+                return;
+              }
+            }
+          }
+          Err(err) => {
+            let _ = tx.send(Event::Failed(err.to_string()));
+            return;
+          }
+        }
+        let current = terminal::size().ok();
+        if current != size {
+          size = current;
+          resized = true;
+          if tx.send(Event::Resize).is_err() {
+            return;
+          }
+        }
+        let fresh = query.capabilities();
+        if let Some(fresh) = fresh.filter(|fresh| Some(*fresh) != capabilities) {
+          capabilities = Some(fresh);
+          if tx.send(Event::Capabilities(fresh)).is_err() {
+            return;
+          }
+        }
+        if let Some(fresh) = query.cell_pixels().filter(|fresh| Some(*fresh) != queried_pixels) {
+          queried_pixels = Some(fresh);
+          if !resized && measured_cell_pixels().is_none() {
+            cell_pixels = Some(fresh);
+            if tx.send(Event::CellPixels(fresh)).is_err() {
+              return;
+            }
+          }
+        }
+        if query.finished() {
+          pending = None;
+        }
+      } else if event::poll(tick_rate).unwrap()
         && let Some(event) = input_event(event::read().unwrap())
         && tx.send(event).is_err()
       {
         return;
+      }
+
+      if let Some(fresh) = measured_cell_pixels().filter(|fresh| Some(*fresh) != cell_pixels) {
+        cell_pixels = Some(fresh);
+        if tx.send(Event::CellPixels(fresh)).is_err() {
+          return;
+        }
       }
 
       if last_tick.elapsed() >= tick_rate {
@@ -309,6 +386,20 @@ pub struct App {
   cpu_temp: TempStore,
   gpu_temp: TempStore,
   fans: FanStore,
+  cooling: Cooling,
+  capabilities: Option<Capabilities>,
+  cell_pixels: Option<(u16, u16)>,
+  /// A resize without pixel evidence uses bounded text cells until dimensions return.
+  geometry_unknown: bool,
+  /// Static widget frame, captured before the text fan overlay.
+  fan_base: Buffer,
+  #[cfg(test)]
+  text_animation_frames: u64,
+  #[cfg(test)]
+  text_frame_times: Vec<Instant>,
+  #[cfg(test)]
+  widget_frames: u64,
+  placements: Vec<Placement>,
   fan_tick: u8,
   fan_phase: bool,
   /// Set by rendering only while the fan indicator is actually on screen and uncovered.
@@ -363,6 +454,7 @@ impl App {
 
     self.cpu_temp.push(data.temp.cpu_temp_avg);
     self.gpu_temp.push(data.temp.gpu_temp_avg);
+    self.cooling.sync(&data.fans);
     self.fans.push(data.fans);
     self.network = data.network;
     if let Some(metrics) = &mut self.network {
@@ -438,7 +530,22 @@ impl App {
         self.unfocused = false;
         return ControlFlow::Continue(());
       }
-      Event::Tick | Event::Resize => return ControlFlow::Continue(()),
+      Event::Capabilities(caps) => {
+        self.set_capabilities(caps);
+        return ControlFlow::Continue(());
+      }
+      Event::CellPixels(pixels) => {
+        self.cell_pixels = measured_cell_pixels().or(Some(pixels));
+        return ControlFlow::Continue(());
+      }
+      Event::Resize => {
+        if !self.refresh_cell_pixels() {
+          self.geometry_unknown = true;
+          self.cell_pixels = None;
+        }
+        return ControlFlow::Continue(());
+      }
+      Event::Tick => return ControlFlow::Continue(()),
       Event::Failed(_) => return ControlFlow::Break(()),
     };
 
@@ -452,6 +559,9 @@ impl App {
       return Err(err.into());
     }
     if matches!(event, Event::Tick) {
+      if self.fans_visible() {
+        return Ok(ControlFlow::Continue(false));
+      }
       if !self.cfg.animate_fans
         || self.unfocused
         || !self.fan_motion_visible
@@ -569,29 +679,126 @@ impl App {
   }
 
   /// Screen layout for the current settings and metrics.
+  #[cfg(test)]
   fn layout(&self, area: Rect) -> LayoutPlan {
-    let (procs, clusters) = (self.cfg.show_procs, self.clusters.items.len());
-    compute_console_layout(area, procs, clusters, !self.soc.vm)
+    self.cooling_layout(area, self.cfg.show_procs).0
+  }
+
+  fn cooling_layout(&self, area: Rect, procs: bool) -> (LayoutPlan, Vec<Placement>) {
+    cooling_layout::layout(
+      area,
+      procs,
+      self.clusters.items.len(),
+      !self.soc.vm,
+      self.cooling.items().len(),
+      self.cell_pixels(),
+      self.native_enabled(),
+    )
+  }
+
+  fn fans_visible(&self) -> bool {
+    self.help.is_none() && !self.placements.is_empty()
+  }
+
+  fn fan_frames_active(&self) -> bool {
+    self.fans_visible() && self.cfg.animate_fans && !self.unfocused && self.cooling.moving()
+  }
+
+  fn cell_pixels(&self) -> (u16, u16) {
+    if self.geometry_unknown {
+      return (8, 16);
+    }
+    self.cell_pixels.or(self.capabilities.map(|caps| caps.cell_pixels)).unwrap_or((8, 16))
+  }
+
+  fn native_enabled(&self) -> bool {
+    self.capabilities.is_some() && !self.geometry_unknown
+  }
+
+  fn refresh_cell_pixels(&mut self) -> bool {
+    if let Some(pixels) = measured_cell_pixels() {
+      self.cell_pixels = Some(pixels);
+      self.geometry_unknown = false;
+      true
+    } else {
+      false
+    }
+  }
+
+  fn set_capabilities(&mut self, caps: Capabilities) {
+    self.capabilities = Some(caps);
+    self.refresh_cell_pixels();
+  }
+
+  fn paint_text_fans(&self, buffer: &mut Buffer) {
+    for (image, place) in self.cooling.items().iter().zip(&self.placements) {
+      fan_text::render(
+        buffer,
+        place.image,
+        &image.rgba,
+        usize::from(place.side),
+        self.cell_pixels(),
+      );
+    }
+  }
+
+  fn render_text_frame(&mut self, frame: &mut Frame) {
+    // Terminal::draw may observe a resize before the input thread sends its resize event.
+    if frame.area() != self.fan_base.area {
+      self.render(frame);
+    } else {
+      frame.buffer_mut().clone_from(&self.fan_base);
+      self.paint_text_fans(frame.buffer_mut());
+    }
+  }
+
+  fn draw_fan_images(&mut self, images: &mut FanImages, moving_only: bool) -> io::Result<()> {
+    // Keep complete image sequences atomic with the panic hook's terminal restoration.
+    let mut out = stdout().lock();
+    if !TERM_ACTIVE.load(Ordering::SeqCst) {
+      return Ok(());
+    }
+    if !self.fans_visible() || !self.native_enabled() {
+      return images.hide(&mut out);
+    }
+    let caps = self.capabilities.unwrap();
+    let side = self.placements[0].side;
+    if !self.cooling.rasterize(side, theme::fan_palette(caps), moving_only) {
+      return Err(io::Error::other("fan image rasterization failed"));
+    }
+    for (slot, (image, place)) in self.cooling.items().iter().zip(&self.placements).enumerate() {
+      if !moving_only || image.rotor.moving() {
+        let r = place.image;
+        images.render(&mut out, &image.rgba, side, slot, (r.x, r.y), (r.width, r.height))?;
+      }
+    }
+    Ok(())
   }
 
   /// Layout of a frame for the window `area`, with the state that follows the window updated
   /// before anything is drawn: whether the process list fits, and whether it is on screen.
   fn layout_frame(&mut self, area: Rect) -> LayoutPlan {
-    self.procs_fit =
-      compute_console_layout(area, true, self.clusters.items.len(), !self.soc.vm).proc.is_some();
-    let plan = self.layout(area);
+    self.procs_fit = self.cooling_layout(area, true).0.proc.is_some();
+    let (plan, placements) = self.cooling_layout(area, self.cfg.show_procs);
+    self.placements = placements;
     self.set_procs_visible(plan.proc.is_some());
     plan
   }
 
   fn render(&mut self, f: &mut Frame) {
+    #[cfg(test)]
+    {
+      self.widget_frames += 1;
+    }
     let plan = self.layout_frame(f.area());
     self.fan_motion_visible = self.help.is_none()
+      && self.placements.is_empty()
       && self.fans.motion_glyph(0).is_some()
       && self.fan_area(&plan).is_some_and(|r| usize::from(r.width) >= self.fans.label().len() + 8);
 
     // the key hints go on the lowest box: the process box, or the metrics box without it
     self.render_metrics_box(f, &plan);
+    self.cooling.render(f, &self.placements);
     if let Some(r) = plan.proc {
       self.render_proc_box(f, r);
       self.info.iter_mut().for_each(|info| info.render(f, r));
@@ -599,6 +806,11 @@ impl App {
     }
     if let Some(scroll) = self.help {
       self.help = Some(help::render(f, f.area(), scroll));
+    }
+    if !self.native_enabled() && self.fans_visible() {
+      self.cooling.rasterize(self.placements[0].side, theme::fan_mask_palette(), false);
+      self.fan_base.clone_from(f.buffer_mut());
+      self.paint_text_fans(f.buffer_mut());
     }
   }
 
@@ -614,19 +826,94 @@ impl App {
     run_procs_thread(tx.clone(), msec.clone(), self.procs_shown.clone(), proc_sampler);
 
     // the guard restores the terminal on every way out of here, `?` included
+    self.run_terminal(tx, rx, &msec)
+  }
+
+  fn run_terminal(
+    &mut self,
+    tx: mpsc::Sender<Event>,
+    rx: mpsc::Receiver<Event>,
+    msec: &RwLock<u32>,
+  ) -> WithError<()> {
     let (mut term, _guard) = enter_term()?;
-    run_inputs_thread(tx.clone(), 250);
+    let mut images = FanImages::new().ok();
+    self.refresh_cell_pixels();
+    let detection = fan_protocol::detect(&mut stdout().lock(), images.as_mut())?;
+    {
+      if let Some(caps) = detection.capabilities {
+        self.set_capabilities(caps);
+      }
+      self.cell_pixels = measured_cell_pixels().or(self.cell_pixels).or(detection.cell_pixels);
+      for event in detection.early_events.into_iter().filter_map(input_event) {
+        if self.apply_event(event, msec)?.is_break() {
+          return Ok(());
+        }
+      }
+    }
+    run_inputs_thread(tx, 250, detection.pending);
     self.three_level_bars = theme::detect_three_level_bars();
 
     let mut mouse = false;
     let mut redraw = true;
+    let mut clock = FrameClock::default();
     loop {
       if redraw {
-        term.draw(|f| self.render(f))?;
-        mouse = set_mouse_capture(&mut stdout(), mouse, self.wants_mouse())?;
+        self.refresh_cell_pixels();
+        let next = self.cooling_layout(term.size()?.into(), self.cfg.show_procs).1;
+        if (self.help.is_some() || next != self.placements)
+          && let Some(images) = &mut images
+        {
+          images.hide(&mut stdout().lock())?;
+        }
+        {
+          let _output = stdout().lock();
+          if !TERM_ACTIVE.load(Ordering::SeqCst) {
+            return Ok(());
+          }
+          term.draw(|f| self.render(f))?;
+          mouse = set_mouse_capture(&mut stdout(), mouse, self.wants_mouse())?;
+        }
+        if let Some(images) = &mut images {
+          self.draw_fan_images(images, false)?;
+        }
       }
-      let event = rx.recv()?;
-      match self.apply_event(event, &msec)? {
+      let active = self.fan_frames_active();
+      clock.set_active(active, Instant::now());
+      if let Some(delta) = clock.frame(Instant::now()) {
+        self.cooling.frame(delta);
+        if self.native_enabled()
+          && let Some(images) = &mut images
+        {
+          self.draw_fan_images(images, true)?;
+        } else {
+          if !self.cooling.rasterize(self.placements[0].side, theme::fan_mask_palette(), true) {
+            return Err("fan text rasterization failed".into());
+          }
+          let _output = stdout().lock();
+          if !TERM_ACTIVE.load(Ordering::SeqCst) {
+            return Ok(());
+          }
+          term.draw(|f| self.render_text_frame(f))?;
+          #[cfg(test)]
+          {
+            self.text_animation_frames += 1;
+            self.text_frame_times.push(Instant::now());
+          }
+        }
+      }
+      let event = if let Some(wait) = clock.wait(Instant::now()) {
+        match rx.recv_timeout(wait) {
+          Ok(event) => event,
+          Err(mpsc::RecvTimeoutError::Timeout) => {
+            redraw = false;
+            continue;
+          }
+          Err(err) => return Err(err.into()),
+        }
+      } else {
+        rx.recv()?
+      };
+      match self.apply_event(event, msec)? {
         ControlFlow::Continue(changed) => redraw = changed,
         ControlFlow::Break(()) => break,
       }
@@ -667,6 +954,7 @@ mod tests {
   use crate::procs::ProcInfo;
 
   include!("ui_preview.rs");
+  include!("fan_preview.rs");
 
   #[test]
   fn idle_heartbeats_do_not_draw_but_samples_and_resize_do() {
@@ -1056,6 +1344,9 @@ mod tests {
   /// App for `test_soc` with a few samples of `test_metrics` changed by `edit`.
   fn test_app_with(edit: impl Fn(&mut Metrics)) -> App {
     let mut app = App::from_parts(test_soc(), Config::default());
+    // Legacy metric/process tests exercise the compact RPM path. Complete native/text fans
+    // and their adaptive placement are covered with valid cell geometry in fan_preview.
+    app.cell_pixels = Some((0, 0));
     for _ in 0..3 {
       let mut metrics = test_metrics();
       edit(&mut metrics);
@@ -1279,6 +1570,7 @@ mod tests {
 
   #[test]
   fn restoring_the_terminal_turns_mouse_capture_off_once() {
+    let _session = super::fan_images::TEST_SESSION.lock().unwrap();
     let active = AtomicBool::new(true);
     let mut out = vec![];
     let mut raw_off = 0;

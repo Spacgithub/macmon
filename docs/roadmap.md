@@ -113,3 +113,22 @@ what we need.
       telemetry, supply an ANSI-compatible Warp theme and add a saved motion switch with
       visibility/focus gating, real RPM and measured resource cost.
       Plan: [docs/plans/completed/20261014-deep-space-console.md](plans/completed/20261014-deep-space-console.md).
+
+- [x] **19. Add full graphical cooling panels.** Seven curved, shaded blades per real fan,
+      independent 60 FPS image updates and the existing manual switch, with terminal capability
+      detection, adaptive placement, owned image cleanup and measured resource cost.
+      Plan: [docs/plans/completed/20261014-full-fan-panels.md](plans/completed/20261014-full-fan-panels.md).
+
+- [x] **20. Match fan materials to the accepted cooling-card prototype.** Add the rounded
+      mechanical housing, recessed screws, cavity and hub shadows, and layered curved-metal
+      blades while preserving the independent frame clock, palette and existing controls.
+      Plan: [docs/plans/completed/20261014-fan-material-fidelity.md](plans/completed/20261014-fan-material-fidelity.md).
+
+- [x] **21. Keep graphical cooling cards compact.** Reduce fan images and card footprints,
+      reclaim graph/process space and retain the existing materials and animation controls.
+      Plan: [docs/plans/completed/20261014-compact-cooling.md](plans/completed/20261014-compact-cooling.md).
+
+- [x] **22. Adapt complete cooling fans across terminals.** Continuously size compact cards
+      using physical cell dimensions, retain verified native images and add complete ANSI
+      text fans with the same rotor state, independent clock and controls.
+      Plan: [docs/plans/completed/20261014-terminal-fans.md](plans/completed/20261014-terminal-fans.md).

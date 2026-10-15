@@ -95,11 +95,26 @@ omitted when space is limited. Units and process metadata are quieter than prima
 the latest chart sample and hot-load history stay prominent. Wide network tables align their
 totals to the panel edge while preserving the compact layout in narrow windows.
 
-Fans have a small character indicator driven by their reported RPM. Zero RPM stays stationary;
-unavailable fans stay absent. Press `a` to toggle motion (enabled by default, saved as
-`animate_fans`); it changes at most four times per second using the existing input heartbeat.
-Motion pauses on focus loss, under help and when its indicator does not fit. It never controls
-hardware fans or changes the 1000 ms default sampling interval.
+Compatible Warp, Kitty and WezTerm sessions can show a complete, shaded seven-blade fan for
+each reported fan, up to 120 pixels across, with a recessed
+mechanical housing, corner screws and curved metal highlights. The housing and hub stay fixed
+as the blades turn. Cards stay compact in large windows and preserve room for the process list.
+Fan diameter adapts to available space and physical cell dimensions, with RPM on the card's
+bottom border. Images use the terminal's queried colors and require a successful capability query for the
+actual image format and transport. Warp receives
+images inline; Kitty and WezTerm use private local files. Apple Terminal and other text terminals
+show the same complete fan geometry with ANSI-colored Braille characters. When a complete fan
+cannot fit, the compact RPM indicator preserves room for metrics, Network and processes.
+Window and font changes refresh pixel sizing through the terminal's window-size reports.
+If those reports omit pixels after a resize, macmon safely switches to text with an estimated
+1:2 cell aspect ratio; restart macmon to query native image dimensions again in such sessions.
+
+Each rotor follows its own reported RPM; zero RPM stays stationary and unavailable fans stay
+absent. Press `a` to toggle animation (enabled by default, saved as `animate_fans`). Complete fans
+target 60 updates per second independently of metric/process sampling; compact indicators
+change at most four times per second. Animation pauses on focus loss, under help and when
+hidden, preserving your manual choice. It never controls hardware fans or changes the saved
+sampling interval (1000 ms by default).
 
 The screen redraws when data, input, the window size or a visible fan frame changes. Other input
 heartbeats skip drawing, and interfaces are ranked when samples arrive. Existing configuration

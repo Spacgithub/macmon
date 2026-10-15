@@ -506,7 +506,9 @@ impl App {
     if let Some(telemetry) = plan.telemetry {
       self.render_telemetry(f, telemetry);
     }
-    if let Some(area) = self.fan_area(plan) {
+    if self.placements.is_empty()
+      && let Some(area) = self.fan_area(plan)
+    {
       self.render_fan(f, area);
     }
 
