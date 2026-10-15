@@ -1,0 +1,196 @@
+"use strict";
+const $ = (id) => document.getElementById(id);
+const unknown = "\u2014";
+const finite = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+const number = (value, digits = 1) => finite(value) ? value.toFixed(digits) : unknown;
+const percent = (value) => finite(value) ? `${(Math.min(value, 1) * 100).toFixed(1)}%` : unknown;
+const put = (id, value) => { $(id).textContent = value; };
+const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], frame: 0, last: 0 };
+const motion = $("motion");
+const reduced = matchMedia("(prefers-reduced-motion: reduce)");
+motion.checked = !reduced.matches;
+let pollTimer, staleTimer, controller;
+function bytes(value) {
+  if (!finite(value)) return unknown;
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  const scale = value > 0 ? Math.max(0, Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1)) : 0;
+  return `${(value / 1024 ** scale).toLocaleString("en-US", { maximumSignificantDigits: 3 })} ${units[scale]}`;
+}
+function age() { return state.sample ? state.sample.age_ms + performance.now() - state.received : Infinity; }
+function limit() { return Math.max(3 * (state.sample?.interval_ms || 1000), 3000); }
+function live() { return state.online && !state.waiting && state.sample && age() <= limit(); }
+function moving() { return live() && !document.hidden && motion.checked && [...state.fans.values()].some((fan) => fan.rpm > 0); }
+function settle() {
+  clearTimeout(staleTimer);
+  const status = state.waiting ? "waiting" : state.online === null ? "connecting" : !state.online ? "offline" : live() ? "live" : "stale";
+  $("status").dataset.state = status;
+  put("status", status.toUpperCase());
+  if (live() && !document.hidden) staleTimer = setTimeout(settle, Math.max(1, limit() - age() + 1));
+  if (moving()) {
+    if (!state.frame) state.frame = requestAnimationFrame(animate);
+  } else {
+    cancelAnimationFrame(state.frame);
+    state.frame = state.last = 0;
+    state.fans.forEach((fan) => { fan.speed = 0; });
+  }
+}
+function animate(now) {
+  state.frame = 0;
+  if (!moving()) { settle(); return; }
+  const delta = state.last ? Math.min((now - state.last) / 1000, 0.05) : 0;
+  state.last = now;
+  state.fans.forEach((fan) => {
+    if (!(fan.rpm > 0)) { fan.speed = 0; return; }
+    const target = Math.min(1.5, Math.sqrt(fan.rpm) / 150);
+    fan.speed += (target - fan.speed) * (1 - Math.exp(-8 * delta));
+    fan.angle = (fan.angle + delta * fan.speed * 360) % 360;
+    fan.rotor.style.transform = `rotate(${fan.angle}deg)`;
+  });
+  state.frame = requestAnimationFrame(animate);
+}
+function drawCharts() {
+  const color = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
+  ["cpu", "gpu", "ram"].forEach((name, index) => {
+    const canvas = $(`${name}-chart`);
+    const context = canvas.getContext("2d");
+    const width = canvas.clientWidth, height = canvas.clientHeight, scale = window.devicePixelRatio || 1;
+    if (!context || !width || !height) return;
+    canvas.width = Math.round(width * scale);
+    canvas.height = Math.round(height * scale);
+    context.setTransform(scale, 0, 0, scale, 0, 0);
+    context.strokeStyle = "#29394c";
+    context.lineWidth = 1;
+    for (const ratio of [0.25, 0.5, 0.75]) { context.beginPath(); context.moveTo(0, ratio * height); context.lineTo(width, ratio * height); context.stroke(); }
+    context.beginPath();
+    context.strokeStyle = color;
+    context.lineWidth = 1.7;
+    let connected = false;
+    state.history.forEach((values, point) => {
+      const value = values[index];
+      if (!finite(value)) { connected = false; return; }
+      const x = width * (60 - state.history.length + point) / 59, y = height * (1 - Math.min(value, 1));
+      if (connected) context.lineTo(x, y); else context.moveTo(x, y);
+      connected = true;
+    });
+    context.stroke();
+  });
+}
+function network(metrics) {
+  const rows = Array.isArray(metrics.network) ? metrics.network.filter((item) => item && typeof item.name === "string") : [];
+  const traffic = (item) => [item.rx_bytes_per_sec, item.tx_bytes_per_sec].reduce((sum, rate) => sum + (finite(rate) ? rate : 0), 0);
+  rows.sort((a, b) => traffic(b) - traffic(a) || a.name.localeCompare(b.name));
+  $("network-table").hidden = !rows.length;
+  $("network-empty").hidden = !!rows.length;
+  put("network-empty", Array.isArray(metrics.network) ? "No active interfaces reported." : "Network telemetry unavailable.");
+  put("network-count", `${rows.length} INTERFACES`);
+  $("network-rows").replaceChildren(...rows.map((item) => {
+    const row = document.createElement("tr");
+    [item.name, bytes(item.rx_bytes_per_sec), bytes(item.tx_bytes_per_sec), bytes(item.rx_bytes), bytes(item.tx_bytes)].forEach((value, index) => {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      cell.dataset.label = ["Interface", "RX / s", "TX / s", "RX total", "TX total"][index];
+      row.append(cell);
+    });
+    return row;
+  }));
+}
+function cooling(metrics) {
+  const next = new Map();
+  const items = !metrics.soc?.vm && Array.isArray(metrics.fans) ? metrics.fans : [];
+  items.filter((item) => item && typeof item.name === "string" && item.name).forEach((item) => {
+    let fan = state.fans.get(item.name);
+    if (!fan) {
+      const node = $("fan-template").content.firstElementChild.cloneNode(true);
+      const rotor = node.querySelector(".rotor");
+      for (let blade = 0; blade < 7; blade++) {
+        const leaf = document.createElement("i");
+        leaf.className = "blade";
+        leaf.style.transform = `rotate(${blade * 360 / 7}deg)`;
+        rotor.append(leaf);
+      }
+      fan = { node, rotor, angle: 0, speed: 0 };
+    }
+    fan.rpm = finite(item.rpm) ? item.rpm : null;
+    if (!(fan.rpm > 0)) fan.speed = 0;
+    fan.node.querySelector(".fan-name").textContent = item.name;
+    fan.node.querySelector(".fan-rpm").textContent = `${number(fan.rpm, 0)} RPM`;
+    fan.node.querySelector(".fan-limit").textContent = finite(item.max_rpm) ? `Reported max ${number(item.max_rpm, 0)} RPM` : "Maximum not reported";
+    next.set(item.name, fan);
+  });
+  state.fans = next;
+  $("fans").replaceChildren(...[...next.values()].map((fan) => fan.node));
+  $("fans").hidden = !next.size;
+  $("fan-empty").hidden = !!next.size;
+  put("fan-empty", metrics.soc?.vm ? "Fan telemetry unavailable in a virtual machine." : "No fan telemetry reported.");
+}
+function update(sample) {
+  const metrics = sample.metrics, vm = metrics.soc?.vm, memory = metrics.memory || {};
+  const ram = finite(memory.ram_usage) && finite(memory.ram_total) && memory.ram_total > 0 ? memory.ram_usage / memory.ram_total : null;
+  put("cpu-value", percent(metrics.cpu_active_ratio));
+  put("gpu-value", percent(metrics.gpu_active_ratio));
+  put("ram-value", percent(ram));
+  const tiers = vm ? unknown : (Array.isArray(metrics.cpu_tiers) ? metrics.cpu_tiers : []).map((tier) => `${tier.label} ${number(tier.freq_mhz, 0)} MHz`).join(" / ") || unknown;
+  put("cpu-detail", `${number(metrics.temp?.cpu_temp_avg)} C / ${number(vm ? null : metrics.cpu_power)} W / ${tiers}`);
+  put("gpu-detail", `${number(metrics.temp?.gpu_temp_avg)} C / ${number(vm ? null : metrics.gpu_power)} W / ${number(vm ? null : metrics.gpu_freq_mhz, 0)} MHz`);
+  put("ram-detail", `${bytes(memory.ram_usage)} used / ${bytes(memory.ram_total)} total / ${bytes(memory.swap_usage)} swap`);
+  put("device", [metrics.soc?.chip_name || "Local device", metrics.soc?.mac_model, vm ? "Virtual machine" : ""].filter(Boolean).join(" / "));
+  put("sample-time", `Sample ${new Date(sample.sampled_at).toLocaleTimeString("en-US", { hour12: false })}`);
+  state.history.push([metrics.cpu_active_ratio, metrics.gpu_active_ratio, ram]);
+  if (state.history.length > 60) state.history.shift();
+  network(metrics);
+  cooling(metrics);
+  drawCharts();
+}
+async function poll() {
+  if (document.hidden || state.busy) return;
+  state.busy = true;
+  state.urgent = false;
+  const started = performance.now(), request = new AbortController();
+  controller = request;
+  const timeout = setTimeout(() => request.abort(), 2500);
+  try {
+    const response = await fetch("/api/sample", { cache: "no-store", signal: request.signal });
+    if (response.status === 503) {
+      state.waiting = true;
+      state.online = true;
+      settle();
+      return;
+    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const sample = await response.json();
+    if (!Number.isSafeInteger(sample.sequence) || sample.sequence < 0 || !finite(sample.age_ms)
+      || !finite(sample.interval_ms) || !sample.interval_ms || !sample.metrics
+      || typeof sample.metrics !== "object" || Array.isArray(sample.metrics)
+      || !Number.isFinite(Date.parse(sample.sampled_at))) throw new Error("Invalid sample");
+    state.sample = sample;
+    state.received = performance.now();
+    state.online = true;
+    state.waiting = false;
+    const identity = `${sample.sequence}/${sample.sampled_at}`;
+    if (identity !== state.identity) {
+      update(sample);
+      state.identity = identity;
+    }
+    settle();
+  } catch (error) {
+    if (request.signal.reason !== "hidden") {
+      state.waiting = false;
+      state.online = false;
+      settle();
+    }
+  } finally {
+    clearTimeout(timeout);
+    controller = null;
+    state.busy = false;
+    if (!document.hidden) pollTimer = setTimeout(poll, state.urgent ? 0 : Math.max(0, 1000 - (performance.now() - started)));
+  }
+}
+motion.addEventListener("change", settle);
+reduced.addEventListener("change", () => { if (reduced.matches) { motion.checked = false; settle(); } });
+document.addEventListener("visibilitychange", () => {
+  clearTimeout(pollTimer);
+  if (document.hidden) controller?.abort("hidden"); else { state.urgent = true; poll(); }
+  settle();
+});
+new ResizeObserver(drawCharts).observe($("cpu-chart").parentElement.parentElement);
+poll();

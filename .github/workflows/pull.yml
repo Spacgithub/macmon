@@ -19,3 +19,4 @@ jobs:
       - run: rustup toolchain install nightly --profile minimal --component rustfmt
       - run: make check
       - run: make test
+      - run: make test-dashboard

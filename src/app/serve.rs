@@ -4,12 +4,29 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use macmon::{Metrics, SocInfo};
 
 use crate::metrics_to_json_value;
 
-pub type SharedMetrics = Arc<RwLock<Option<Metrics>>>;
+pub type SharedMetrics = Arc<RwLock<Option<Sample>>>;
+
+pub struct Sample {
+  metrics: Metrics,
+  sequence: u64,
+  sampled_at: String,
+  sampled: Instant,
+  interval_ms: u32,
+}
+
+pub fn publish_sample(shared: &SharedMetrics, metrics: Metrics, interval_ms: u32) {
+  let sampled = Instant::now();
+  let sampled_at = chrono::Utc::now().to_rfc3339();
+  let mut latest = shared.write().unwrap();
+  let sequence = latest.as_ref().map_or(1, |sample| sample.sequence.saturating_add(1));
+  *latest = Some(Sample { metrics, sequence, sampled_at, sampled, interval_ms });
+}
 
 fn escape_label_value(value: &str) -> String {
   value.replace('\\', r"\\").replace('\n', r"\n").replace('"', r#"\""#)
@@ -142,35 +159,71 @@ fn to_prometheus(m: &Metrics, soc: &SocInfo) -> String {
   out
 }
 
-fn to_json(m: &Metrics, soc: &SocInfo) -> String {
+fn json_value(m: &Metrics, soc: &SocInfo, timestamp: &str) -> serde_json::Value {
   let mut doc = metrics_to_json_value(m).unwrap_or_default();
   doc["soc"] = serde_json::to_value(soc).unwrap_or_default();
-  doc["timestamp"] = serde_json::to_value(chrono::Utc::now().to_rfc3339()).unwrap_or_default();
-  serde_json::to_string(&doc).unwrap_or_default()
+  doc["timestamp"] = timestamp.into();
+  doc
+}
+
+fn to_json(m: &Metrics, soc: &SocInfo) -> String {
+  json_value(m, soc, &chrono::Utc::now().to_rfc3339()).to_string()
+}
+
+fn to_sample(sample: &Sample, soc: &SocInfo) -> String {
+  serde_json::json!({
+    "sequence": sample.sequence,
+    "sampled_at": sample.sampled_at,
+    "age_ms": sample.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    "interval_ms": sample.interval_ms,
+    "metrics": json_value(&sample.metrics, soc, &sample.sampled_at),
+  })
+  .to_string()
 }
 
 fn read_path(stream: &mut TcpStream) -> Option<String> {
-  let mut buf = [0u8; 2048];
-  let n = stream.read(&mut buf).ok()?;
-  let text = std::str::from_utf8(&buf[..n]).ok()?;
-  let path = text.lines().next()?.split_whitespace().nth(1)?;
-  Some(path.split('?').next().unwrap_or(path).to_string())
+  let deadline = Instant::now() + Duration::from_secs(2);
+  let mut header = Vec::new();
+  let mut buf = [0; 1024];
+  while header.len() < 8192 {
+    stream.set_read_timeout(Some(deadline.checked_duration_since(Instant::now())?)).ok()?;
+    let limit = buf.len().min(8192 - header.len());
+    let n = stream.read(&mut buf[..limit]).ok()?;
+    if n == 0 {
+      return None;
+    }
+    header.extend_from_slice(&buf[..n]);
+    if let Some(end) = header.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+      let text = std::str::from_utf8(&header[..end]).ok()?;
+      let mut line = text.lines().next()?.split_whitespace();
+      if line.next()? != "GET" {
+        return None;
+      }
+      let path = line.next()?;
+      if !path.starts_with('/')
+        || !matches!(line.next()?, "HTTP/1.0" | "HTTP/1.1")
+        || line.next().is_some()
+      {
+        return None;
+      }
+      return Some(path.split('?').next().unwrap_or(path).to_string());
+    }
+  }
+  None
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: String) {
+fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
   let status_text = match status {
     200 => "OK",
     404 => "Not Found",
     503 => "Service Unavailable",
     _ => "OK",
   };
-  let _ = stream.write_all(
-    format!(
-      "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-      body.len()
-    )
-    .as_bytes(),
+  let header = format!(
+    "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+    body.len()
   );
+  let _ = stream.write_all(header.as_bytes()).and_then(|()| stream.write_all(body.as_bytes()));
 }
 
 fn serve_url(host: &str, port: u16) -> String {
@@ -193,38 +246,63 @@ fn escape_xml(value: &str) -> String {
 }
 
 fn handle_conn(mut stream: TcpStream, shared: SharedMetrics, soc: Arc<SocInfo>) {
+  if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+    return;
+  }
   let path = match read_path(&mut stream) {
     Some(p) => p,
     None => return,
   };
 
   if path == "/" {
-    write_response(&mut stream, 200, "application/json", r#"{}"#.to_string());
+    write_response(&mut stream, 200, "application/json", r#"{}"#);
+    return;
+  }
+
+  let asset = match path.as_str() {
+    "/dashboard" | "/dashboard/" => {
+      Some(("text/html; charset=utf-8", include_str!("dashboard/index.html")))
+    }
+    "/dashboard/style.css" => {
+      Some(("text/css; charset=utf-8", include_str!("dashboard/style.css")))
+    }
+    "/dashboard/app.js" => {
+      Some(("text/javascript; charset=utf-8", include_str!("dashboard/app.js")))
+    }
+    _ => None,
+  };
+  if let Some((content_type, body)) = asset {
+    write_response(&mut stream, 200, content_type, body);
     return;
   }
 
   let lock = shared.read().unwrap();
 
-  let Some(m) = lock.as_ref() else {
+  let Some(sample) = lock.as_ref() else {
     drop(lock);
-    write_response(&mut stream, 503, "application/json", r#"{"error":"no data yet"}"#.to_string());
+    write_response(&mut stream, 503, "application/json", r#"{"error":"no data yet"}"#);
     return;
   };
 
   match path.as_str() {
     "/json" => {
-      let body = to_json(m, &soc);
+      let body = to_json(&sample.metrics, &soc);
       drop(lock);
-      write_response(&mut stream, 200, "application/json", body);
+      write_response(&mut stream, 200, "application/json", &body);
+    }
+    "/api/sample" => {
+      let body = to_sample(sample, &soc);
+      drop(lock);
+      write_response(&mut stream, 200, "application/json", &body);
     }
     "/metrics" => {
-      let body = to_prometheus(m, &soc);
+      let body = to_prometheus(&sample.metrics, &soc);
       drop(lock);
-      write_response(&mut stream, 200, "text/plain; version=0.0.4; charset=utf-8", body);
+      write_response(&mut stream, 200, "text/plain; version=0.0.4; charset=utf-8", &body);
     }
     _ => {
       drop(lock);
-      write_response(&mut stream, 404, "application/json", r#"{"error":"not found"}"#.to_string());
+      write_response(&mut stream, 404, "application/json", r#"{"error":"not found"}"#);
     }
   }
 }
@@ -299,6 +377,8 @@ pub fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
   let listener = TcpListener::bind((host, port))?;
   eprintln!("macmon serving on http://{}", listener.local_addr()?);
+  eprintln!("  GET /dashboard/ → Local dashboard");
+  eprintln!("  GET /api/sample → Latest sample with freshness metadata");
   eprintln!("  GET /json    → JSON metrics");
   eprintln!("  GET /metrics → Prometheus format");
 
@@ -314,9 +394,183 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+  use std::io::{Read, Write};
+  use std::net::{Shutdown, TcpListener, TcpStream};
+  use std::sync::{Arc, RwLock, mpsc};
+  use std::thread;
+  use std::time::{Duration, Instant};
+
   use macmon::{CpuTierMetrics, Metrics, NetworkMetric, SocInfo};
 
-  use super::{escape_label_value, escape_xml, serve_url, to_json, to_prometheus};
+  use super::{
+    SharedMetrics, escape_label_value, escape_xml, handle_conn, publish_sample, read_path,
+    serve_url, to_json, to_prometheus, to_sample,
+  };
+
+  fn request(shared: &SharedMetrics, fragments: &[&[u8]]) -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let shared = Arc::clone(shared);
+    let worker = thread::spawn(move || {
+      handle_conn(listener.accept().unwrap().0, shared, Arc::new(SocInfo::default()));
+    });
+    let mut client = TcpStream::connect(address).unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    client.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    for fragment in fragments {
+      client.write_all(fragment).unwrap();
+      thread::sleep(Duration::from_millis(5));
+    }
+    let _ = client.shutdown(Shutdown::Write);
+    let mut response = String::new();
+    if let Err(error) = client.read_to_string(&mut response) {
+      assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+      assert!(response.is_empty());
+    }
+    worker.join().unwrap();
+    response
+  }
+
+  fn get(shared: &SharedMetrics, path: &str) -> String {
+    request(shared, &[format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes()])
+  }
+
+  fn body(response: &str) -> &str {
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    let length = headers.lines().find_map(|line| line.strip_prefix("Content-Length: ")).unwrap();
+    assert_eq!(length.parse::<usize>().unwrap(), body.len());
+    body
+  }
+
+  #[test]
+  fn static_routes_work_without_a_sample_and_keep_the_root_json() {
+    let shared = Arc::new(RwLock::new(None));
+    let root = get(&shared, "/?status=1");
+    assert!(root.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"));
+    assert_eq!(body(&root), "{}");
+    for (path, content_type, expected) in [
+      ("/dashboard", "text/html; charset=utf-8", include_str!("dashboard/index.html")),
+      ("/dashboard/", "text/html; charset=utf-8", include_str!("dashboard/index.html")),
+      ("/dashboard/style.css?v=1", "text/css; charset=utf-8", include_str!("dashboard/style.css")),
+      ("/dashboard/app.js", "text/javascript; charset=utf-8", include_str!("dashboard/app.js")),
+    ] {
+      let response = get(&shared, path);
+      assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{path}: {response}");
+      assert!(response.contains(&format!("Content-Type: {content_type}\r\n")));
+      assert!(response.contains("Cache-Control: no-store\r\n"));
+      assert!(response.contains("X-Content-Type-Options: nosniff\r\n"));
+      assert!(!response.contains("Access-Control-Allow-Origin"));
+      assert!(!expected.is_empty());
+      assert_eq!(body(&response), expected);
+    }
+  }
+
+  #[test]
+  fn sample_routes_return_503_until_the_first_successful_sample() {
+    let shared = Arc::new(RwLock::new(None));
+    for path in ["/api/sample", "/json", "/metrics"] {
+      let response = get(&shared, path);
+      assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+      assert_eq!(body(&response), r#"{"error":"no data yet"}"#);
+    }
+  }
+
+  #[test]
+  fn sample_metadata_retains_its_time_and_age_until_a_new_success() {
+    let shared = Arc::new(RwLock::new(None));
+    publish_sample(&shared, Metrics::default(), 1500);
+    shared.write().unwrap().as_mut().unwrap().sampled = Instant::now() - Duration::from_millis(250);
+    let read = || {
+      let lock = shared.read().unwrap();
+      serde_json::from_str::<serde_json::Value>(&to_sample(
+        lock.as_ref().unwrap(),
+        &SocInfo::default(),
+      ))
+      .unwrap()
+    };
+    let first = read();
+    thread::sleep(Duration::from_millis(10));
+    let retained = read();
+    assert_eq!(first["sequence"], 1);
+    assert_eq!(retained["sequence"], first["sequence"]);
+    assert_eq!(retained["sampled_at"], first["sampled_at"]);
+    assert_eq!(retained["metrics"], first["metrics"]);
+    assert!(retained["age_ms"].as_u64().unwrap() > first["age_ms"].as_u64().unwrap());
+    assert_eq!(retained["interval_ms"], 1500);
+    assert_eq!(retained["metrics"]["timestamp"], retained["sampled_at"]);
+    chrono::DateTime::parse_from_rfc3339(retained["sampled_at"].as_str().unwrap()).unwrap();
+    publish_sample(&shared, Metrics::default(), 100);
+    let next = read();
+    assert_eq!(next["sequence"], 2);
+    assert_eq!(next["interval_ms"], 100);
+    assert!(next["age_ms"].as_u64().unwrap() < retained["age_ms"].as_u64().unwrap());
+  }
+
+  #[test]
+  fn fragmented_http_requests_export_the_existing_json_shape() {
+    let shared = Arc::new(RwLock::new(None));
+    publish_sample(&shared, Metrics::default(), 1000);
+    let response = request(
+      &shared,
+      &[b"GE", b"T /api/sam", b"ple?fresh=1 HTTP/1.1\r\nHost: local", b"host\r\n", b"\r\n"],
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    let sample: serde_json::Value = serde_json::from_str(body(&response)).unwrap();
+    let legacy: serde_json::Value = serde_json::from_str(body(&get(&shared, "/json"))).unwrap();
+    for name in
+      ["soc", "cpu_tiers", "cpu_usage_pct", "ecpu_usage", "pcpu_usage", "gpu_usage", "fans"]
+    {
+      assert!(legacy.get(name).is_some(), "{name}");
+      assert_eq!(sample["metrics"][name], legacy[name], "{name}");
+    }
+    assert_eq!(sample["sequence"], 1);
+    let metrics = get(&shared, "/metrics");
+    assert!(metrics.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert_eq!(body(&metrics), to_prometheus(&Metrics::default(), &SocInfo::default()));
+    for path in ["/dashboard/../main.rs", "/dashboard/missing.css", "/not-found"] {
+      assert!(get(&shared, path).starts_with("HTTP/1.1 404 Not Found\r\n"));
+    }
+  }
+
+  #[test]
+  fn request_headers_are_limited_to_eight_kibibytes_and_must_be_complete_gets() {
+    let shared = Arc::new(RwLock::new(None));
+    let mut exact = b"GET / HTTP/1.1\r\nHost: localhost\r\nX: ".to_vec();
+    exact.resize(8192 - 4, b'x');
+    exact.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(body(&request(&shared, &[&exact])), "{}");
+    exact.insert(exact.len() - 4, b'x');
+    assert!(request(&shared, &[&exact]).is_empty());
+    for invalid in [
+      b"GET / HTTP/1.1\r\n".as_slice(),
+      b"POST /dashboard HTTP/1.1\r\n\r\n",
+      b"GET / HTTP/9\r\n\r\n",
+    ] {
+      assert!(request(&shared, &[invalid]).is_empty());
+    }
+  }
+
+  #[test]
+  fn incomplete_headers_have_one_total_deadline_despite_incoming_bytes() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+      let mut stream = listener.accept().unwrap().0;
+      let started = Instant::now();
+      assert!(read_path(&mut stream).is_none());
+      tx.send(started.elapsed()).unwrap();
+    });
+    let mut client = TcpStream::connect(address).unwrap();
+    for byte in [b"G", b"E", b"T"] {
+      client.write_all(byte).unwrap();
+      thread::sleep(Duration::from_millis(600));
+    }
+    let elapsed = rx.recv_timeout(Duration::from_secs(4)).unwrap();
+    worker.join().unwrap();
+    assert!(elapsed >= Duration::from_millis(1800), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(2900), "{elapsed:?}");
+  }
 
   #[test]
   fn exports_all_interfaces_with_escaped_labels_and_omits_unknown_rates() {

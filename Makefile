@@ -24,7 +24,10 @@ build:
 update:
 	cargo upgrade -i
 
-.PHONY: loc bench remote upstream-sync test-upstream-sync
+.PHONY: loc bench remote upstream-sync test-upstream-sync test-dashboard
+
+test-dashboard:
+	node scripts/test-dashboard.mjs
 
 upstream-sync:
 	@sh scripts/upstream-sync.sh
