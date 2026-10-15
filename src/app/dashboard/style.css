@@ -50,9 +50,17 @@ h3 { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
   box-shadow: inset 0 1px #ffffff04, 0 16px 40px #00000012;
 }
 .detail-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(320px, 1fr); gap: 18px; }
-.network-scroll { max-height: 354px; overflow: auto; scrollbar-color: #3b4e65 transparent; }
-.network-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
-.network-scroll thead { position: sticky; top: 0; background: #131e2c; }
+.network-scroll, .process-scroll { max-height: 354px; overflow: auto; scrollbar-color: #3b4e65 transparent; }
+.network-scroll:focus-visible, .process-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
+.network-scroll thead, .process-scroll thead { position: sticky; top: 0; background: #131e2c; }
+.processes { margin-top: 18px; }
+.process-scroll th:first-child { width: 40%; }
+.process-scroll td:first-child small { display: block; color: var(--muted); font-size: 11px; }
+.readings { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.temperature { display: grid; color: var(--muted); font-size: 10px; letter-spacing: 1px; }
+.temperature strong { color: var(--accent); font-size: 20px; font-weight: 500; letter-spacing: 0; }
+select { max-width: 130px; padding: 6px; color: inherit; background: #101925; border: 1px solid var(--line); border-radius: 6px; }
+select:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .panel-head { margin-bottom: 20px; }
 .metric .tag { color: var(--muted); letter-spacing: 1px; }
 .reading { margin-top: 20px; font-size: 38px; font-weight: 550; font-variant-numeric: tabular-nums; letter-spacing: -1px; }
@@ -125,7 +133,7 @@ footer { margin-top: 24px; text-align: center; }
   .fans { grid-template-columns: 1fr; }
 }
 @media (max-width: 520px) {
-  .network-scroll thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .network-scroll thead, .process-scroll thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
   tbody { display: grid; gap: 12px; }
   tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); padding-bottom: 12px; border-bottom: 1px solid var(--line); }
   td { border: 0; padding: 7px 0; text-align: left; font-size: 12px; }

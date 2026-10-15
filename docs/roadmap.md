@@ -136,3 +136,7 @@ what we need.
 - [x] **23. Add a local browser dashboard.** Reuse real samples for responsive CPU/GPU,
       memory and Network views, compact material fans and reliable connection/sample state.
       Plan: [docs/plans/completed/20261014-local-dashboard.md](plans/completed/20261014-local-dashboard.md).
+
+- [x] **24. Add dashboard Processes and named temperatures.** Reuse completed process
+      snapshots for sortable CPU/GPU/memory rows and show prominent CPU/GPU Celsius readings.
+      Plan: [docs/plans/completed/20261014-dashboard-processes.md](plans/completed/20261014-dashboard-processes.md).

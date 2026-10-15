@@ -25,6 +25,9 @@ function settle() {
   const status = state.waiting ? "waiting" : state.online === null ? "connecting" : !state.online ? "offline" : live() ? "live" : "stale";
   $("status").dataset.state = status;
   put("status", status.toUpperCase());
+  const processAge = finite(state.sample?.processes_age_ms) ? state.sample.processes_age_ms + performance.now() - state.received : Infinity;
+  const processState = state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : processAge > limit() ? "STALE / " : "";
+  put("process-status", Array.isArray(state.sample?.processes) ? `${processState}${finite(processAge) ? `${Math.floor(processAge / 1000)}s old` : "Age unavailable"} / CPU 100% = one core` : "Unavailable for this request");
   if (live() && !document.hidden) staleTimer = setTimeout(settle, Math.max(1, limit() - age() + 1));
   if (moving()) {
     if (!state.frame) state.frame = requestAnimationFrame(animate);
@@ -123,6 +126,27 @@ function cooling(metrics) {
   $("fan-empty").hidden = !!next.size;
   put("fan-empty", metrics.soc?.vm ? "Fan telemetry unavailable in a virtual machine." : "No fan telemetry reported.");
 }
+function processes() {
+  const items = state.sample?.processes;
+  const rows = Array.isArray(items) ? items.filter((row) => row && typeof row.name === "string" && Number.isSafeInteger(row.pid) && row.pid > 0) : [];
+  const key = $("process-sort").value || "cpu_pct";
+  rows.sort((a, b) => Number(finite(b[key])) - Number(finite(a[key])) || (finite(a[key]) ? b[key] - a[key] : 0) || a.pid - b.pid);
+  $("process-table").hidden = !rows.length;
+  $("process-empty").hidden = !!rows.length;
+  put("process-empty", Array.isArray(items) ? "No processes reported." : "Process telemetry requires a local loopback request.");
+  put("process-count", `${rows.length} PROCESSES`);
+  $("process-rows").replaceChildren(...rows.map((item) => {
+    const row = document.createElement("tr");
+    [item.name, finite(item.cpu_pct) ? `${number(item.cpu_pct)}%` : unknown, finite(item.gpu_pct) ? `${number(item.gpu_pct)}%` : unknown, bytes(item.mem_bytes)].forEach((value, index) => {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      cell.dataset.label = ["Process / PID", "CPU %", "GPU %", "Memory"][index];
+      if (!index) { const pid = document.createElement("small"); pid.textContent = `PID ${item.pid}`; cell.append(pid); }
+      row.append(cell);
+    });
+    return row;
+  }));
+}
 function update(sample) {
   const metrics = sample.metrics, vm = metrics.soc?.vm, memory = metrics.memory || {};
   const frequencies = metrics.soc?.gpu_freqs;
@@ -133,8 +157,12 @@ function update(sample) {
   put("gpu-value", percent(gpu));
   put("ram-value", percent(ram));
   const tiers = vm ? unknown : (Array.isArray(metrics.cpu_tiers) ? metrics.cpu_tiers : []).map((tier) => `${tier.label} ${number(tier.freq_mhz, 0)} MHz`).join(" / ") || unknown;
-  put("cpu-detail", `${number(metrics.temp?.cpu_temp_avg)} C / ${number(vm ? null : metrics.cpu_power)} W / ${tiers}`);
-  put("gpu-detail", `${number(metrics.temp?.gpu_temp_avg)} C / ${number(vm ? null : metrics.gpu_power)} W / ${number(gpuUnavailable ? null : metrics.gpu_freq_mhz, 0)} MHz`);
+  for (const name of ["cpu", "gpu"]) {
+    const value = metrics.temp?.[`${name}_temp_avg`];
+    put(`${name}-temp`, typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(1)} \u00b0C` : "Unavailable");
+  }
+  put("cpu-detail", `${number(vm ? null : metrics.cpu_power)} W / ${tiers}`);
+  put("gpu-detail", `${number(vm ? null : metrics.gpu_power)} W / ${number(gpuUnavailable ? null : metrics.gpu_freq_mhz, 0)} MHz`);
   put("ram-detail", `${bytes(memory.ram_usage)} used / ${bytes(memory.ram_total)} total / ${bytes(memory.swap_usage)} swap`);
   put("device", [metrics.soc?.chip_name || "Local device", metrics.soc?.mac_model, vm ? "Virtual machine" : ""].filter(Boolean).join(" / "));
   put("sample-time", `Sample ${new Date(sample.sampled_at).toLocaleTimeString("en-US", { hour12: false })}`);
@@ -142,6 +170,7 @@ function update(sample) {
   if (state.history.length > 60) state.history.shift();
   network(metrics);
   cooling(metrics);
+  processes();
   drawCharts();
 }
 async function poll() {
@@ -190,6 +219,7 @@ async function poll() {
   }
 }
 motion.addEventListener("change", settle);
+$("process-sort").addEventListener("change", processes);
 reduced.addEventListener("change", () => { if (reduced.matches) { motion.checked = false; settle(); } });
 document.addEventListener("visibilitychange", () => {
   clearTimeout(pollTimer);

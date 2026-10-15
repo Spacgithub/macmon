@@ -17,12 +17,14 @@
     <section class="overview" aria-label="Processor and memory overview">
       <article class="metric">
         <div class="metric-top"><h2>CPU activity</h2><span class="tag">COMPUTE</span></div>
-        <p class="reading" id="cpu-value">&mdash;</p><canvas id="cpu-chart" role="img" aria-label="CPU activity history, up to 60 samples"></canvas>
+        <div class="readings"><p class="reading" id="cpu-value">&mdash;</p><div class="temperature"><span>CPU TEMP</span><strong id="cpu-temp">Unavailable</strong></div></div>
+        <canvas id="cpu-chart" role="img" aria-label="CPU activity history, up to 60 samples"></canvas>
         <p class="detail" id="cpu-detail">Waiting for a sample</p>
       </article>
       <article class="metric">
         <div class="metric-top"><h2>GPU activity</h2><span class="tag">GRAPHICS</span></div>
-        <p class="reading" id="gpu-value">&mdash;</p><canvas id="gpu-chart" role="img" aria-label="GPU activity history, up to 60 samples"></canvas>
+        <div class="readings"><p class="reading" id="gpu-value">&mdash;</p><div class="temperature"><span>GPU TEMP</span><strong id="gpu-temp">Unavailable</strong></div></div>
+        <canvas id="gpu-chart" role="img" aria-label="GPU activity history, up to 60 samples"></canvas>
         <p class="detail" id="gpu-detail">Waiting for a sample</p>
       </article>
       <article class="metric">
@@ -48,6 +50,16 @@
       <p class="muted" id="fan-empty">Waiting for a sample</p><div class="fans" id="fans" hidden></div>
     </section>
     </div>
+    <section class="panel processes" aria-labelledby="process-title">
+      <div class="panel-head"><div><p class="eyebrow" id="process-count">PROCESS TELEMETRY</p><h2 id="process-title">Processes</h2></div>
+        <label class="motion">Sort by <select id="process-sort"><option value="cpu_pct">CPU usage</option><option value="gpu_pct">GPU usage</option><option value="mem_bytes">Memory</option></select></label></div>
+      <p class="muted" id="process-status">Waiting for a sample</p><p class="muted" id="process-empty">Waiting for a sample</p>
+      <div class="process-scroll" tabindex="0" role="region" aria-label="Processes; scroll to see all">
+        <table id="process-table" hidden><caption class="sr-only">Process name and PID, CPU percent (100% is one core), GPU percent and memory; unavailable rates shown as a dash</caption>
+          <thead><tr><th scope="col">Process / PID</th><th scope="col">CPU %</th><th scope="col">GPU %</th><th scope="col">Memory</th></tr></thead><tbody id="process-rows"></tbody>
+        </table>
+      </div>
+    </section>
     <footer class="muted">Local metrics / 60-sample history / One-second refresh</footer>
   </main>
   <template id="fan-template">

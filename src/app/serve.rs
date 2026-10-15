@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use macmon::{Metrics, SocInfo};
 
 use crate::metrics_to_json_value;
+use crate::procs::ProcessSnapshot;
 
 pub type SharedMetrics = Arc<RwLock<Option<Sample>>>;
 
@@ -18,14 +19,25 @@ pub struct Sample {
   sampled_at: String,
   sampled: Instant,
   interval_ms: u32,
+  processes: Option<ProcessSnapshot>,
 }
 
-pub fn publish_sample(shared: &SharedMetrics, metrics: Metrics, interval_ms: u32) {
-  let sampled = Instant::now();
-  let sampled_at = chrono::Utc::now().to_rfc3339();
+/// Capture system-metric completion before collecting the separate process snapshot.
+pub fn sample_time() -> (Instant, String) {
+  (Instant::now(), chrono::Utc::now().to_rfc3339())
+}
+
+pub fn publish_sample(
+  shared: &SharedMetrics,
+  metrics: Metrics,
+  interval_ms: u32,
+  processes: Option<ProcessSnapshot>,
+  time: (Instant, String),
+) {
+  let (sampled, sampled_at) = time;
   let mut latest = shared.write().unwrap();
   let sequence = latest.as_ref().map_or(1, |sample| sample.sequence.saturating_add(1));
-  *latest = Some(Sample { metrics, sequence, sampled_at, sampled, interval_ms });
+  *latest = Some(Sample { metrics, sequence, sampled_at, sampled, interval_ms, processes });
 }
 
 fn escape_label_value(value: &str) -> String {
@@ -170,18 +182,21 @@ fn to_json(m: &Metrics, soc: &SocInfo) -> String {
   json_value(m, soc, &chrono::Utc::now().to_rfc3339()).to_string()
 }
 
-fn to_sample(sample: &Sample, soc: &SocInfo) -> String {
+fn to_sample(sample: &Sample, soc: &SocInfo, local: bool) -> String {
+  let processes = sample.processes.as_ref().filter(|_| local);
   serde_json::json!({
     "sequence": sample.sequence,
     "sampled_at": sample.sampled_at,
     "age_ms": sample.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64,
     "interval_ms": sample.interval_ms,
     "metrics": json_value(&sample.metrics, soc, &sample.sampled_at),
+    "processes": processes.map(|snapshot| &snapshot.rows),
+    "processes_age_ms": processes.map(|snapshot| snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
   })
   .to_string()
 }
 
-fn read_path(stream: &mut TcpStream) -> Option<String> {
+fn read_path(stream: &mut TcpStream) -> Option<(String, bool)> {
   let deadline = Instant::now() + Duration::from_secs(2);
   let mut header = Vec::new();
   let mut buf = [0; 1024];
@@ -206,10 +221,31 @@ fn read_path(stream: &mut TcpStream) -> Option<String> {
       {
         return None;
       }
-      return Some(path.split('?').next().unwrap_or(path).to_string());
+      let mut hosts = text
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("Host"));
+      let port = stream.local_addr().ok()?.port();
+      let local_host = hosts.next().is_some_and(|(_, host)| local_host(host.trim(), port))
+        && hosts.next().is_none();
+      return Some((path.split('?').next().unwrap_or(path).to_string(), local_host));
     }
   }
   None
+}
+
+fn local_host(host: &str, port: u16) -> bool {
+  host.eq_ignore_ascii_case(&format!("localhost:{port}"))
+    || (port == 80 && host.eq_ignore_ascii_case("localhost"))
+    || host
+      .parse::<std::net::SocketAddr>()
+      .or_else(|_| format!("{host}:80").parse())
+      .is_ok_and(|address| loopback(address.ip()) && address.port() == port)
+}
+
+fn loopback(ip: std::net::IpAddr) -> bool {
+  ip.to_canonical().is_loopback()
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
@@ -249,7 +285,7 @@ fn handle_conn(mut stream: TcpStream, shared: SharedMetrics, soc: Arc<SocInfo>) 
   if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
     return;
   }
-  let path = match read_path(&mut stream) {
+  let (path, local_host) = match read_path(&mut stream) {
     Some(p) => p,
     None => return,
   };
@@ -291,7 +327,8 @@ fn handle_conn(mut stream: TcpStream, shared: SharedMetrics, soc: Arc<SocInfo>) 
       write_response(&mut stream, 200, "application/json", &body);
     }
     "/api/sample" => {
-      let body = to_sample(sample, &soc);
+      let local = local_host && stream.peer_addr().is_ok_and(|peer| loopback(peer.ip()));
+      let body = to_sample(sample, &soc, local);
       drop(lock);
       write_response(&mut stream, 200, "application/json", &body);
     }
@@ -478,13 +515,14 @@ mod tests {
   #[test]
   fn sample_metadata_retains_its_time_and_age_until_a_new_success() {
     let shared = Arc::new(RwLock::new(None));
-    publish_sample(&shared, Metrics::default(), 1500);
+    publish_sample(&shared, Metrics::default(), 1500, None, super::sample_time());
     shared.write().unwrap().as_mut().unwrap().sampled = Instant::now() - Duration::from_millis(250);
     let read = || {
       let lock = shared.read().unwrap();
       serde_json::from_str::<serde_json::Value>(&to_sample(
         lock.as_ref().unwrap(),
         &SocInfo::default(),
+        false,
       ))
       .unwrap()
     };
@@ -499,7 +537,7 @@ mod tests {
     assert_eq!(retained["interval_ms"], 1500);
     assert_eq!(retained["metrics"]["timestamp"], retained["sampled_at"]);
     chrono::DateTime::parse_from_rfc3339(retained["sampled_at"].as_str().unwrap()).unwrap();
-    publish_sample(&shared, Metrics::default(), 100);
+    publish_sample(&shared, Metrics::default(), 100, None, super::sample_time());
     let next = read();
     assert_eq!(next["sequence"], 2);
     assert_eq!(next["interval_ms"], 100);
@@ -507,9 +545,151 @@ mod tests {
   }
 
   #[test]
+  fn system_sample_time_includes_a_slow_process_sweep() {
+    let shared = Arc::new(RwLock::new(None));
+    let time = super::sample_time();
+    let instant = time.0;
+    let timestamp = time.1.clone();
+    thread::sleep(Duration::from_millis(25)); // Stand in for process enumeration.
+    let processes = crate::procs::ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() };
+    publish_sample(&shared, Metrics::default(), 1000, Some(processes), time);
+    let lock = shared.read().unwrap();
+    let sample = lock.as_ref().unwrap();
+    let json: serde_json::Value =
+      serde_json::from_str(&to_sample(sample, &SocInfo::default(), true)).unwrap();
+    assert_eq!(sample.sampled, instant);
+    assert_eq!(json["sampled_at"], timestamp);
+    assert_eq!(json["metrics"]["timestamp"], timestamp);
+    assert!(json["age_ms"].as_u64().unwrap() >= 25);
+    assert!(json["processes_age_ms"].as_u64().unwrap() < json["age_ms"].as_u64().unwrap());
+  }
+
+  #[test]
+  fn loopback_peers_and_host_authorities_canonicalize_mapped_ipv4() {
+    for ip in ["127.0.0.1", "127.12.0.1", "::1", "::ffff:127.0.0.1"] {
+      assert!(super::loopback(ip.parse().unwrap()), "{ip}");
+    }
+    for ip in ["192.0.2.1", "::", "::ffff:192.0.2.1"] {
+      assert!(!super::loopback(ip.parse().unwrap()), "{ip}");
+    }
+    for host in ["localhost:9090", "127.0.0.1:9090", "[::1]:9090", "[::ffff:127.0.0.1]:9090"] {
+      assert!(super::local_host(host, 9090), "{host}");
+    }
+    for host in ["localhost", "127.0.0.1", "[::1]", "[::ffff:127.0.0.1]"] {
+      assert!(super::local_host(host, 80), "{host}");
+      assert!(!super::local_host(host, 9090), "unported {host}");
+    }
+    for host in ["[::ffff:192.0.2.1]:9090", "[::ffff:127.0.0.1]:80", "foreign.example:9090"] {
+      assert!(!super::local_host(host, 9090), "{host}");
+    }
+  }
+
+  #[test]
+  fn ipv6_and_available_dual_stack_connections_keep_local_processes() {
+    let shared = Arc::new(RwLock::new(None));
+    let processes = crate::procs::ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() };
+    publish_sample(&shared, Metrics::default(), 1000, Some(processes), super::sample_time());
+    for (bind, connect, host) in
+      [("::1", "::1", "[::1]"), ("::", "127.0.0.1", "[::ffff:127.0.0.1]")]
+    {
+      let listener = match TcpListener::bind((bind, 0)) {
+        Ok(listener) => listener,
+        Err(error)
+          if matches!(
+            error.kind(),
+            std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+          ) =>
+        {
+          eprintln!("IPv6 unavailable: {error}");
+          continue;
+        }
+        Err(error) => panic!("IPv6 bind: {error}"),
+      };
+      let port = listener.local_addr().unwrap().port();
+      let mut client = match TcpStream::connect_timeout(
+        &std::net::SocketAddr::new(connect.parse().unwrap(), port),
+        Duration::from_secs(1),
+      ) {
+        Ok(client) => client,
+        Err(error) if bind == "::" && error.kind() == std::io::ErrorKind::ConnectionRefused => {
+          eprintln!("IPv4 mapping unavailable on this IPv6 listener");
+          continue;
+        }
+        Err(error) => panic!("IPv6 connect: {error}"),
+      };
+      let (stream, peer) = listener.accept().unwrap();
+      eprintln!("Validated local process disclosure for peer {peer}");
+      assert!(super::loopback(peer.ip()));
+      let latest = Arc::clone(&shared);
+      let worker = thread::spawn(move || handle_conn(stream, latest, Arc::new(SocInfo::default())));
+      client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+      write!(client, "GET /api/sample HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").unwrap();
+      let mut response = String::new();
+      client.read_to_string(&mut response).unwrap();
+      worker.join().unwrap();
+      let json: serde_json::Value = serde_json::from_str(body(&response)).unwrap();
+      assert!(json["processes"].is_array());
+    }
+  }
+
+  #[test]
+  fn process_snapshots_require_loopback_authority_and_keep_their_own_age() {
+    use crate::procs::ProcessSnapshot;
+    let shared = Arc::new(RwLock::new(None));
+    publish_sample(
+      &shared,
+      Metrics::default(),
+      1000,
+      Some(ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() - Duration::from_secs(5) }),
+      super::sample_time(),
+    );
+    for (authority, allowed) in [
+      ("localhost:PORT", true),
+      ("127.0.0.1:PORT", true),
+      ("[::1]:PORT", true),
+      ("attacker.example:PORT", false),
+      ("localhost:0", false),
+      ("127.0.0.1.attacker:PORT", false),
+      ("localhost:PORT\r\nHost: localhost:PORT", false),
+    ] {
+      let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+      let address = listener.local_addr().unwrap();
+      let latest = Arc::clone(&shared);
+      let worker = thread::spawn(move || {
+        handle_conn(listener.accept().unwrap().0, latest, Arc::new(SocInfo::default()))
+      });
+      let mut client = TcpStream::connect(address).unwrap();
+      client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+      let host = authority.replace("PORT", &address.port().to_string());
+      write!(client, "GET /api/sample HTTP/1.1\r\nHost: {host}\r\n\r\n").unwrap();
+      let mut response = String::new();
+      client.read_to_string(&mut response).unwrap();
+      worker.join().unwrap();
+      let json: serde_json::Value = serde_json::from_str(body(&response)).unwrap();
+      assert_eq!(json["processes"].is_array(), allowed, "{authority}");
+      if allowed {
+        assert!(json["processes_age_ms"].as_u64().unwrap() >= 5000);
+      } else {
+        assert!(json["processes_age_ms"].is_null());
+      }
+      assert_eq!(json["sequence"], 1);
+    }
+    let lock = shared.read().unwrap();
+    let remote: serde_json::Value =
+      serde_json::from_str(&to_sample(lock.as_ref().unwrap(), &SocInfo::default(), false)).unwrap();
+    assert!(remote["processes"].is_null() && remote["processes_age_ms"].is_null());
+    let old: serde_json::Value = serde_json::from_str(body(&get(&shared, "/json"))).unwrap();
+    assert!(old.get("processes").is_none() && old.get("processes_age_ms").is_none());
+    assert_eq!(
+      body(&get(&shared, "/metrics")),
+      to_prometheus(&Metrics::default(), &SocInfo::default())
+    );
+  }
+
+  #[test]
   fn fragmented_http_requests_export_the_existing_json_shape() {
     let shared = Arc::new(RwLock::new(None));
-    publish_sample(&shared, Metrics::default(), 1000);
+    publish_sample(&shared, Metrics::default(), 1000, None, super::sample_time());
     let response = request(
       &shared,
       &[b"GE", b"T /api/sam", b"ple?fresh=1 HTTP/1.1\r\nHost: local", b"host\r\n", b"\r\n"],

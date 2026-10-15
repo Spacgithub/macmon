@@ -190,8 +190,8 @@ function metrics(overrides = {}) {
     network: [{ name: 'en0', rx_bytes_per_sec: 1000, tx_bytes_per_sec: 500, rx_bytes: 4096, tx_bytes: 2048 }],
     fans: [{ name: 'fan0', rpm: 1800, max_rpm: 6800 }, { name: 'fan1', rpm: 2400 }], ...overrides };
 }
-function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, data = metrics() } = {}) {
-  return { sequence, sampled_at, age_ms, interval_ms, metrics: data };
+function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, data = metrics(), processes = null, processes_age_ms = null } = {}) {
+  return { sequence, sampled_at, age_ms, interval_ms, metrics: data, processes, processes_age_ms };
 }
 async function nextPoll(harness) {
   for (let i = 0; !harness.pending() && i < 4; i++) await harness.advance(1000);
@@ -392,6 +392,55 @@ await check('all interfaces remain available and busiest interfaces sort first w
   assert.equal(rows[0].children[0].textContent, 'en20');
   assert.equal(rows.at(-1).children[0].textContent, 'en0');
   assert.deepEqual(network, before);
+});
+
+await check('named temperature readings retain activity and distinguish missing sensors', async () => {
+  const h = boot(); await h.answer(sample());
+  assert.equal(h.text('cpu-value'), '25.0%'); assert.equal(h.text('gpu-value'), '50.0%');
+  assert.equal(h.text('cpu-temp'), '45.0 °C'); assert.equal(h.text('gpu-temp'), '43.0 °C');
+  await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ temp: { cpu_temp_avg: 0, gpu_temp_avg: null } }) }));
+  assert.equal(h.text('cpu-temp'), '0.0 °C'); assert.equal(h.text('gpu-temp'), 'Unavailable');
+  await nextPoll(h); await h.answer(sample({ sequence: 3, data: {} }));
+  assert.equal(h.text('cpu-temp'), 'Unavailable'); assert.equal(h.text('gpu-temp'), 'Unavailable');
+  assert.match(html, /CPU TEMP/); assert.match(html, /GPU TEMP/);
+});
+
+await check('all processes sort by real usage with missing rates last and safe names', async () => {
+  const h = boot(), name = '<img onerror="globalThis.pwned=1">';
+  const processes = Array.from({ length: 80 }, (_, i) => ({ pid: i + 1, name: i ? `process${i}` : name,
+    cpu_pct: i ? i * 3 : null, gpu_pct: i === 79 ? null : i, mem_bytes: 1000 - i }));
+  const before = structuredClone(processes);
+  await h.answer(sample({ processes, processes_age_ms: 25 }));
+  const rows = () => h.elements.get('process-rows').children;
+  assert.equal(rows().length, 80); assert.equal(h.elements.get('process-table').hidden, false);
+  assert.equal(rows()[0].children[1].textContent, '237.0%', 'per-core CPU may exceed 100%');
+  assert.equal(rows().at(-1).children[0].textContent, `${name}PID 1`);
+  assert.equal(rows().at(-1).children[1].textContent, '—');
+  const requests = h.requests.length;
+  h.elements.get('process-sort').value = 'gpu_pct'; h.elements.get('process-sort').emit('change');
+  assert.equal(rows()[0].children[0].textContent, 'process78PID 79');
+  assert.equal(rows().at(-1).children[2].textContent, '—');
+  h.elements.get('process-sort').value = 'mem_bytes'; h.elements.get('process-sort').emit('change');
+  assert.equal(rows()[0].children[0].textContent, `${name}PID 1`);
+  assert.equal(h.requests.length, requests, 'sorting does not request or resample');
+  assert.deepEqual(processes, before); assert.equal(h.inspect('globalThis.pwned'), undefined);
+  assert.match(h.text('process-status'), /0s old.*one core/);
+});
+
+await check('process snapshots distinguish local-only, empty, stale and retained offline values', async () => {
+  const h = boot(); await h.answer(sample());
+  assert.equal(h.elements.get('process-table').hidden, true);
+  assert.match(h.text('process-empty'), /loopback/);
+  await nextPoll(h); await h.answer(sample({ sequence: 2, processes: [], processes_age_ms: 0 }));
+  assert.match(h.text('process-empty'), /No processes/);
+  await nextPoll(h); await h.answer(sample({ sequence: 3, processes: [{ pid: 1, name: 'real', cpu_pct: 0, gpu_pct: null, mem_bytes: 123 }], processes_age_ms: 5000 }));
+  assert.match(h.text('process-status'), /STALE/);
+  const retained = h.text('process-rows');
+  await nextPoll(h); await h.fail();
+  assert.equal(h.status(), 'offline'); assert.equal(h.text('process-rows'), retained);
+  assert.match(h.text('process-status'), /^OFFLINE \/ retained/);
+  await nextPoll(h); await h.answer(sample(), 503);
+  assert.match(h.text('process-status'), /^WAITING \/ retained/);
 });
 
 console.log(`${tests.length} dashboard checks passed.`);

@@ -276,6 +276,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
       }
       let mut sampler = Sampler::new()?;
+      let mut processes = procs::ProcSampler::new();
+      let _ = processes.sample(); // Prime counters before the first complete sampling interval.
       let soc = Arc::new(sampler.get_soc_info().clone());
       let shared: serve::SharedMetrics = Arc::new(RwLock::new(None));
 
@@ -291,7 +293,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
       loop {
         match sampler.get_metrics(args.interval.max(100)) {
-          Ok(m) => serve::publish_sample(&shared, m, args.interval.max(100)),
+          Ok(m) => {
+            let time = serve::sample_time();
+            let processes = processes.sample_dashboard();
+            serve::publish_sample(&shared, m, args.interval.max(100), Some(processes), time);
+          }
           Err(e) => eprintln!("sampling error: {e}"),
         }
       }
