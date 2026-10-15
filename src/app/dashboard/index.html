@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>macmon / Local telemetry</title>
+  <link rel="stylesheet" href="/dashboard/style.css">
+  <script src="/dashboard/app.js" defer></script>
+</head>
+<body>
+  <main class="dashboard">
+    <header class="masthead">
+      <div><p class="eyebrow">MACMON / LOCAL TELEMETRY</p><h1>System observatory</h1><p id="device" class="muted">Waiting for device telemetry</p></div>
+      <div class="connection"><span id="status" role="status" aria-live="polite" data-state="connecting">CONNECTING</span><p id="sample-time" class="muted">No sample received</p></div>
+    </header>
+    <section class="overview" aria-label="Processor and memory overview">
+      <article class="metric">
+        <div class="metric-top"><h2>CPU activity</h2><span class="tag">COMPUTE</span></div>
+        <p class="reading" id="cpu-value">&mdash;</p><canvas id="cpu-chart" role="img" aria-label="CPU activity history, up to 60 samples"></canvas>
+        <p class="detail" id="cpu-detail">Waiting for a sample</p>
+      </article>
+      <article class="metric">
+        <div class="metric-top"><h2>GPU activity</h2><span class="tag">GRAPHICS</span></div>
+        <p class="reading" id="gpu-value">&mdash;</p><canvas id="gpu-chart" role="img" aria-label="GPU activity history, up to 60 samples"></canvas>
+        <p class="detail" id="gpu-detail">Waiting for a sample</p>
+      </article>
+      <article class="metric">
+        <div class="metric-top"><h2>Unified memory</h2><span class="tag">MEMORY</span></div>
+        <p class="reading" id="ram-value">&mdash;</p><canvas id="ram-chart" role="img" aria-label="Memory usage history, up to 60 samples"></canvas>
+        <p class="detail" id="ram-detail">Waiting for a sample</p>
+      </article>
+    </section>
+    <div class="detail-grid">
+    <section class="panel" aria-labelledby="network-title">
+      <div class="panel-head"><div><p class="eyebrow">INTERFACE TELEMETRY</p><h2 id="network-title">Network</h2></div><span class="tag" id="network-count">NO DATA</span></div>
+      <p class="muted" id="network-empty">Waiting for a sample</p>
+      <div class="network-scroll" tabindex="0" role="region" aria-label="Network interfaces; scroll to see all">
+      <table id="network-table" hidden>
+        <caption class="sr-only">Receive and transmit rates and cumulative bytes for each interface</caption>
+        <thead><tr><th scope="col">Interface</th><th scope="col">RX / s</th><th scope="col">TX / s</th><th scope="col">RX total</th><th scope="col">TX total</th></tr></thead>
+        <tbody id="network-rows"></tbody>
+      </table>
+      </div>
+    </section>
+    <section class="panel" aria-labelledby="cooling-title">
+      <div class="panel-head"><div><p class="eyebrow">THERMAL SYSTEM</p><h2 id="cooling-title">Cooling</h2></div><label class="motion"><input id="motion" type="checkbox"> Fan motion</label></div>
+      <p class="muted" id="fan-empty">Waiting for a sample</p><div class="fans" id="fans" hidden></div>
+    </section>
+    </div>
+    <footer class="muted">Local metrics / 60-sample history / One-second refresh</footer>
+  </main>
+  <template id="fan-template">
+    <article class="fan-card">
+      <div class="housing" aria-hidden="true"><i class="screw"></i><i class="screw"></i><i class="screw"></i><i class="screw"></i><div class="rotor"></div><span class="hub"></span></div>
+      <div><h3 class="fan-name"></h3><p class="fan-rpm"></p><p class="muted fan-limit"></p></div>
+    </article>
+  </template>
+  <noscript>This dashboard requires JavaScript to show local telemetry.</noscript>
+</body>
+</html>

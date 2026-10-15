@@ -132,3 +132,7 @@ what we need.
       using physical cell dimensions, retain verified native images and add complete ANSI
       text fans with the same rotor state, independent clock and controls.
       Plan: [docs/plans/completed/20261014-terminal-fans.md](plans/completed/20261014-terminal-fans.md).
+
+- [x] **23. Add a local browser dashboard.** Reuse real samples for responsive CPU/GPU,
+      memory and Network views, compact material fans and reliable connection/sample state.
+      Plan: [docs/plans/completed/20261014-local-dashboard.md](plans/completed/20261014-local-dashboard.md).

@@ -1,0 +1,137 @@
+:root {
+  color-scheme: dark;
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #e5eef8;
+  background: #0b111b;
+  --muted: #91a3b8;
+  --line: #263446;
+  --accent: #72d8e8;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+[hidden] { display: none !important; }
+.dashboard {
+  width: min(1180px, calc(100% - 48px));
+  margin: 44px auto;
+}
+.masthead, .panel-head, .metric-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+h1, h2, h3, p { margin: 0; }
+h1 { font-size: clamp(26px, 4vw, 36px); font-weight: 580; letter-spacing: -1px; }
+h2 { font-size: 17px; font-weight: 550; }
+h3 { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
+.muted, .detail { color: var(--muted); font-size: 12px; }
+.eyebrow, .tag {
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 1.6px;
+}
+.eyebrow { margin-bottom: 6px; }
+.connection { text-align: right; flex-shrink: 0; }
+#status { font-size: 11px; letter-spacing: 1.4px; color: var(--accent); }
+#status::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 8px; border-radius: 50%; background: currentColor; }
+#status[data-state="offline"], #status[data-state="stale"] { color: #edb77b; }
+.overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  margin: 32px 0 18px;
+}
+.metric, .panel {
+  min-width: 0;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: linear-gradient(140deg, #142030, #101925 70%);
+  box-shadow: inset 0 1px #ffffff04, 0 16px 40px #00000012;
+}
+.detail-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(320px, 1fr); gap: 18px; }
+.network-scroll { max-height: 354px; overflow: auto; scrollbar-color: #3b4e65 transparent; }
+.network-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
+.network-scroll thead { position: sticky; top: 0; background: #131e2c; }
+.panel-head { margin-bottom: 20px; }
+.metric .tag { color: var(--muted); letter-spacing: 1px; }
+.reading { margin-top: 20px; font-size: 38px; font-weight: 550; font-variant-numeric: tabular-nums; letter-spacing: -1px; }
+canvas { display: block; width: 100%; height: 74px; margin: 12px 0; }
+.detail { min-height: 36px; overflow-wrap: anywhere; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; table-layout: fixed; }
+th, td { padding: 13px 8px; text-align: right; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+th { color: var(--muted); font-size: 11px; font-weight: 450; }
+th:first-child, td:first-child { text-align: left; }
+tbody tr:last-child td { border-bottom: 0; }
+td:nth-child(2) { color: var(--accent); }
+.motion { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+input { accent-color: var(--accent); }
+input:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.fans { display: grid; grid-template-columns: repeat(auto-fit, minmax(245px, 1fr)); gap: 30px; }
+.fan-card { display: flex; align-items: center; gap: 22px; min-width: 0; }
+.fan-card > div:last-child { min-width: 0; }
+.fan-rpm { margin: 4px 0; font-size: 25px; font-variant-numeric: tabular-nums; }
+.housing {
+  position: relative;
+  flex: 0 0 144px;
+  width: 144px;
+  height: 144px;
+  border: 1px solid #3b4a5d;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #243346, #111925 70%);
+  box-shadow: inset 0 1px #536274, inset 0 -5px 16px #080e17;
+}
+.housing::before {
+  content: "";
+  position: absolute;
+  inset: 8%;
+  border-radius: 50%;
+  background: radial-gradient(circle, #08111a 60%, #20384a 61%, #102331 69%, var(--accent) 70%, #243c4f 71%, #08121e 73%);
+  box-shadow: 0 0 9px #72d8e81c;
+}
+.rotor { position: absolute; inset: 13%; border-radius: 50%; overflow: hidden; }
+.blade {
+  position: absolute;
+  inset: 0;
+  clip-path: polygon(50% 50%, 53% 44%, 58% 34%, 65% 26%, 74% 20%, 83% 18%, 91% 19%, 96% 22%, 93% 31%, 88% 40%, 80% 48%, 70% 54%, 60% 57%, 54% 54%);
+  background: linear-gradient(124deg, #192936 27%, #376776 51%, #9cb9c4 63%, #294b5b 79%);
+}
+.blade:first-child { background: linear-gradient(124deg, #192936 27%, #437b89 51%, var(--accent) 63%, #294b5b 79%); }
+.hub {
+  position: absolute;
+  inset: 38%;
+  border: 1px solid #668196;
+  border-radius: 50%;
+  background: radial-gradient(circle at 36% 25%, #526b7d, #253a4d 44%, #111c2a 75%);
+  box-shadow: 0 2px 7px #050b11;
+}
+.screw { position: absolute; width: 5px; height: 5px; border-radius: 50%; background: #07111c; box-shadow: 0 1px #5d6d81; }
+.screw:nth-child(1) { inset: 9% auto auto 9%; }
+.screw:nth-child(2) { inset: 9% 9% auto auto; }
+.screw:nth-child(3) { inset: auto auto 9% 9%; }
+.screw:nth-child(4) { inset: auto 9% 9% auto; }
+footer { margin-top: 24px; text-align: center; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+@media (max-width: 960px) {
+  .detail-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 760px) {
+  .dashboard { width: calc(100% - 32px); margin: 24px auto; }
+  .masthead { align-items: flex-start; flex-direction: column; gap: 12px; }
+  .connection { text-align: left; }
+  .overview { grid-template-columns: 1fr; gap: 12px; margin-top: 24px; }
+  .metric, .panel { padding: 20px; }
+  .detail { min-height: 0; }
+  .fans { grid-template-columns: 1fr; }
+}
+@media (max-width: 520px) {
+  .network-scroll thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  tbody { display: grid; gap: 12px; }
+  tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+  td { border: 0; padding: 7px 0; text-align: left; font-size: 12px; }
+  td:first-child { grid-column: 1 / -1; font-size: 14px; }
+  td:not(:first-child)::before { content: attr(data-label); display: block; color: var(--muted); font-size: 10px; }
+  .panel-head { gap: 8px; }
+  .housing { flex-basis: 128px; width: 128px; height: 128px; }
+  .fan-card { gap: 16px; }
+}

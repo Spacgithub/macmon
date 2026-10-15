@@ -291,7 +291,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
       loop {
         match sampler.get_metrics(args.interval.max(100)) {
-          Ok(m) => *shared.write().unwrap() = Some(m),
+          Ok(m) => serve::publish_sample(&shared, m, args.interval.max(100)),
           Err(e) => eprintln!("sampling error: {e}"),
         }
       }
@@ -320,6 +320,21 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn serve_keeps_its_default_listener_and_explicit_loopback_option() {
+    for (args, expected) in [
+      (vec!["macmon", "serve"], "0.0.0.0"),
+      (vec!["macmon", "serve", "--host", "127.0.0.1"], "127.0.0.1"),
+    ] {
+      let cli = Cli::try_parse_from(args).unwrap();
+      let Some(Commands::Serve { host, port, .. }) = cli.command else {
+        panic!("expected serve");
+      };
+      assert_eq!(host, expected);
+      assert_eq!(port, 9090);
+    }
+  }
 
   #[test]
   fn zero_duration_ane_and_all_skip_warmup() {

@@ -158,12 +158,29 @@ macmon serve -i 500            # sampling interval 500ms
 macmon serve &                 # run in background
 ```
 
-Two endpoints are available:
+Available endpoints:
 
 | Endpoint       | Format     | Description                                                                                       |
 | -------------- | ---------- | ------------------------------------------------------------------------------------------------- |
 | `GET /json`    | JSON       | Current metrics snapshot (same format as `pipe --soc-info`)                                       |
 | `GET /metrics` | Prometheus | Metrics in [Prometheus text format](https://prometheus.io/docs/instrumenting/exposition_formats/) |
+| `GET /dashboard/` | HTML | Local browser dashboard with CPU/GPU activity, memory, Network and cooling |
+| `GET /api/sample` | JSON | Successful-sample sequence, timestamp, age, interval and metrics |
+
+#### Local dashboard
+
+Run `macmon serve --host 127.0.0.1`, then open
+[http://127.0.0.1:9090/dashboard/](http://127.0.0.1:9090/dashboard/).
+The dashboard is bundled into the binary and uses no external assets or frontend build step.
+It polls once per second, retains 60 distinct samples, ranks active interfaces first and keeps
+the full interface list in a scrollable panel. CPU/GPU activity uses active residency ratios.
+
+Compact mechanical fans show reported names and RPM. Zero RPM remains stationary; missing
+readings and VM-only placeholders stay unavailable. The Fan motion switch and reduced-motion
+preference control browser animation independently of sampling. Hidden pages pause polling
+and animation. WAITING, LIVE, STALE and OFFLINE describe connection/sample state while keeping
+the last available values visible. `/api/sample` adds freshness metadata; `/json`, `/metrics`,
+the root JSON response and existing server defaults retain their formats.
 
 #### launchd service
 
@@ -456,6 +473,10 @@ Creating `Sampler` inside the worker keeps its low-level macOS handles on that t
 ## 🤝 Contributing
 
 All contributions are welcome! Feel free to open an issue or submit a pull request.
+
+Run `make check` and `make test` for Rust and HTTP checks. With Node.js installed,
+`make test-dashboard` exercises the actual browser script against isolated DOM, clock and
+request fixtures. Node.js is used only for these development tests.
 
 ## 📝 License
 
