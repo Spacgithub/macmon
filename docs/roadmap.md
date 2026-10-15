@@ -145,7 +145,7 @@ what we need.
       with local web controls, effective/pending feedback and coordinated polling/freshness.
       Plan: [docs/plans/completed/20261014-dashboard-interval.md](plans/completed/20261014-dashboard-interval.md).
 
-- [ ] **26. Add desktop control for background web monitoring.** Start/open and stop a
+- [x] **26. Add desktop control for background web monitoring.** Start/open and stop a
       precisely owned launchd job from a small macOS app, preserving login preferences and
       separate terminal monitors.
-      Plan: [docs/plans/20261014-dashboard-control.md](plans/20261014-dashboard-control.md).
+      Plan: [docs/plans/completed/20261014-dashboard-control.md](plans/completed/20261014-dashboard-control.md).

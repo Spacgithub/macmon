@@ -1,3 +1,5 @@
+Done: 2026-10-14, PR #15
+
 # Desktop dashboard service control
 
 ## Behavior and decisions
@@ -15,7 +17,13 @@
 ## Tasks
 
 - [x] Implement precisely scoped start/status/stop actions and a desktop entry installer.
-- [ ] Verify repeat start/stop, KeepAlive, foreign-job rejection and separate TUI survival.
-- [ ] Install and check the user-facing desktop control without changing login preferences.
-- [ ] Run complete checks and review the personal-fork PR.
-- [ ] Refresh and verify the installed command with a working backup.
+- [x] Verify repeat start/stop, KeepAlive, foreign-job rejection and separate TUI survival.
+- [x] Install and check the user-facing desktop control without changing login preferences.
+- [x] Run complete checks and review the personal-fork PR.
+- [x] Refresh and verify the installed command with a working backup.
+
+## Result
+
+The signed desktop controller starts and stops its verified launchd job without affecting
+separate terminal monitors or login preferences. Isolated failure fixtures and real service
+lifecycle checks passed; the desktop entry and installed preview retain recoverable backups.
