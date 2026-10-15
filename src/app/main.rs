@@ -280,23 +280,26 @@ fn main() -> Result<(), Box<dyn Error>> {
       let _ = processes.sample(); // Prime counters before the first complete sampling interval.
       let soc = Arc::new(sampler.get_soc_info().clone());
       let shared: serve::SharedMetrics = Arc::new(RwLock::new(None));
+      let cadence = Arc::new(RwLock::new(serve::Cadence::new(args.interval.max(100))));
 
       let shared_http = Arc::clone(&shared);
       let soc_http = Arc::clone(&soc);
       let host = host.clone();
       let port = *port;
+      let cadence_http = Arc::clone(&cadence);
       thread::spawn(move || {
-        if let Err(e) = serve::run(&host, port, shared_http, soc_http) {
+        if let Err(e) = serve::run(&host, port, shared_http, soc_http, cadence_http) {
           eprintln!("server error: {e}");
         }
       });
 
       loop {
-        match sampler.get_metrics(args.interval.max(100)) {
+        let window = cadence.write().unwrap().begin();
+        match sampler.get_metrics(window) {
           Ok(m) => {
             let time = serve::sample_time();
             let processes = processes.sample_dashboard();
-            serve::publish_sample(&shared, m, args.interval.max(100), Some(processes), time);
+            serve::publish_sample(&shared, m, window, Some(processes), time);
           }
           Err(e) => eprintln!("sampling error: {e}"),
         }

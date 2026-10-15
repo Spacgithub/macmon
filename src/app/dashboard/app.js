@@ -5,7 +5,7 @@ const finite = (value) => typeof value === "number" && Number.isFinite(value) &&
 const number = (value, digits = 1) => finite(value) ? value.toFixed(digits) : unknown;
 const percent = (value) => finite(value) ? `${(Math.min(value, 1) * 100).toFixed(1)}%` : unknown;
 const put = (id, value) => { $(id).textContent = value; };
-const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], frame: 0, last: 0 };
+const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], frame: 0, last: 0, cadence: null, changing: false, intervalError: false };
 const motion = $("motion");
 const reduced = matchMedia("(prefers-reduced-motion: reduce)");
 motion.checked = !reduced.matches;
@@ -17,7 +17,41 @@ function bytes(value) {
   return `${(value / 1024 ** scale).toLocaleString("en-US", { maximumSignificantDigits: 3 })} ${units[scale]}`;
 }
 function age() { return state.sample ? state.sample.age_ms + performance.now() - state.received : Infinity; }
-function limit() { return Math.max(3 * (state.sample?.interval_ms || 1000), 3000); }
+function limit() { return Math.max(3 * (state.sample?.interval_ms || 1000), 3 * (state.cadence?.effective_ms || 0), 3000); }
+function refreshCadence(value = state.cadence) {
+  if (!value) return;
+  if ([value.requested_ms, value.effective_ms].some((ms) => !Number.isInteger(ms) || ms <= 0)
+    || typeof value.pending !== "boolean") throw new Error("Invalid cadence");
+  state.cadence = value;
+  put("interval-value", `${number(value.effective_ms, 0)} ms`);
+  put("interval-feedback", state.changing ? "Applying…" : state.intervalError ? "Change not confirmed"
+    : value.pending ? `Pending ${number(value.requested_ms, 0)} ms; finishing current sample` : "Service sampling");
+  $("interval-down").disabled = state.changing || value.requested_ms === 250;
+  $("interval-up").disabled = state.changing || value.requested_ms === 10000;
+  put("cadence-footer", `Local metrics / 60-sample history / ${number(value.effective_ms, 0)} ms sampling`);
+}
+async function adjustInterval(adjustment) {
+  if (state.changing || !state.cadence) return;
+  state.changing = true;
+  state.intervalError = false;
+  refreshCadence();
+  const request = new AbortController(), timeout = setTimeout(() => request.abort(), 2500);
+  try {
+    const response = await fetch("/api/interval", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ adjustment }), signal: request.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    refreshCadence(await response.json());
+  } catch {
+    state.intervalError = true;
+  } finally {
+    clearTimeout(timeout);
+    state.changing = false;
+    refreshCadence();
+    clearTimeout(pollTimer);
+    state.urgent = true;
+    poll();
+  }
+}
 function live() { return state.online && !state.waiting && state.sample && age() <= limit(); }
 function moving() { return live() && !document.hidden && motion.checked && [...state.fans.values()].some((fan) => fan.rpm > 0); }
 function settle() {
@@ -195,6 +229,7 @@ async function poll() {
       || typeof sample.metrics !== "object" || Array.isArray(sample.metrics)
       || !Number.isFinite(Date.parse(sample.sampled_at))) throw new Error("Invalid sample");
     state.sample = sample;
+    if (sample.cadence) refreshCadence(sample.cadence);
     // Count the full request duration as a conservative bound for response transit time.
     state.received = started;
     state.online = true;
@@ -215,11 +250,15 @@ async function poll() {
     clearTimeout(timeout);
     controller = null;
     state.busy = false;
-    if (!document.hidden) pollTimer = setTimeout(poll, state.urgent ? 0 : Math.max(0, 1000 - (performance.now() - started)));
+    const delay = state.cadence ? Math.min(state.cadence.effective_ms, state.cadence.pending ? 1000 : 10000) : 1000;
+    if (!document.hidden) pollTimer = setTimeout(poll, state.urgent ? 0 : Math.max(0, Math.max(250, delay) - (performance.now() - started)));
   }
 }
 motion.addEventListener("change", settle);
 $("process-sort").addEventListener("change", processes);
+
+$("interval-down").addEventListener("click", () => adjustInterval("decrease"));
+$("interval-up").addEventListener("click", () => adjustInterval("increase"));
 reduced.addEventListener("change", () => { if (reduced.matches) { motion.checked = false; settle(); } });
 document.addEventListener("visibilitychange", () => {
   clearTimeout(pollTimer);

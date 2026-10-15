@@ -140,3 +140,7 @@ what we need.
 - [x] **24. Add dashboard Processes and named temperatures.** Reuse completed process
       snapshots for sortable CPU/GPU/memory rows and show prominent CPU/GPU Celsius readings.
       Plan: [docs/plans/completed/20261014-dashboard-processes.md](plans/completed/20261014-dashboard-processes.md).
+
+- [x] **25. Control live dashboard sampling.** Adjust the service's real sampling interval
+      with local web controls, effective/pending feedback and coordinated polling/freshness.
+      Plan: [docs/plans/completed/20261014-dashboard-interval.md](plans/completed/20261014-dashboard-interval.md).

@@ -165,15 +165,17 @@ Available endpoints:
 | `GET /json`    | JSON       | Current metrics snapshot (same format as `pipe --soc-info`)                                       |
 | `GET /metrics` | Prometheus | Metrics in [Prometheus text format](https://prometheus.io/docs/instrumenting/exposition_formats/) |
 | `GET /dashboard/` | HTML | Local browser dashboard with CPU/GPU activity and temperature, memory, Network, cooling and Processes |
-| `GET /api/sample` | JSON | Successful-sample sequence, timestamp, age, interval and metrics; local-only process snapshot |
+| `GET /api/sample` | JSON | Successful-sample sequence, timestamp, age, interval, service cadence and metrics; local-only process snapshot |
+| `POST /api/interval` | JSON | Adjust real service sampling with `{"adjustment":"increase"}` or `"decrease"`; local same-origin requests only |
 
 #### Local dashboard
 
 Run `macmon serve --host 127.0.0.1`, then open
 [http://127.0.0.1:9090/dashboard/](http://127.0.0.1:9090/dashboard/).
 The dashboard is bundled into the binary and uses no external assets or frontend build step.
-It polls once per second, retains 60 distinct samples, ranks active interfaces first and keeps
+It follows the service sampling interval, retains 60 distinct samples, ranks active interfaces first and keeps
 the full interface list in a scrollable panel. CPU/GPU activity uses active residency ratios.
+
 Named CPU and GPU temperature readings show Celsius or `Unavailable`. The Processes table
 includes names/PIDs, CPU, GPU and memory, sortable by usage; CPU 100% means one busy core.
 New processes and unavailable rates show a dash. Process sampling runs once per completed
@@ -181,6 +183,20 @@ metrics cycle, independently of browsers. Only loopback clients with a matching 
 receive process names and PIDs; other requests get `processes: null`. Snapshot age is reported
 as `processes_age_ms`, and all processes remain accessible in the scrollable table.
 System metric timestamps and age include the time spent collecting the separate process snapshot.
+
+The −/+ controls change the service's real sampling window in 250 ms steps, from 250 to
+10000 ms, using the terminal's adjustment rules. The displayed interval becomes effective
+when the next acquisition starts; a requested change remains pending while the current
+acquisition finishes. Further adjustments are allowed while pending. These runtime changes
+do not write terminal settings or change the command's startup interval. Existing CLI
+intervals down to 100 ms remain supported. Fan motion stays independent of sampling.
+
+Control requests require a loopback client, a loopback `Host` with the service's actual port,
+an exact same-origin `Origin`, and JSON content type. Remote dashboards remain read-only.
+`/api/sample` reports the completed window in `interval_ms` and current service state in
+`cadence: {requested_ms, effective_ms, pending}`. Pending settings are checked at least once
+per second; sample age uses completed and effective windows, so an unstarted request cannot
+hide stale readings.
 
 Compact mechanical fans show reported names and RPM. Zero RPM remains stationary; missing
 readings and VM-only placeholders stay unavailable. The Fan motion switch and reduced-motion

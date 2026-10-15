@@ -74,7 +74,10 @@ tbody tr:last-child td { border-bottom: 0; }
 td:nth-child(2) { color: var(--accent); }
 .motion { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; }
 input { accent-color: var(--accent); }
-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.interval-control { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 8px; font-size: 12px; }
+.interval-control button { width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 5px; background: #142030; color: inherit; cursor: pointer; }
+button:disabled { opacity: .4; cursor: default; }
 .fans { display: grid; grid-template-columns: repeat(auto-fit, minmax(245px, 1fr)); gap: 30px; }
 .fan-card { display: flex; align-items: center; gap: 22px; min-width: 0; }
 .fan-card > div:last-child { min-width: 0; }
@@ -127,6 +130,7 @@ footer { margin-top: 24px; text-align: center; }
   .dashboard { width: calc(100% - 32px); margin: 24px auto; }
   .masthead { align-items: flex-start; flex-direction: column; gap: 12px; }
   .connection { text-align: left; }
+  .interval-control { justify-content: flex-start; }
   .overview { grid-template-columns: 1fr; gap: 12px; margin-top: 24px; }
   .metric, .panel { padding: 20px; }
   .detail { min-height: 0; }
