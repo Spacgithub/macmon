@@ -141,6 +141,6 @@ what we need.
       snapshots for sortable CPU/GPU/memory rows and show prominent CPU/GPU Celsius readings.
       Plan: [docs/plans/completed/20261014-dashboard-processes.md](plans/completed/20261014-dashboard-processes.md).
 
-- [ ] **25. Control live dashboard sampling.** Adjust the service's real sampling interval
+- [x] **25. Control live dashboard sampling.** Adjust the service's real sampling interval
       with local web controls, effective/pending feedback and coordinated polling/freshness.
-      Plan: [docs/plans/20261014-dashboard-interval.md](plans/20261014-dashboard-interval.md).
+      Plan: [docs/plans/completed/20261014-dashboard-interval.md](plans/completed/20261014-dashboard-interval.md).

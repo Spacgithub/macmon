@@ -1,3 +1,5 @@
+Done: 2026-10-14, PR #14
+
 # Live dashboard sampling interval
 
 ## Behavior and decisions
@@ -16,6 +18,12 @@
 
 - [x] Implement bounded shared service cadence and a local control endpoint.
 - [x] Add effective interval, pending/error feedback and adaptive browser polling.
-- [ ] Verify actual cadence changes, invalid requests and recovery.
-- [ ] Run complete checks and review the personal-fork PR.
-- [ ] Refresh and verify the installed command with a working backup.
+- [x] Verify actual cadence changes, invalid requests and recovery.
+- [x] Run complete checks and review the personal-fork PR.
+- [x] Refresh and verify the installed command with a working backup.
+
+## Result
+
+Web controls adjust the real shared sampling window with effective and pending feedback.
+Boundary, request-validation, frontend and real-hardware cadence checks passed, including
+browser adjustments and restoration to 1000 ms. The installed preview retains a working backup.
