@@ -123,3 +123,7 @@ what we need.
       mechanical housing, recessed screws, cavity and hub shadows, and layered curved-metal
       blades while preserving the independent frame clock, palette and existing controls.
       Plan: [docs/plans/completed/20261014-fan-material-fidelity.md](plans/completed/20261014-fan-material-fidelity.md).
+
+- [x] **21. Keep graphical cooling cards compact.** Reduce fan images and card footprints,
+      reclaim graph/process space and retain the existing materials and animation controls.
+      Plan: [docs/plans/completed/20261014-compact-cooling.md](plans/completed/20261014-compact-cooling.md).

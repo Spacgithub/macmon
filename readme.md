@@ -96,10 +96,11 @@ the latest chart sample and hot-load history stay prominent. Wide network tables
 totals to the panel edge while preserving the compact layout in narrow windows.
 
 Compatible Warp, Kitty and WezTerm sessions can show a complete, shaded seven-blade fan for
-each reported fan, normally 180–240 pixels across, with a recessed mechanical housing, corner
-screws and curved metal highlights. The housing and hub stay fixed as the blades turn.
-Images use the terminal's queried colors and
-require a successful capability query for the actual image format and transport. Warp receives
+each reported fan, normally 120 pixels across (100 when space is limited), with a recessed
+mechanical housing, corner screws and curved metal highlights. The housing and hub stay fixed
+as the blades turn. Cards stay compact in large windows and preserve room for the process list.
+Images use the terminal's queried colors and require a successful capability query for the
+actual image format and transport. Warp receives
 images inline; Kitty and WezTerm use private local files. Other terminals and small windows keep
 the compact RPM indicator. Window resizing adapts the panels. Restart macmon after changing the
 terminal font size to query fresh pixel dimensions.

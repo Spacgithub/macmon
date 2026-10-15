@@ -77,13 +77,33 @@ mod fan_preview {
       assert!(row(&buffer, network.y).contains("Network 3/4"));
       assert!(row(&buffer, network.y + 2).contains("en0"));
       assert!(row(&buffer, network.y + 2).contains("1.0 MiB/s"));
+      assert!(screen.contains("Temperature"));
+      assert!(screen.contains("12.00 W"));
       assert_eq!(serde_json::to_value(&app.network).unwrap(), network_before);
       for place in &app.placements {
-        assert!((180..=240).contains(&place.side));
+        assert!((100..=120).contains(&place.side));
         assert_eq!(place.card.intersection(place.image), place.image);
         assert!(place.card.intersection(network).is_empty());
       }
       assert_saved_intent(&app, &RwLock::new(SAMPLE_MSEC), true);
+    }
+  }
+
+  #[test]
+  fn compact_single_fan_keeps_the_long_aggregate_power_title() {
+    for power in [12.0, 123.45] {
+      let mut app = graphical_app("one", true);
+      app.sys_power = Default::default();
+      app.all_power = Default::default();
+      let mut metrics = preview_metrics("one");
+      metrics.sys_power = 0.0;
+      metrics.all_power = power;
+      app.update_metrics(metrics);
+      let buffer = render_buffer(&mut app, 120, 40);
+      assert_eq!(app.placements.len(), 1);
+      let telemetry = app.layout(buffer.area).telemetry.unwrap();
+      assert!(row(&buffer, telemetry.y).contains(&format!("CPU+GPU+ANE {power:.2} W")));
+      assert!(screen_text(&buffer).contains("Temperature"));
     }
   }
 
