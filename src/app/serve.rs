@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use macmon::{Metrics, SocInfo};
 
 use crate::metrics_to_json_value;
+use crate::procs::ProcessSnapshot;
 
 pub type SharedMetrics = Arc<RwLock<Option<Sample>>>;
 
@@ -18,14 +19,20 @@ pub struct Sample {
   sampled_at: String,
   sampled: Instant,
   interval_ms: u32,
+  processes: Option<ProcessSnapshot>,
 }
 
-pub fn publish_sample(shared: &SharedMetrics, metrics: Metrics, interval_ms: u32) {
+pub fn publish_sample(
+  shared: &SharedMetrics,
+  metrics: Metrics,
+  interval_ms: u32,
+  processes: Option<ProcessSnapshot>,
+) {
   let sampled = Instant::now();
   let sampled_at = chrono::Utc::now().to_rfc3339();
   let mut latest = shared.write().unwrap();
   let sequence = latest.as_ref().map_or(1, |sample| sample.sequence.saturating_add(1));
-  *latest = Some(Sample { metrics, sequence, sampled_at, sampled, interval_ms });
+  *latest = Some(Sample { metrics, sequence, sampled_at, sampled, interval_ms, processes });
 }
 
 fn escape_label_value(value: &str) -> String {
@@ -170,18 +177,21 @@ fn to_json(m: &Metrics, soc: &SocInfo) -> String {
   json_value(m, soc, &chrono::Utc::now().to_rfc3339()).to_string()
 }
 
-fn to_sample(sample: &Sample, soc: &SocInfo) -> String {
+fn to_sample(sample: &Sample, soc: &SocInfo, local: bool) -> String {
+  let processes = sample.processes.as_ref().filter(|_| local);
   serde_json::json!({
     "sequence": sample.sequence,
     "sampled_at": sample.sampled_at,
     "age_ms": sample.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64,
     "interval_ms": sample.interval_ms,
     "metrics": json_value(&sample.metrics, soc, &sample.sampled_at),
+    "processes": processes.map(|snapshot| &snapshot.rows),
+    "processes_age_ms": processes.map(|snapshot| snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
   })
   .to_string()
 }
 
-fn read_path(stream: &mut TcpStream) -> Option<String> {
+fn read_path(stream: &mut TcpStream) -> Option<(String, bool)> {
   let deadline = Instant::now() + Duration::from_secs(2);
   let mut header = Vec::new();
   let mut buf = [0; 1024];
@@ -206,10 +216,27 @@ fn read_path(stream: &mut TcpStream) -> Option<String> {
       {
         return None;
       }
-      return Some(path.split('?').next().unwrap_or(path).to_string());
+      let mut hosts = text
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("Host"));
+      let port = stream.local_addr().ok()?.port();
+      let local_host = hosts.next().is_some_and(|(_, host)| local_host(host.trim(), port))
+        && hosts.next().is_none();
+      return Some((path.split('?').next().unwrap_or(path).to_string(), local_host));
     }
   }
   None
+}
+
+fn local_host(host: &str, port: u16) -> bool {
+  host.eq_ignore_ascii_case(&format!("localhost:{port}"))
+    || (port == 80
+      && matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "[::1]"))
+    || host
+      .parse::<std::net::SocketAddr>()
+      .is_ok_and(|address| address.ip().is_loopback() && address.port() == port)
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
@@ -249,7 +276,7 @@ fn handle_conn(mut stream: TcpStream, shared: SharedMetrics, soc: Arc<SocInfo>) 
   if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
     return;
   }
-  let path = match read_path(&mut stream) {
+  let (path, local_host) = match read_path(&mut stream) {
     Some(p) => p,
     None => return,
   };
@@ -291,7 +318,8 @@ fn handle_conn(mut stream: TcpStream, shared: SharedMetrics, soc: Arc<SocInfo>) 
       write_response(&mut stream, 200, "application/json", &body);
     }
     "/api/sample" => {
-      let body = to_sample(sample, &soc);
+      let local = local_host && stream.peer_addr().is_ok_and(|peer| peer.ip().is_loopback());
+      let body = to_sample(sample, &soc, local);
       drop(lock);
       write_response(&mut stream, 200, "application/json", &body);
     }
@@ -478,13 +506,14 @@ mod tests {
   #[test]
   fn sample_metadata_retains_its_time_and_age_until_a_new_success() {
     let shared = Arc::new(RwLock::new(None));
-    publish_sample(&shared, Metrics::default(), 1500);
+    publish_sample(&shared, Metrics::default(), 1500, None);
     shared.write().unwrap().as_mut().unwrap().sampled = Instant::now() - Duration::from_millis(250);
     let read = || {
       let lock = shared.read().unwrap();
       serde_json::from_str::<serde_json::Value>(&to_sample(
         lock.as_ref().unwrap(),
         &SocInfo::default(),
+        false,
       ))
       .unwrap()
     };
@@ -499,7 +528,7 @@ mod tests {
     assert_eq!(retained["interval_ms"], 1500);
     assert_eq!(retained["metrics"]["timestamp"], retained["sampled_at"]);
     chrono::DateTime::parse_from_rfc3339(retained["sampled_at"].as_str().unwrap()).unwrap();
-    publish_sample(&shared, Metrics::default(), 100);
+    publish_sample(&shared, Metrics::default(), 100, None);
     let next = read();
     assert_eq!(next["sequence"], 2);
     assert_eq!(next["interval_ms"], 100);
@@ -507,9 +536,62 @@ mod tests {
   }
 
   #[test]
+  fn process_snapshots_require_loopback_authority_and_keep_their_own_age() {
+    use crate::procs::ProcessSnapshot;
+    let shared = Arc::new(RwLock::new(None));
+    publish_sample(
+      &shared,
+      Metrics::default(),
+      1000,
+      Some(ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() - Duration::from_secs(5) }),
+    );
+    for (authority, allowed) in [
+      ("localhost:PORT", true),
+      ("127.0.0.1:PORT", true),
+      ("[::1]:PORT", true),
+      ("attacker.example:PORT", false),
+      ("localhost:0", false),
+      ("127.0.0.1.attacker:PORT", false),
+      ("localhost:PORT\r\nHost: localhost:PORT", false),
+    ] {
+      let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+      let address = listener.local_addr().unwrap();
+      let latest = Arc::clone(&shared);
+      let worker = thread::spawn(move || {
+        handle_conn(listener.accept().unwrap().0, latest, Arc::new(SocInfo::default()))
+      });
+      let mut client = TcpStream::connect(address).unwrap();
+      client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+      let host = authority.replace("PORT", &address.port().to_string());
+      write!(client, "GET /api/sample HTTP/1.1\r\nHost: {host}\r\n\r\n").unwrap();
+      let mut response = String::new();
+      client.read_to_string(&mut response).unwrap();
+      worker.join().unwrap();
+      let json: serde_json::Value = serde_json::from_str(body(&response)).unwrap();
+      assert_eq!(json["processes"].is_array(), allowed, "{authority}");
+      if allowed {
+        assert!(json["processes_age_ms"].as_u64().unwrap() >= 5000);
+      } else {
+        assert!(json["processes_age_ms"].is_null());
+      }
+      assert_eq!(json["sequence"], 1);
+    }
+    let lock = shared.read().unwrap();
+    let remote: serde_json::Value =
+      serde_json::from_str(&to_sample(lock.as_ref().unwrap(), &SocInfo::default(), false)).unwrap();
+    assert!(remote["processes"].is_null() && remote["processes_age_ms"].is_null());
+    let old: serde_json::Value = serde_json::from_str(body(&get(&shared, "/json"))).unwrap();
+    assert!(old.get("processes").is_none() && old.get("processes_age_ms").is_none());
+    assert_eq!(
+      body(&get(&shared, "/metrics")),
+      to_prometheus(&Metrics::default(), &SocInfo::default())
+    );
+  }
+
+  #[test]
   fn fragmented_http_requests_export_the_existing_json_shape() {
     let shared = Arc::new(RwLock::new(None));
-    publish_sample(&shared, Metrics::default(), 1000);
+    publish_sample(&shared, Metrics::default(), 1000, None);
     let response = request(
       &shared,
       &[b"GE", b"T /api/sam", b"ple?fresh=1 HTTP/1.1\r\nHost: local", b"host\r\n", b"\r\n"],

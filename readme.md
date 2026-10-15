@@ -164,8 +164,8 @@ Available endpoints:
 | -------------- | ---------- | ------------------------------------------------------------------------------------------------- |
 | `GET /json`    | JSON       | Current metrics snapshot (same format as `pipe --soc-info`)                                       |
 | `GET /metrics` | Prometheus | Metrics in [Prometheus text format](https://prometheus.io/docs/instrumenting/exposition_formats/) |
-| `GET /dashboard/` | HTML | Local browser dashboard with CPU/GPU activity, memory, Network and cooling |
-| `GET /api/sample` | JSON | Successful-sample sequence, timestamp, age, interval and metrics |
+| `GET /dashboard/` | HTML | Local browser dashboard with CPU/GPU activity and temperature, memory, Network, cooling and Processes |
+| `GET /api/sample` | JSON | Successful-sample sequence, timestamp, age, interval and metrics; local-only process snapshot |
 
 #### Local dashboard
 
@@ -174,6 +174,12 @@ Run `macmon serve --host 127.0.0.1`, then open
 The dashboard is bundled into the binary and uses no external assets or frontend build step.
 It polls once per second, retains 60 distinct samples, ranks active interfaces first and keeps
 the full interface list in a scrollable panel. CPU/GPU activity uses active residency ratios.
+Named CPU and GPU temperature readings show Celsius or `Unavailable`. The Processes table
+includes names/PIDs, CPU, GPU and memory, sortable by usage; CPU 100% means one busy core.
+New processes and unavailable rates show a dash. Process sampling runs once per completed
+metrics cycle, independently of browsers. Only loopback clients with a matching loopback Host
+receive process names and PIDs; other requests get `processes: null`. Snapshot age is reported
+as `processes_age_ms`, and all processes remain accessible in the scrollable table.
 
 Compact mechanical fans show reported names and RPM. Zero RPM remains stationary; missing
 readings and VM-only placeholders stay unavailable. The Fan motion switch and reduced-motion

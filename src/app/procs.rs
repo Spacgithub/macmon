@@ -132,6 +132,21 @@ pub struct ProcInfo {
   pub started: Option<(u64, u64)>,
 }
 
+/// Minimal dashboard rows; unavailable interval rates remain distinct from measured idle.
+#[derive(serde::Serialize)]
+pub struct DashboardProc {
+  pid: i32,
+  name: String,
+  cpu_pct: Option<f32>,
+  gpu_pct: Option<f32>,
+  mem_bytes: u64,
+}
+
+pub struct ProcessSnapshot {
+  pub rows: Vec<DashboardProc>,
+  pub sampled: Instant,
+}
+
 /// Cumulative counters of one process; rates come from two snapshots.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Counters {
@@ -143,6 +158,7 @@ struct Counters {
   energy_nj: Option<u64>,
   /// GPU time of the process' GPU clients, None without clients.
   gpu_ns: Option<u64>,
+  gpu_readable: bool,
 }
 
 /// Process state read from libproc or `ps`, before rates are computed.
@@ -285,6 +301,7 @@ fn read_libproc(pid: i32, flavor: c_int, (numer, denom): (u32, u32)) -> Option<R
       cpu_ns: ticks_to_ns(ru.ri_user_time + ru.ri_system_time, numer, denom),
       energy_nj: (flavor == RUSAGE_INFO_V6).then_some(ru.ri_energy_nj),
       gpu_ns: None,
+      gpu_readable: false,
     },
     fallback: if name.is_empty() { comm.clone() } else { name },
     comm,
@@ -344,7 +361,7 @@ fn parse_ps_line(line: &str) -> Option<Raw> {
     uid,
     mem_bytes: rss_kib.saturating_mul(1024),
     // ps has no start time, a reused pid is told apart by its command.
-    counters: Counters { start: 0, cpu_ns, energy_nj: None, gpu_ns: None },
+    counters: Counters { start: 0, cpu_ns, energy_nj: None, gpu_ns: None, gpu_readable: false },
     fallback: basename(&comm).unwrap_or(&comm).to_string(),
     comm,
     path: None,
@@ -479,9 +496,9 @@ fn parse_creator(creator: &str) -> Option<i32> {
 }
 
 /// Total `accumulatedGPUTime` (ns) of a client's `AppUsage`, an array with one dict per command
-/// queue. Entries without a non-negative number are skipped.
-fn app_usage_ns(usage: &CFType) -> u64 {
-  let Some(entries) = usage.downcast::<CFArray>() else { return 0 };
+/// queue. Invalid entries are skipped in the existing total and mark dashboard rates unavailable.
+fn app_usage_ns(usage: &CFType) -> (u64, bool) {
+  let Some(entries) = usage.downcast::<CFArray>() else { return (0, false) };
   let key = CFString::from_static_string("accumulatedGPUTime");
 
   let entry_ns = |entry: *const c_void| {
@@ -491,12 +508,15 @@ fn app_usage_ns(usage: &CFType) -> u64 {
     let value = (!value.is_null()).then(|| unsafe { CFType::wrap_under_get_rule(value) })?;
     u64::try_from(value.downcast_into::<CFNumber>()?.to_i64()?).ok()
   };
-  entries.iter().filter_map(|entry| entry_ns(*entry)).fold(0, u64::saturating_add)
+  entries.iter().fold((0u64, true), |(total, readable), entry| {
+    let value = entry_ns(*entry);
+    (total.saturating_add(value.unwrap_or(0)), readable && value.is_some())
+  })
 }
 
-/// `(pid, GPU time in ns)` of every GPU user client. The clients are unregistered children of
-/// the `IOAccelerator` services, so they're only found by walking the service plane.
-fn read_gpu_clients() -> Option<Vec<(i32, u64)>> {
+/// `(pid, GPU time in ns, readable)` of every GPU user client. The clients are unregistered
+/// children of the `IOAccelerator` services, so they're only found by walking the service plane.
+fn read_gpu_clients() -> Option<Vec<(i32, u64, bool)>> {
   let creator_key = CFString::from_static_string("IOUserClientCreator");
   let usage_key = CFString::from_static_string("AppUsage");
   let mut clients = Vec::new();
@@ -510,8 +530,9 @@ fn read_gpu_clients() -> Option<Vec<(i32, u64)>> {
         let Some(pid) = creator.and_then(|creator| parse_creator(&creator.to_string())) else {
           continue;
         };
-        let gpu_ns = client.property(&usage_key).map_or(0, |usage| app_usage_ns(&usage));
-        clients.push((pid, gpu_ns));
+        let (gpu_ns, readable) =
+          client.property(&usage_key).map_or((0, false), |usage| app_usage_ns(&usage));
+        clients.push((pid, gpu_ns, readable));
       }
       Some(iter.is_valid())
     })?;
@@ -548,9 +569,12 @@ fn sum_gpu_times(clients: impl IntoIterator<Item = (i32, u64)>) -> HashMap<i32, 
   times
 }
 
-/// GPU time per pid, empty when the IORegistry isn't readable.
-fn gpu_times() -> HashMap<i32, u64> {
-  read_gpu_clients().map(sum_gpu_times).unwrap_or_default()
+/// GPU time and pids with unreadable client counters; the times preserve existing TUI accounting.
+fn gpu_times() -> (HashMap<i32, u64>, HashSet<i32>) {
+  let clients = read_gpu_clients().unwrap_or_default();
+  let unreadable =
+    clients.iter().filter_map(|&(pid, _, readable)| (!readable).then_some(pid)).collect();
+  (sum_gpu_times(clients.into_iter().map(|(pid, ns, _)| (pid, ns))), unreadable)
 }
 
 // MARK: Sampler
@@ -579,6 +603,7 @@ struct Known {
   path: String,
   /// `ps` rows: `(time, CPU time)` of the last `PS_CPU_INTERVALS` ticks, oldest first.
   cpu_history: VecDeque<(u64, u64)>,
+  available: (bool, bool),
 }
 
 /// Samples every process: libproc for those it can read, `ps` for the rest.
@@ -622,7 +647,7 @@ impl ProcSampler {
     let now = Instant::now();
     let elapsed_ns = self.last.map_or(0, |last| now.duration_since(last).as_nanos() as u64);
     self.last = Some(now);
-    let gpu = gpu_times(); // Read next to `now`: the counters carry no timestamp of their own.
+    let (gpu, unreadable_gpu) = gpu_times(); // Read next to `now`: no counter timestamps.
 
     list_pids(&mut self.pids);
     let mut rows = Vec::with_capacity(self.pids.len());
@@ -639,11 +664,37 @@ impl ProcSampler {
     }
     for raw in &mut rows {
       raw.counters.gpu_ns = gpu.get(&raw.pid).copied();
+      raw.counters.gpu_readable =
+        raw.counters.gpu_ns.is_some() && !unreadable_gpu.contains(&raw.pid);
       // every tick, not only for new pids: the start time and `comm` can stay the same across an
       // exec (about 1 ms for 800 processes)
       raw.path = exe_path(raw.pid);
     }
     self.update(rows, elapsed_ns)
+  }
+
+  pub fn sample_dashboard(&mut self) -> ProcessSnapshot {
+    let rows = self.sample();
+    ProcessSnapshot {
+      rows: self.dashboard_rows(rows),
+      sampled: self.last.unwrap_or_else(Instant::now),
+    }
+  }
+
+  fn dashboard_rows(&self, rows: Vec<ProcInfo>) -> Vec<DashboardProc> {
+    rows
+      .into_iter()
+      .map(|row| {
+        let (cpu, gpu) = self.known.get(&row.pid).map_or((false, false), |known| known.available);
+        DashboardProc {
+          pid: row.pid,
+          name: row.name,
+          cpu_pct: cpu.then_some(row.cpu_pct),
+          gpu_pct: gpu.then_some(row.gpu_pct),
+          mem_bytes: row.mem_bytes,
+        }
+      })
+      .collect()
   }
 
   /// Rates against the previous tick (CPU of `ps` rows over the last `PS_CPU_INTERVALS` ticks);
@@ -661,6 +712,19 @@ impl ProcSampler {
           && raw.path.as_ref().is_none_or(|path| *path == prev.path)
       });
       let mut usage = usage(prev.as_ref().map(|prev| &prev.counters), &raw.counters, elapsed_ns);
+      let ready = prev.as_ref().is_some_and(|prev| {
+        elapsed_ns > 0 && raw.counters.cpu_ns >= prev.counters.cpu_ns
+          && !matches!((prev.counters.energy_nj, raw.counters.energy_nj), (Some(a), Some(b)) if b < a)
+      });
+      let mut available = (
+        ready,
+        ready
+          && prev.as_ref().is_some_and(|prev| {
+            prev.counters.gpu_readable
+              && raw.counters.gpu_readable
+              && matches!((prev.counters.gpu_ns, raw.counters.gpu_ns), (Some(a), Some(b)) if b >= a)
+          }),
+      );
       let (name, path, mut cpu_history) = match prev {
         Some(prev) => (prev.name, prev.path, prev.cpu_history),
         None => {
@@ -670,7 +734,10 @@ impl ProcSampler {
       };
       if raw.ps {
         let cpu_ns = raw.counters.cpu_ns;
-        usage.cpu_pct = averaged_cpu_pct(cpu_history.make_contiguous(), self.clock_ns, cpu_ns);
+        let history = cpu_history.make_contiguous();
+        available.0 &= !matches!(history, [(0, _)])
+          && history.first().is_some_and(|&(time, cpu)| self.clock_ns > time && cpu_ns >= cpu);
+        usage.cpu_pct = averaged_cpu_pct(history, self.clock_ns, cpu_ns);
         cpu_history.push_back((self.clock_ns, cpu_ns));
         if cpu_history.len() > PS_CPU_INTERVALS {
           cpu_history.pop_front();
@@ -690,7 +757,7 @@ impl ProcSampler {
         started: raw.started,
       });
       let counters = raw.counters;
-      known.insert(raw.pid, Known { counters, comm: raw.comm, name, path, cpu_history });
+      known.insert(raw.pid, Known { counters, comm: raw.comm, name, path, cpu_history, available });
     }
 
     self.known = known;
@@ -711,7 +778,7 @@ mod tests {
   const B: i32 = 1_000_002;
 
   fn counters(cpu_ns: u64, energy_nj: Option<u64>) -> Counters {
-    Counters { start: 42, cpu_ns, energy_nj, gpu_ns: None }
+    Counters { start: 42, cpu_ns, energy_nj, gpu_ns: None, gpu_readable: false }
   }
 
   #[test]
@@ -797,7 +864,13 @@ mod tests {
     let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (GPU)";
     let raw = parse_ps_line(&format!(" 2301   501 182976   1:02.50 {chrome}")).expect("valid");
     assert_eq!((raw.pid, raw.uid, raw.mem_bytes), (2301, 501, 182976 * 1024));
-    let times = Counters { start: 0, cpu_ns: 62_500_000_000, energy_nj: None, gpu_ns: None };
+    let times = Counters {
+      start: 0,
+      cpu_ns: 62_500_000_000,
+      energy_nj: None,
+      gpu_ns: None,
+      gpu_readable: false,
+    };
     assert_eq!(raw.counters, times);
     assert_eq!((raw.comm.as_str(), raw.fallback.as_str()), (chrome, "Google Chrome Helper (GPU)"));
     assert!(raw.ps);
@@ -828,7 +901,7 @@ mod tests {
       pid,
       uid: 0,
       mem_bytes: 1024,
-      counters: Counters { start: 0, cpu_ns, energy_nj, gpu_ns: None },
+      counters: Counters { start: 0, cpu_ns, energy_nj, gpu_ns: None, gpu_readable: false },
       comm: comm.to_string(),
       path: None,
       fallback: comm.to_string(),
@@ -932,6 +1005,68 @@ mod tests {
     assert_eq!(procs[0].cpu_pct, 0.0);
     let procs = sampler.update(vec![ps_row(A, ms(3), "other")], ms(100));
     assert_eq!(procs[0].cpu_pct, pct(2, 100));
+  }
+
+  #[test]
+  fn dashboard_rates_require_identity_baselines_and_readable_gpu_counters() {
+    let mut sampler = ProcSampler::new();
+    let raw = |cpu, gpu, readable| Raw {
+      counters: Counters { gpu_ns: gpu, gpu_readable: readable, ..row(A, cpu, None, "a").counters },
+      ..row(A, cpu, None, "a")
+    };
+    let tick = |sampler: &mut ProcSampler, raw, elapsed| {
+      let rows = sampler.update(vec![raw], elapsed);
+      let old_gpu = rows[0].gpu_pct;
+      (sampler.dashboard_rows(rows).remove(0), old_gpu)
+    };
+    let (first, _) = tick(&mut sampler, raw(0, Some(0), true), 0);
+    assert_eq!((first.cpu_pct, first.gpu_pct), (None, None));
+    let (busy, _) = tick(&mut sampler, raw(2 * SEC, Some(SEC / 2), true), SEC);
+    assert_eq!((busy.cpu_pct, busy.gpu_pct), (Some(200.0), Some(50.0)));
+    let (idle, _) = tick(&mut sampler, raw(2 * SEC, Some(SEC / 2), true), SEC);
+    assert_eq!((idle.cpu_pct, idle.gpu_pct), (Some(0.0), Some(0.0)));
+    let (unreadable, old_gpu) = tick(&mut sampler, raw(3 * SEC, Some(SEC), false), SEC);
+    assert_eq!(old_gpu, 50.0, "the existing TUI rate remains unchanged");
+    assert_eq!((unreadable.cpu_pct, unreadable.gpu_pct), (Some(100.0), None));
+    assert_eq!(tick(&mut sampler, raw(4 * SEC, Some(2 * SEC), true), SEC).0.gpu_pct, None);
+    assert_eq!(tick(&mut sampler, raw(5 * SEC, Some(SEC), true), SEC).0.gpu_pct, None);
+    assert_eq!(tick(&mut sampler, raw(6 * SEC, None, false), SEC).0.gpu_pct, None);
+    let (reset, _) = tick(&mut sampler, raw(0, Some(0), true), SEC);
+    assert_eq!((reset.cpu_pct, reset.gpu_pct), (None, None));
+    let (exec, _) =
+      tick(&mut sampler, Raw { comm: "other".into(), ..raw(SEC, Some(SEC), true) }, SEC);
+    assert_eq!((exec.cpu_pct, exec.gpu_pct), (None, None));
+    let json = serde_json::to_value(busy).unwrap();
+    assert_eq!(json.as_object().unwrap().len(), 5);
+    for field in ["path", "user", "started", "power_w"] {
+      assert!(json.get(field).is_none());
+    }
+  }
+
+  #[test]
+  fn dashboard_ps_warmup_and_new_processes_remain_unknown() {
+    let mut sampler = ProcSampler::new();
+    for (index, expected) in [None, None, Some(100.0)].into_iter().enumerate() {
+      let rows =
+        sampler.update(vec![ps_row(A, index as u64 * SEC, "a")], if index == 0 { 0 } else { SEC });
+      let row = sampler.dashboard_rows(rows).remove(0);
+      assert_eq!((row.cpu_pct, row.gpu_pct), (expected, None));
+    }
+    let rows = sampler.update(vec![ps_row(B, 10 * SEC, "new")], SEC);
+    let row = sampler.dashboard_rows(rows).remove(0);
+    assert_eq!((row.cpu_pct, row.gpu_pct), (None, None));
+    let rows = sampler.update(vec![ps_row(B, 11 * SEC, "new")], SEC);
+    assert_eq!(sampler.dashboard_rows(rows)[0].cpu_pct, Some(100.0));
+  }
+
+  #[test]
+  fn missing_or_malformed_gpu_usage_preserves_idle_but_marks_it_unreadable() {
+    let wrong = CFString::from_static_string("not an AppUsage array").as_CFType();
+    assert_eq!(app_usage_ns(&wrong), (0, false));
+    let entries = CFArray::from_CFTypes(&[wrong]);
+    assert_eq!(app_usage_ns(&entries.as_CFType()), (0, false));
+    let empty: CFArray<CFType> = CFArray::from_CFTypes(&[]);
+    assert_eq!(app_usage_ns(&empty.as_CFType()), (0, true));
   }
 
   #[test]
