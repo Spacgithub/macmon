@@ -119,7 +119,7 @@ what we need.
       detection, adaptive placement, owned image cleanup and measured resource cost.
       Plan: [docs/plans/completed/20261014-full-fan-panels.md](plans/completed/20261014-full-fan-panels.md).
 
-- [ ] **20. Match fan materials to the accepted cooling-card prototype.** Add the rounded
+- [x] **20. Match fan materials to the accepted cooling-card prototype.** Add the rounded
       mechanical housing, recessed screws, cavity and hub shadows, and layered curved-metal
       blades while preserving the independent frame clock, palette and existing controls.
-      Plan: [docs/plans/20261014-fan-material-fidelity.md](plans/20261014-fan-material-fidelity.md).
+      Plan: [docs/plans/completed/20261014-fan-material-fidelity.md](plans/completed/20261014-fan-material-fidelity.md).

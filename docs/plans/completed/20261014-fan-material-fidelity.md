@@ -1,3 +1,5 @@
+Done: 2026-10-14, PR #11
+
 # Graphical fan material fidelity
 
 Refine the graphical fans in the existing personal-fork PR #11 against the accepted cooling-card
@@ -23,5 +25,13 @@ prototype. Keep upstream read-only and retain the approved single-PR production-
 - [x] Implement cached mechanical layers and the curved-blade material model.
 - [x] Review equal-size, equal-palette static and rotating-angle product/reference comparisons.
 - [x] Verify focused tests, complete checks, CPU/RSS and native-frame submission cadence.
-- [ ] Complete reviews and update the existing personal-fork PR #11.
-- [ ] Refresh and verify the installed command with its previous binary retained.
+- [x] Complete reviews and update the existing personal-fork PR #11.
+- [x] Refresh and verify the installed command with its previous binary retained.
+
+## Result
+
+Cooling panels now use cached mechanical housings, recessed screws, broad curved metal blades
+and fixed hub lighting matched against the accepted prototype at native sizes and angles.
+Rendering preserves the terminal palette, per-fan RPM, manual animation and the independent
+image clock. Partial image writes close before restoring terminal modes. Integrated checks,
+rootless Network Monitoring and the refreshed installed command passed; its predecessor is retained.

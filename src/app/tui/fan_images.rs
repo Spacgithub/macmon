@@ -158,12 +158,13 @@ fn delete(out: &mut impl Write, id: u32, data: bool) -> io::Result<()> {
   write!(out, "\x1b_Ga=d,d={kind},i={id},q=2;\x1b\\")
 }
 
-/// Call before leaving the alternate screen; continue restoring other modes on output failure.
+/// Call before any terminal mode commands: close partial APCs, then delete owned images/files.
+/// Continue restoring terminal modes even if image cleanup cannot write to the terminal.
 pub(super) fn cleanup(out: &mut impl Write) {
   let resources = ACTIVE.lock().unwrap_or_else(|err| err.into_inner()).take();
   if let Some(resources) = resources {
     if resources.exposed {
-      // Finish any partially written APC before sending cleanup commands.
+      // End the APC before either image deletion or the caller's terminal mode commands.
       let _ = out.write_all(b"\x1b\\");
       for id in resources.ids {
         let _ = delete(out, id, true);
@@ -324,6 +325,72 @@ mod tests {
     let directory = images.resources.directory.clone();
     cleanup(&mut Broken);
     assert!(!directory.exists());
+  }
+
+  #[test]
+  fn terminal_restore_closes_a_failed_image_apc_before_disabling_modes_once() {
+    struct FailOnce {
+      bytes: Vec<u8>,
+      fail_at: usize,
+      failed: bool,
+    }
+    impl Write for FailOnce {
+      fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if !self.failed && self.bytes.len() == self.fail_at {
+          self.failed = true;
+          return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let count =
+          if self.failed { bytes.len() } else { bytes.len().min(self.fail_at - self.bytes.len()) };
+        self.bytes.extend_from_slice(&bytes[..count]);
+        Ok(count)
+      }
+      fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+      }
+    }
+
+    let _session = TEST_SESSION.lock().unwrap();
+    for frame in [false, true] {
+      let mut images = FanImages::with_inline(true).unwrap();
+      let directory = images.resources.directory.clone();
+      let cursor_prefix = if frame { b"\x1b7\x1b[1;1H".len() } else { 0 };
+      let mut out = FailOnce { bytes: Vec::new(), fail_at: cursor_prefix + 7, failed: false };
+      let result = if frame {
+        images.render(&mut out, &[42; 16], 2, 0, (0, 0), (2, 2))
+      } else {
+        images.probe(&mut out).map(|_| ())
+      };
+      assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+      assert!(out.failed);
+      let apc = out.bytes.windows(3).position(|bytes| bytes == b"\x1b_G").unwrap();
+      assert!(!out.bytes[apc..].windows(2).any(|bytes| bytes == b"\x1b\\"));
+      let partial = out.bytes.len();
+      let active = std::sync::atomic::AtomicBool::new(true);
+      let mut raw_off = 0;
+      assert!(super::super::restore_term_once(&active, &mut out, || {
+        raw_off += 1;
+        Err(io::ErrorKind::Other.into())
+      }));
+      let restored = std::str::from_utf8(&out.bytes[partial..]).unwrap();
+      assert!(restored.starts_with("\x1b\\"), "close the image APC first: {restored:?}");
+      let first_mode = restored.find("\x1b[?").unwrap();
+      for id in images.resources.ids {
+        let deletion = restored.find(&format!("\x1b_Ga=d,d=I,i={id},q=2;\x1b\\")).unwrap();
+        assert!(deletion < first_mode, "delete images before restoring modes");
+      }
+      assert!(restored.contains("\x1b[?1004l"));
+      assert!(restored.ends_with("\x1b[?1049l\x1b[?25h"));
+      assert!(!directory.exists());
+      assert_eq!(raw_off, 1);
+      let length = out.bytes.len();
+      assert!(!super::super::restore_term_once(&active, &mut out, || {
+        raw_off += 1;
+        Ok(())
+      }));
+      assert_eq!(out.bytes.len(), length);
+      assert_eq!(raw_off, 1);
+    }
   }
 
   #[test]

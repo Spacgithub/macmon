@@ -83,10 +83,10 @@ fn leave_term() {
   restore_term_once(&TERM_ACTIVE, &mut stdout().lock(), terminal::disable_raw_mode);
 }
 
-/// Turns mouse capture and focus reports off, leaves the alternate screen, shows the cursor
-/// (ratatui hides it while drawing, and a panic aborts before the terminal is dropped) and turns
-/// raw mode off when `active` is set, and clears it. Every step runs even if an earlier one fails.
-/// Returns whether it ran.
+/// Closes any partial image APC and deletes owned images before restoring terminal modes, so a
+/// failed image write cannot swallow the mouse/focus disable commands. Then leaves the alternate
+/// screen, shows the cursor and turns raw mode off. Clears `active` and runs every step even if
+/// an earlier one fails. Returns whether it ran.
 fn restore_term_once(
   active: &AtomicBool,
   out: &mut impl Write,
@@ -96,9 +96,9 @@ fn restore_term_once(
     return false;
   }
 
+  fan_images::cleanup(out);
   let _ = out.execute(DisableMouseCapture);
   let _ = out.execute(DisableFocusChange);
-  fan_images::cleanup(out);
   let _ = out.execute(terminal::LeaveAlternateScreen);
   let _ = out.execute(cursor::Show);
   let _ = disable_raw_mode();
