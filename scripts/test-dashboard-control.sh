@@ -29,18 +29,22 @@ case "$1" in
     exit 113;;
   bootout) [ "${MOCK_BOOTOUT_FAIL:-0}" = 0 ] || exit 9; rm -f "$FIXTURE_ROOT/job" "$FIXTURE_ROOT/listener"; exit;;
   bootstrap) [ "${MOCK_BOOTSTRAP_FAIL:-0}" = 0 ] || exit 9; plist=$3;;
-  kickstart) plist=$(cat "$FIXTURE_ROOT/source");;
+  kickstart) [ "${MOCK_KICKSTART_FAIL:-0}" = 0 ] || exit 9; plist=$(cat "$FIXTURE_ROOT/source");;
   *) exit 11;;
 esac
 printf '%s\n' "$plist" > "$FIXTURE_ROOT/source"
 previous=$(cat "$FIXTURE_ROOT/counter" 2>/dev/null || printf 1000)
 pid=$((previous + 1)); printf '%s\n' "$pid" > "$FIXTURE_ROOT/counter"
+if plutil -type Program "$plist" >/dev/null 2>&1; then
+  program=$(plutil -extract Program raw "$plist")
+else program=$(plutil -extract ProgramArguments.0 raw "$plist"); fi
 {
-  printf 'gui/test/com.macmon = {\n\tpath = %s\n\tprogram = %s\n\targuments = {\n' "$plist" "$(plutil -extract ProgramArguments.0 raw "$plist")"
+  printf 'gui/test/com.macmon = {\n\tpath = %s\n\tprogram = %s\n\targuments = {\n' "$plist" "$program"
   for index in 0 1 2 3 4 5; do printf '\t\t%s\n' "$(plutil -extract "ProgramArguments.$index" raw "$plist")"; done
   printf '\t}\n\tpid = %s\n}\n' "$pid"
 } > "$FIXTURE_ROOT/job"
 [ "${MOCK_NO_LISTENER:-0}" = 1 ] || printf '%s\n' "$pid" > "$FIXTURE_ROOT/listener"
+if [ "$1" = bootstrap ] && [ "${MOCK_BOOTSTRAP_RACE:-0}" = 1 ]; then exit 9; fi
 SH
 cat > "$fixture/tools/lsof" <<'SH'
 #!/bin/sh
@@ -48,6 +52,8 @@ cat > "$fixture/tools/lsof" <<'SH'
 SH
 cat > "$fixture/tools/curl" <<'SH'
 #!/bin/sh
+printf '%s\n' "$@" > "$FIXTURE_ROOT/curl-options"
+[ "$1" = -q ] && [ "$2" = --noproxy ] && [ "$3" = '*' ] || exit 12
 [ "${MOCK_HTTP_FAIL:-0}" = 0 ] && [ -s "$FIXTURE_ROOT/listener" ]
 SH
 cat > "$fixture/tools/open" <<'SH'
@@ -134,6 +140,7 @@ plutil -remove ProgramArguments.3 "$MACMON_CONTROL_AGENT_PLIST"
 plutil -insert ProgramArguments.3 -string 0.0.0.0 "$MACMON_CONTROL_AGENT_PLIST"
 plutil -remove ProgramArguments.5 "$MACMON_CONTROL_AGENT_PLIST"
 plutil -insert ProgramArguments.5 -string 9090 "$MACMON_CONTROL_AGENT_PLIST"
+plutil -insert Program -string "$binary" "$MACMON_CONTROL_AGENT_PLIST"
 cp "$MACMON_CONTROL_AGENT_PLIST" "$fixture/preserved.plist"
 printf 'disabled-preferences sentinel\n' > "$fixture/Disabled preferences"
 control start >/dev/null
@@ -141,6 +148,15 @@ control stop >/dev/null
 cmp "$fixture/preserved.plist" "$MACMON_CONTROL_AGENT_PLIST"
 grep -q '^disabled-preferences sentinel$' "$fixture/Disabled preferences"
 printf 'PASS compatible login plist and preferences remain unchanged\n'
+
+reset
+cp "$fixture/legacy-template.plist" "$MACMON_CONTROL_AGENT_PLIST"
+plutil -insert Program -string /foreign/executable "$MACMON_CONTROL_AGENT_PLIST"
+cp "$MACMON_CONTROL_AGENT_PLIST" "$fixture/foreign-agent.plist"
+reject control start
+no_job; [ ! -e "$fixture/commands" ]
+cmp "$fixture/foreign-agent.plist" "$MACMON_CONTROL_AGENT_PLIST"
+printf 'PASS optional Program cannot override the configured executable\n'
 
 reset
 printf '9999\n' > "$fixture/listener"
@@ -194,6 +210,32 @@ control start >/dev/null
 grep -q '^kickstart -k gui/' "$fixture/commands"
 control stop >/dev/null; no_job
 printf 'PASS failed startup cleanup and loaded-but-not-listening recovery\n'
+
+reset; control start >/dev/null; control stop >/dev/null
+rm "$fixture/commands"
+(MOCK_BOOTSTRAP_RACE=1 reject control start)
+[ -s "$fixture/job" ] && [ -s "$fixture/listener" ]
+! grep -q '^bootout ' "$fixture/commands"
+winner_pid=$(cat "$fixture/listener")
+control status | grep -q '^Running'
+control start >/dev/null
+[ "$(cat "$fixture/listener")" = "$winner_pid" ]
+control stop >/dev/null; no_job
+reset; control start >/dev/null; rm "$fixture/listener" "$fixture/commands"
+(MOCK_KICKSTART_FAIL=1 reject control start)
+[ -s "$fixture/job" ]
+! grep -q '^bootout ' "$fixture/commands"
+control stop >/dev/null; no_job
+printf 'PASS failed activation never rolls back an unclaimed existing job\n'
+
+reset
+(http_proxy=http://fixture.invalid:9 ALL_PROXY=http://fixture.invalid:9 control start >/dev/null)
+[ "$(sed -n '1p' "$fixture/curl-options")" = -q ]
+[ "$(sed -n '2p' "$fixture/curl-options")" = --noproxy ]
+[ "$(sed -n '3p' "$fixture/curl-options")" = '*' ]
+control status | grep -q '^Running'
+control stop >/dev/null; no_job
+printf 'PASS readiness ignores caller curl configuration and proxies\n'
 
 reset
 destination="$fixture/macmon's Web Control.app"

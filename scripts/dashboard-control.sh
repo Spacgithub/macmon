@@ -52,6 +52,9 @@ if [ -e "$plist" ] || [ -L "$plist" ]; then
   host=$(value ProgramArguments.3); port=$(value ProgramArguments.5)
   [ "$(value ProgramArguments.0)" = "$binary" ] && [ "$(value ProgramArguments.1)" = serve ] &&
     [ "$(value ProgramArguments.2)" = --host ] && [ "$(value ProgramArguments.4)" = --port ] || fail 'Foreign agent executable or arguments'
+  if program_type=$(plutil -type Program "$plist" 2>/dev/null); then
+    [ "$program_type" = string ] && [ "$(value Program)" = "$binary" ] || fail 'Foreign agent Program override'
+  fi
 fi
 case "$host" in 127.0.0.1|0.0.0.0) ;; *) fail 'Agent host must be 127.0.0.1 or 0.0.0.0';; esac
 case "$port" in ''|*[!0-9]*) fail 'Invalid agent port';; esac
@@ -124,16 +127,16 @@ if [ "$loaded" = no ]; then
     rmdir "$building"
     building=
   fi
-  started=yes
   launchctl bootstrap "$domain" "$plist"
+  started=yes
 elif [ -z "$listening" ]; then
   job || fail 'Job disappeared before activation'
-  started=yes
   launchctl kickstart -k "$target"
+  started=yes
 fi
 n=0
 while [ "$n" -lt 30 ]; do
-  if job && [ -n "$pid" ] && [ "$(listener)" = "$pid" ] && curl -fsS --max-time 1 "$url" >/dev/null; then
+  if job && [ -n "$pid" ] && [ "$(listener)" = "$pid" ] && curl -q --noproxy '*' -fsS --max-time 1 "$url" >/dev/null; then
     ready=yes
     printf 'Running — %s\n' "$url"
     [ "$action" != open ] || open "$url"

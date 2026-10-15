@@ -219,8 +219,9 @@ monitoring active. The app contains its own control script and does not need thi
 Without an existing login agent it uses a session-only, loopback listener at
 `http://127.0.0.1:19090/dashboard/`; its plist stays under
 `~/Library/Application Support/macmon/dashboard-control/`, outside `LaunchAgents`.
-A compatible `com.macmon` login agent keeps its executable, host and port; only exact
-`serve --host … --port …` arguments with `127.0.0.1` or `0.0.0.0` are accepted. Stopping
+A compatible `com.macmon` login agent keeps its executable, host and port; an optional
+`Program` must name that same executable. Only exact `serve --host … --port …` arguments
+with `127.0.0.1` or `0.0.0.0` are accepted. Stopping
 unloads the current job so KeepAlive cannot restart it, while preserving the login plist
 and startup preferences. Port conflicts and foreign jobs are rejected; a separate TUI is
 unaffected. The script also supports headless `start`, `status` and `stop` with the same
