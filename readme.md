@@ -205,6 +205,27 @@ and animation. WAITING, LIVE, STALE and OFFLINE describe connection/sample state
 the last available values visible. `/api/sample` adds freshness metadata; `/json`, `/metrics`,
 the root JSON response and existing server defaults retain their formats.
 
+#### Desktop control
+
+Create a small macOS app once, using an absolute path to the installed executable:
+
+```sh
+sh scripts/dashboard-control.sh install "$HOME/.local/bin/macmon" "$HOME/Desktop/macmon Web Control.app"
+```
+
+Double-click **macmon Web Control**, then choose **启动并打开** to start monitoring and open
+the dashboard, or **停止** to stop the background job. Closing the browser alone keeps
+monitoring active. The app contains its own control script and does not need this checkout.
+Without an existing login agent it uses a session-only, loopback listener at
+`http://127.0.0.1:19090/dashboard/`; its plist stays under
+`~/Library/Application Support/macmon/dashboard-control/`, outside `LaunchAgents`.
+A compatible `com.macmon` login agent keeps its executable, host and port; only exact
+`serve --host … --port …` arguments with `127.0.0.1` or `0.0.0.0` are accepted. Stopping
+unloads the current job so KeepAlive cannot restart it, while preserving the login plist
+and startup preferences. Port conflicts and foreign jobs are rejected; a separate TUI is
+unaffected. The script also supports headless `start`, `status` and `stop` with the same
+executable argument. `open` starts the job and opens the browser only after readiness.
+
 #### launchd service
 
 To start `macmon serve` automatically on login and keep it running:

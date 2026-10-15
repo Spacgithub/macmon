@@ -16,6 +16,7 @@ check:
 test:
 	cargo test $(CARGO_FLAGS)
 	sh scripts/test-upstream-sync.sh
+	$(MAKE) test-dashboard-control
 
 build:
 	cargo build $(CARGO_FLAGS)
@@ -24,7 +25,10 @@ build:
 update:
 	cargo upgrade -i
 
-.PHONY: loc bench remote upstream-sync test-upstream-sync test-dashboard
+.PHONY: loc bench remote upstream-sync test-upstream-sync test-dashboard test-dashboard-control
+
+test-dashboard-control:
+	sh scripts/test-dashboard-control.sh
 
 test-dashboard:
 	node scripts/test-dashboard.mjs
