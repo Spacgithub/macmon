@@ -1,3 +1,5 @@
+Done: 2026-10-14, PR #13
+
 # Dashboard processes and temperatures
 
 ## Behavior and decisions
@@ -15,6 +17,12 @@
 
 - [x] Publish real process snapshots without request-thread sampling.
 - [x] Add sortable processes and prominent temperature readings.
-- [ ] Verify missing data, accounting and desktop/narrow layouts.
-- [ ] Run complete checks and review the personal-fork PR.
-- [ ] Refresh and verify the installed command with a working backup.
+- [x] Verify missing data, accounting and desktop/narrow layouts.
+- [x] Run complete checks and review the personal-fork PR.
+- [x] Refresh and verify the installed command with a working backup.
+
+## Result
+
+The dashboard shows real sortable process snapshots and named Celsius temperatures,
+with unavailable rates kept explicit. Unit, frontend, rootless hardware and responsive
+browser checks passed; the combined installed preview was verified with a retained backup.

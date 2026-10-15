@@ -137,6 +137,6 @@ what we need.
       memory and Network views, compact material fans and reliable connection/sample state.
       Plan: [docs/plans/completed/20261014-local-dashboard.md](plans/completed/20261014-local-dashboard.md).
 
-- [ ] **24. Add dashboard Processes and named temperatures.** Reuse completed process
+- [x] **24. Add dashboard Processes and named temperatures.** Reuse completed process
       snapshots for sortable CPU/GPU/memory rows and show prominent CPU/GPU Celsius readings.
-      Plan: [docs/plans/20261014-dashboard-processes.md](plans/20261014-dashboard-processes.md).
+      Plan: [docs/plans/completed/20261014-dashboard-processes.md](plans/completed/20261014-dashboard-processes.md).
