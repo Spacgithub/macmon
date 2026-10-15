@@ -127,3 +127,8 @@ what we need.
 - [x] **21. Keep graphical cooling cards compact.** Reduce fan images and card footprints,
       reclaim graph/process space and retain the existing materials and animation controls.
       Plan: [docs/plans/completed/20261014-compact-cooling.md](plans/completed/20261014-compact-cooling.md).
+
+- [x] **22. Adapt complete cooling fans across terminals.** Continuously size compact cards
+      using physical cell dimensions, retain verified native images and add complete ANSI
+      text fans with the same rotor state, independent clock and controls.
+      Plan: [docs/plans/completed/20261014-terminal-fans.md](plans/completed/20261014-terminal-fans.md).

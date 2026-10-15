@@ -2,11 +2,13 @@
 
 mod boxes;
 mod cooling;
+mod cooling_layout;
 mod fan_clock;
 mod fan_images;
 mod fan_protocol;
 mod fan_raster;
 mod fan_replies;
+mod fan_text;
 mod help;
 mod info;
 mod kill;
@@ -137,6 +139,8 @@ enum Event {
   Resize,
   /// Completed graphics evidence from the remaining startup replies.
   Capabilities(Capabilities),
+  /// Physical cell dimensions, measured independently of image protocol support.
+  CellPixels((u16, u16)),
   /// Input-thread heartbeat, also used by the visible fan indicator.
   Tick,
 }
@@ -167,6 +171,13 @@ fn input_event(event: event::Event) -> Option<Event> {
 /// Window of the first process sample after the panel shows up, so the list fills in quickly.
 const PROCS_WARMUP: Duration = Duration::from_millis(TUI_MIN_MS as u64);
 
+/// ioctl dimensions also refresh font changes that leave the character grid unchanged.
+fn measured_cell_pixels() -> Option<(u16, u16)> {
+  let size = terminal::window_size().ok()?;
+  let pixels = (size.width.checked_div(size.columns)?, size.height.checked_div(size.rows)?);
+  (pixels.0 > 0 && pixels.1 > 0).then_some(pixels)
+}
+
 /// Sends input events and a `Tick` every `tick` ms; stops once the app is gone.
 fn run_inputs_thread(tx: mpsc::Sender<Event>, tick: u64, mut pending: Option<PendingQueries>) {
   let tick_rate = Duration::from_millis(tick);
@@ -175,6 +186,9 @@ fn run_inputs_thread(tx: mpsc::Sender<Event>, tick: u64, mut pending: Option<Pen
     let mut last_tick = Instant::now();
     let mut size = terminal::size().ok();
     let mut capabilities = pending.as_ref().and_then(PendingQueries::capabilities);
+    let mut cell_pixels = pending.as_ref().and_then(PendingQueries::cell_pixels);
+    let mut queried_pixels = cell_pixels;
+    let mut resized = false;
 
     loop {
       if let Some(query) = &mut pending {
@@ -191,6 +205,14 @@ fn run_inputs_thread(tx: mpsc::Sender<Event>, tick: u64, mut pending: Option<Pen
             return;
           }
         }
+        let current = terminal::size().ok();
+        if current != size {
+          size = current;
+          resized = true;
+          if tx.send(Event::Resize).is_err() {
+            return;
+          }
+        }
         let fresh = query.capabilities();
         if let Some(fresh) = fresh.filter(|fresh| Some(*fresh) != capabilities) {
           capabilities = Some(fresh);
@@ -198,21 +220,30 @@ fn run_inputs_thread(tx: mpsc::Sender<Event>, tick: u64, mut pending: Option<Pen
             return;
           }
         }
+        if let Some(fresh) = query.cell_pixels().filter(|fresh| Some(*fresh) != queried_pixels) {
+          queried_pixels = Some(fresh);
+          if !resized && measured_cell_pixels().is_none() {
+            cell_pixels = Some(fresh);
+            if tx.send(Event::CellPixels(fresh)).is_err() {
+              return;
+            }
+          }
+        }
         if query.finished() {
           pending = None;
-        }
-        let current = terminal::size().ok();
-        if current != size {
-          size = current;
-          if tx.send(Event::Resize).is_err() {
-            return;
-          }
         }
       } else if event::poll(tick_rate).unwrap()
         && let Some(event) = input_event(event::read().unwrap())
         && tx.send(event).is_err()
       {
         return;
+      }
+
+      if let Some(fresh) = measured_cell_pixels().filter(|fresh| Some(*fresh) != cell_pixels) {
+        cell_pixels = Some(fresh);
+        if tx.send(Event::CellPixels(fresh)).is_err() {
+          return;
+        }
       }
 
       if last_tick.elapsed() >= tick_rate {
@@ -357,6 +388,17 @@ pub struct App {
   fans: FanStore,
   cooling: Cooling,
   capabilities: Option<Capabilities>,
+  cell_pixels: Option<(u16, u16)>,
+  /// A resize without pixel evidence uses bounded text cells until dimensions return.
+  geometry_unknown: bool,
+  /// Static widget frame, captured before the text fan overlay.
+  fan_base: Buffer,
+  #[cfg(test)]
+  text_animation_frames: u64,
+  #[cfg(test)]
+  text_frame_times: Vec<Instant>,
+  #[cfg(test)]
+  widget_frames: u64,
   placements: Vec<Placement>,
   fan_tick: u8,
   fan_phase: bool,
@@ -492,9 +534,14 @@ impl App {
         self.set_capabilities(caps);
         return ControlFlow::Continue(());
       }
+      Event::CellPixels(pixels) => {
+        self.cell_pixels = measured_cell_pixels().or(Some(pixels));
+        return ControlFlow::Continue(());
+      }
       Event::Resize => {
-        if self.capabilities.is_some_and(|caps| !Self::cell_size_safe(caps)) {
-          self.capabilities = None;
+        if !self.refresh_cell_pixels() {
+          self.geometry_unknown = true;
+          self.cell_pixels = None;
         }
         return ControlFlow::Continue(());
       }
@@ -512,7 +559,7 @@ impl App {
       return Err(err.into());
     }
     if matches!(event, Event::Tick) {
-      if self.graphics_visible() {
+      if self.fans_visible() {
         return Ok(ControlFlow::Continue(false));
       }
       if !self.cfg.animate_fans
@@ -638,36 +685,71 @@ impl App {
   }
 
   fn cooling_layout(&self, area: Rect, procs: bool) -> (LayoutPlan, Vec<Placement>) {
-    cooling::layout(
+    cooling_layout::layout(
       area,
       procs,
       self.clusters.items.len(),
       !self.soc.vm,
       self.cooling.items().len(),
-      self.capabilities.map(|caps| caps.cell_pixels),
+      self.cell_pixels(),
+      self.native_enabled(),
     )
   }
 
-  fn graphics_visible(&self) -> bool {
-    self.help.is_none() && self.capabilities.is_some() && !self.placements.is_empty()
+  fn fans_visible(&self) -> bool {
+    self.help.is_none() && !self.placements.is_empty()
   }
 
   fn fan_frames_active(&self) -> bool {
-    self.graphics_visible() && self.cfg.animate_fans && !self.unfocused && self.cooling.moving()
+    self.fans_visible() && self.cfg.animate_fans && !self.unfocused && self.cooling.moving()
   }
 
-  fn cell_size_safe(caps: Capabilities) -> bool {
-    terminal::window_size().ok().is_none_or(|size| {
-      size.width.checked_div(size.columns).zip(size.height.checked_div(size.rows)).is_none_or(
-        |(width, height)| {
-          width == 0 || height == 0 || width >= caps.cell_pixels.0 && height >= caps.cell_pixels.1
-        },
-      )
-    })
+  fn cell_pixels(&self) -> (u16, u16) {
+    if self.geometry_unknown {
+      return (8, 16);
+    }
+    self.cell_pixels.or(self.capabilities.map(|caps| caps.cell_pixels)).unwrap_or((8, 16))
+  }
+
+  fn native_enabled(&self) -> bool {
+    self.capabilities.is_some() && !self.geometry_unknown
+  }
+
+  fn refresh_cell_pixels(&mut self) -> bool {
+    if let Some(pixels) = measured_cell_pixels() {
+      self.cell_pixels = Some(pixels);
+      self.geometry_unknown = false;
+      true
+    } else {
+      false
+    }
   }
 
   fn set_capabilities(&mut self, caps: Capabilities) {
-    self.capabilities = Self::cell_size_safe(caps).then_some(caps);
+    self.capabilities = Some(caps);
+    self.refresh_cell_pixels();
+  }
+
+  fn paint_text_fans(&self, buffer: &mut Buffer) {
+    for (image, place) in self.cooling.items().iter().zip(&self.placements) {
+      fan_text::render(
+        buffer,
+        place.image,
+        &image.rgba,
+        usize::from(place.side),
+        self.cell_pixels(),
+      );
+    }
+  }
+
+  fn render_text_frame(&mut self, frame: &mut Frame) {
+    // Terminal::draw may observe a resize before the input thread sends its resize event.
+    if frame.area() != self.fan_base.area {
+      self.render(frame);
+    } else {
+      frame.buffer_mut().clone_from(&self.fan_base);
+      self.paint_text_fans(frame.buffer_mut());
+    }
   }
 
   fn draw_fan_images(&mut self, images: &mut FanImages, moving_only: bool) -> io::Result<()> {
@@ -676,7 +758,7 @@ impl App {
     if !TERM_ACTIVE.load(Ordering::SeqCst) {
       return Ok(());
     }
-    if !self.graphics_visible() {
+    if !self.fans_visible() || !self.native_enabled() {
       return images.hide(&mut out);
     }
     let caps = self.capabilities.unwrap();
@@ -704,8 +786,13 @@ impl App {
   }
 
   fn render(&mut self, f: &mut Frame) {
+    #[cfg(test)]
+    {
+      self.widget_frames += 1;
+    }
     let plan = self.layout_frame(f.area());
     self.fan_motion_visible = self.help.is_none()
+      && self.placements.is_empty()
       && self.fans.motion_glyph(0).is_some()
       && self.fan_area(&plan).is_some_and(|r| usize::from(r.width) >= self.fans.label().len() + 8);
 
@@ -719,6 +806,11 @@ impl App {
     }
     if let Some(scroll) = self.help {
       self.help = Some(help::render(f, f.area(), scroll));
+    }
+    if !self.native_enabled() && self.fans_visible() {
+      self.cooling.rasterize(self.placements[0].side, theme::fan_mask_palette(), false);
+      self.fan_base.clone_from(f.buffer_mut());
+      self.paint_text_fans(f.buffer_mut());
     }
   }
 
@@ -745,24 +837,20 @@ impl App {
   ) -> WithError<()> {
     let (mut term, _guard) = enter_term()?;
     let mut images = FanImages::new().ok();
-    let detection = if let Some(images) = &mut images {
-      Some(fan_protocol::detect(&mut stdout().lock(), images)?)
-    } else {
-      None
-    };
-    let mut pending = None;
-    if let Some(detection) = detection {
+    self.refresh_cell_pixels();
+    let detection = fan_protocol::detect(&mut stdout().lock(), images.as_mut())?;
+    {
       if let Some(caps) = detection.capabilities {
         self.set_capabilities(caps);
       }
+      self.cell_pixels = measured_cell_pixels().or(self.cell_pixels).or(detection.cell_pixels);
       for event in detection.early_events.into_iter().filter_map(input_event) {
         if self.apply_event(event, msec)?.is_break() {
           return Ok(());
         }
       }
-      pending = detection.pending;
     }
-    run_inputs_thread(tx, 250, pending);
+    run_inputs_thread(tx, 250, detection.pending);
     self.three_level_bars = theme::detect_three_level_bars();
 
     let mut mouse = false;
@@ -770,6 +858,7 @@ impl App {
     let mut clock = FrameClock::default();
     loop {
       if redraw {
+        self.refresh_cell_pixels();
         let next = self.cooling_layout(term.size()?.into(), self.cfg.show_procs).1;
         if (self.help.is_some() || next != self.placements)
           && let Some(images) = &mut images
@@ -788,12 +877,28 @@ impl App {
           self.draw_fan_images(images, false)?;
         }
       }
-      let active = images.is_some() && self.fan_frames_active();
+      let active = self.fan_frames_active();
       clock.set_active(active, Instant::now());
       if let Some(delta) = clock.frame(Instant::now()) {
         self.cooling.frame(delta);
-        if let Some(images) = &mut images {
+        if self.native_enabled()
+          && let Some(images) = &mut images
+        {
           self.draw_fan_images(images, true)?;
+        } else {
+          if !self.cooling.rasterize(self.placements[0].side, theme::fan_mask_palette(), true) {
+            return Err("fan text rasterization failed".into());
+          }
+          let _output = stdout().lock();
+          if !TERM_ACTIVE.load(Ordering::SeqCst) {
+            return Ok(());
+          }
+          term.draw(|f| self.render_text_frame(f))?;
+          #[cfg(test)]
+          {
+            self.text_animation_frames += 1;
+            self.text_frame_times.push(Instant::now());
+          }
         }
       }
       let event = if let Some(wait) = clock.wait(Instant::now()) {
@@ -1239,6 +1344,9 @@ mod tests {
   /// App for `test_soc` with a few samples of `test_metrics` changed by `edit`.
   fn test_app_with(edit: impl Fn(&mut Metrics)) -> App {
     let mut app = App::from_parts(test_soc(), Config::default());
+    // Legacy metric/process tests exercise the compact RPM path. Complete native/text fans
+    // and their adaptive placement are covered with valid cell geometry in fan_preview.
+    app.cell_pixels = Some((0, 0));
     for _ in 0..3 {
       let mut metrics = test_metrics();
       edit(&mut metrics);

@@ -107,6 +107,11 @@ pub(super) fn fan_palette(caps: super::fan_protocol::Capabilities) -> super::fan
   }
 }
 
+/// Canonical raster data for shape extraction; text colors remain terminal ANSI colors.
+pub(super) fn fan_mask_palette() -> super::fan_raster::Palette {
+  super::fan_raster::Palette { background: [0; 3], foreground: [255; 3], accent: [0, 255, 255] }
+}
+
 #[cfg(test)]
 mod tests {
   use ratatui::style::Color;

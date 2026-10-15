@@ -4,13 +4,12 @@ use std::time::Duration;
 
 use macmon::FanMetric;
 use ratatui::Frame;
-use ratatui::layout::{Margin, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, BorderType, Paragraph};
+use ratatui::widgets::{Block, BorderType};
 
 use super::fan_clock::Rotor;
 use super::fan_raster::{FanRaster, Palette};
-use super::layout::{LayoutPlan, Metric, compute_console_layout};
 use super::theme;
 
 #[derive(Debug)]
@@ -90,10 +89,9 @@ impl Cooling {
         theme::text(" "),
       ]);
       let block = Block::bordered().border_type(BorderType::Rounded).border_style(theme::BORDER);
-      frame.render_widget(block.title(title), place.card);
-      let label = Line::from(vec![theme::heading(image.rpm.to_string()), theme::dim(" RPM")]);
-      let row = Rect::new(place.card.x + 1, place.card.bottom() - 2, place.card.width - 2, 1);
-      frame.render_widget(Paragraph::new(label).centered(), row);
+      let label =
+        Line::from(vec![theme::heading(format!(" {}", image.rpm)), theme::dim(" RPM ")]).centered();
+      frame.render_widget(block.title(title).title_bottom(label), place.card);
     }
   }
 }
@@ -104,94 +102,6 @@ pub(super) struct Placement {
   pub(super) card: Rect,
   pub(super) image: Rect,
   pub(super) side: u16,
-}
-
-pub(super) fn layout(
-  area: Rect,
-  procs: bool,
-  clusters: usize,
-  power: bool,
-  fan_count: usize,
-  cell_pixels: Option<(u16, u16)>,
-) -> (LayoutPlan, Vec<Placement>) {
-  let fallback = compute_console_layout(area, procs, clusters, power);
-  let Some((cell_width, cell_height)) = cell_pixels else { return (fallback, Vec::new()) };
-  if fallback.compute.is_none()
-    || !(1..=2).contains(&fan_count)
-    || cell_width == 0
-    || cell_height == 0
-  {
-    return (fallback, Vec::new());
-  }
-  let count = fan_count as u16;
-  let keep_procs = procs && fallback.proc.is_some();
-  let group_min = u16::try_from(clusters.saturating_add(1).saturating_mul(3).saturating_add(2))
-    .unwrap_or(u16::MAX)
-    .max(12);
-  for side in [120_u16, 100] {
-    let (columns, rows) = (side.div_ceil(cell_width) + 1, side.div_ceil(cell_height) + 1);
-    let card_width = (columns + 2).max(16);
-    let cards_width = count * card_width + count - 1;
-    // Keep the aggregate power title, values and units readable beside the compact cards.
-    let right_width = cards_width.max(34);
-    let top_height = group_min.max(4 + 8 + rows + 3).saturating_add(8);
-    if right_width + 1 + 36 > area.width - 2
-      || u32::from(top_height) + u32::from(keep_procs) * 6 > u32::from(area.height)
-    {
-      continue;
-    }
-    let top = Rect { height: if keep_procs { top_height } else { area.height }, ..area };
-    let inner = top.inner(Margin::new(1, 1));
-    let network = Rect { y: inner.bottom() - 6, height: 6, ..inner };
-    let compute = Rect { width: inner.width - right_width - 1, height: inner.height - 6, ..inner };
-    let right = Rect { x: compute.right() + 1, width: right_width, ..compute };
-    let memory = Rect { height: 4, ..right };
-    let telemetry = Rect { y: right.y + 4, height: 8, ..right };
-    let cooling = Rect { y: right.y + 12, height: right.height - 12, ..right };
-    let body = compute.inner(Margin::new(1, 1));
-    let edge =
-      |index: usize| (u64::from(body.height) * index as u64 / (clusters + 1) as u64) as u16;
-    let mut boxes: Vec<_> = (0..clusters)
-      .map(Metric::Cluster)
-      .chain([Metric::Gpu])
-      .enumerate()
-      .map(|(index, metric)| {
-        (metric, Rect { y: body.y + edge(index), height: edge(index + 1) - edge(index), ..body })
-      })
-      .collect();
-    boxes.push((Metric::Ram, memory));
-    let placements = (0..count)
-      .map(|index| {
-        let card = Rect {
-          x: cooling.x + (cooling.width - cards_width) / 2 + index * (card_width + 1),
-          width: card_width,
-          height: rows + 3,
-          ..cooling
-        };
-        let image = Rect::new(
-          card.x + 1 + (card.width - 2 - columns) / 2,
-          card.y + 1 + (card.height - 3 - rows) / 2,
-          columns,
-          rows,
-        );
-        Placement { card, image, side }
-      })
-      .collect();
-    let proc =
-      keep_procs.then_some(Rect { y: top.bottom(), height: area.height - top.height, ..area });
-    return (
-      LayoutPlan {
-        top: Some(top),
-        boxes,
-        compute: Some(compute),
-        telemetry: Some(telemetry),
-        network: Some(network),
-        proc,
-      },
-      placements,
-    );
-  }
-  (fallback, Vec::new())
 }
 
 #[cfg(test)]
@@ -253,106 +163,5 @@ mod tests {
     assert!(cooling.rasterize(180, palette, true));
     assert_eq!(cooling.items()[0].rgba, before[0]);
     assert_ne!(cooling.items()[1].rgba, before[1]);
-  }
-
-  #[test]
-  fn unsupported_small_vm_empty_or_many_fans_keep_current_layout() {
-    for (area, power, count, cell) in [
-      (Rect::new(0, 0, 120, 40), true, 2, None),
-      (Rect::new(0, 0, 120, 40), true, 2, Some((0, 18))),
-      (Rect::new(0, 0, 80, 24), true, 2, Some((9, 18))),
-      (Rect::new(0, 0, 120, 40), false, 2, Some((9, 18))),
-      (Rect::new(0, 0, 120, 40), true, 0, Some((9, 18))),
-      (Rect::new(0, 0, 120, 40), true, 3, Some((9, 18))),
-      (Rect::default(), true, 2, Some((9, 18))),
-    ] {
-      let (plan, placements) = layout(area, true, 2, power, count, cell);
-      assert_eq!(plan, compute_console_layout(area, true, 2, power));
-      assert!(placements.is_empty());
-    }
-  }
-
-  #[test]
-  fn pixel_bounds_and_cards_do_not_overlap_and_process_rows_remain_useful() {
-    for (area, count, cell) in [
-      (Rect::new(0, 0, 120, 40), 2, (9, 18)),
-      (Rect::new(3, 2, 120, 40), 1, (9, 18)),
-      (Rect::new(7, 5, 160, 60), 2, (8, 20)),
-      (Rect::new(0, 0, 140, 50), 1, (9, 18)),
-    ] {
-      let (plan, placements) = layout(area, true, 2, true, count, Some(cell));
-      assert_eq!(placements.len(), count);
-      let top = plan.top.unwrap();
-      assert_eq!(top.intersection(area), top);
-      assert!(plan.proc.unwrap().height >= 6);
-      assert_eq!(plan.network.unwrap().width, top.width - 2);
-      let mut cards = Vec::new();
-      for placement in placements {
-        assert!((100..=120).contains(&placement.side));
-        assert_eq!(placement.card.intersection(placement.image), placement.image);
-        assert_eq!(placement.card.intersection(top), placement.card);
-        assert!(placement.image.bottom() <= placement.card.bottom() - 2);
-        assert!(u32::from(placement.image.width) * u32::from(cell.0) >= u32::from(placement.side));
-        assert!(u32::from(placement.image.height) * u32::from(cell.1) >= u32::from(placement.side));
-        for sibling in cards.iter().chain(
-          [
-            plan.compute.unwrap(),
-            plan.telemetry.unwrap(),
-            plan.boxes.last().unwrap().1,
-            plan.network.unwrap(),
-          ]
-          .iter(),
-        ) {
-          assert!(placement.card.intersection(*sibling).is_empty());
-        }
-        cards.push(placement.card);
-      }
-    }
-    let (_, dual) = layout(Rect::new(0, 0, 120, 40), true, 2, true, 2, Some((9, 18)));
-    assert!(dual.iter().all(|placement| placement.side == 120));
-    let (_, single) = layout(Rect::new(0, 0, 140, 50), true, 2, true, 1, Some((9, 18)));
-    assert_eq!(single[0].side, 120);
-  }
-
-  #[test]
-  fn cards_remain_compact_in_tall_windows_and_with_large_font_cells() {
-    for (width, height) in [(120, 40), (160, 60), (220, 80)] {
-      for cell in [(9, 18), (8, 20), (14, 28)] {
-        for count in 1..=2 {
-          for procs in [false, true] {
-            let area = Rect::new(3, 2, width, height);
-            let (plan, placements) = layout(area, procs, 2, true, count, Some(cell));
-            assert_eq!(placements.len(), count);
-            for place in placements {
-              assert_eq!(place.side, 120);
-              assert!((16..=18).contains(&place.card.width), "readable, bounded fan title");
-              assert!(place.card.height <= 11, "cards must not stretch with window height");
-              assert_eq!(place.card.intersection(place.image), place.image);
-            }
-            assert!(plan.telemetry.unwrap().width >= 34);
-            assert_eq!(plan.network.unwrap().width, width - 2);
-            assert_eq!(plan.proc.is_some(), procs);
-          }
-        }
-      }
-    }
-    let area = Rect::new(0, 0, 160, 60);
-    let (plan, _) = layout(area, true, 2, true, 2, Some((9, 18)));
-    let previous = compute_console_layout(area, true, 2, true);
-    assert!(plan.compute.unwrap().width > previous.compute.unwrap().width);
-  }
-
-  #[test]
-  fn smaller_fans_keep_process_rows_and_fall_back_before_displacing_them() {
-    let (plan, placements) = layout(Rect::new(0, 0, 120, 36), true, 2, true, 2, Some((9, 18)));
-    assert_eq!(placements.len(), 2);
-    assert!(placements.iter().all(|place| place.side == 100));
-    assert_eq!(plan.proc.unwrap().height, 6);
-
-    let area = Rect::new(0, 0, 120, 35);
-    let (plan, placements) = layout(area, true, 2, true, 2, Some((9, 18)));
-    assert!(placements.is_empty());
-    assert_eq!(plan, compute_console_layout(area, true, 2, true));
-    assert!(plan.proc.is_some());
   }
 }

@@ -10,6 +10,7 @@ use super::fan_replies::ReplyParser;
 
 // Image query, foreground, background, cursor, grid pixels and grid character dimensions.
 const ALL_REPLIES: u8 = 0b11_1111;
+const SIZE_REPLIES: u8 = 0b11_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Capabilities {
@@ -21,18 +22,30 @@ pub(super) struct Capabilities {
 
 pub(super) struct Detection {
   pub capabilities: Option<Capabilities>,
+  pub cell_pixels: Option<(u16, u16)>,
   pub early_events: Vec<Event>,
   pub pending: Option<PendingQueries>,
 }
 
-pub(super) fn detect(out: &mut impl Write, images: &mut FanImages) -> io::Result<Detection> {
+pub(super) fn detect(
+  out: &mut impl Write,
+  images: Option<&mut FanImages>,
+) -> io::Result<Detection> {
   let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
   let term = std::env::var("TERM").unwrap_or_default();
-  if !candidate(&program, &term) || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-    return Ok(Detection { capabilities: None, early_events: Vec::new(), pending: None });
+  if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+    return Ok(Detection {
+      capabilities: None,
+      cell_pixels: None,
+      early_events: Vec::new(),
+      pending: None,
+    });
   }
-  let id = images.probe(out)?;
-  detect_fd(out, libc::STDIN_FILENO, Duration::from_millis(700), id)
+  if let Some(images) = images.filter(|_| candidate(&program, &term)) {
+    let id = images.probe(out)?;
+    return detect_queries(out, libc::STDIN_FILENO, Duration::from_millis(700), id, ALL_REPLIES);
+  }
+  detect_queries(out, libc::STDIN_FILENO, Duration::from_millis(100), 0, SIZE_REPLIES)
 }
 
 fn candidate(program: &str, term: &str) -> bool {
@@ -43,19 +56,39 @@ fn candidate(program: &str, term: &str) -> bool {
   }
 }
 
+#[cfg(test)]
 fn detect_fd(
   out: &mut impl Write,
   fd: libc::c_int,
   wait: Duration,
   id: u32,
 ) -> io::Result<Detection> {
-  out.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b[14t\x1b[18t")?;
+  detect_queries(out, fd, wait, id, ALL_REPLIES)
+}
+
+fn detect_queries(
+  out: &mut impl Write,
+  fd: libc::c_int,
+  wait: Duration,
+  id: u32,
+  requested: u8,
+) -> io::Result<Detection> {
+  if requested & 1 != 0 {
+    out.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\")?;
+  }
+  out.write_all(b"\x1b[14t\x1b[18t")?;
   out.flush()?;
-  let mut pending =
-    PendingQueries { fd, id, parser: ReplyParser::default(), evidence: Evidence::default() };
+  let mut pending = PendingQueries {
+    fd,
+    id,
+    requested,
+    parser: ReplyParser::default(),
+    evidence: Evidence::default(),
+  };
   let early_events = pending.read(wait)?;
   Ok(Detection {
     capabilities: pending.capabilities(),
+    cell_pixels: pending.cell_pixels(),
     early_events,
     pending: (!pending.finished()).then_some(pending),
   })
@@ -64,17 +97,22 @@ fn detect_fd(
 pub(super) struct PendingQueries {
   fd: libc::c_int,
   id: u32,
+  requested: u8,
   parser: ReplyParser,
   evidence: Evidence,
 }
 
 impl PendingQueries {
   pub(super) fn capabilities(&self) -> Option<Capabilities> {
-    self.evidence.capabilities()
+    (self.requested & 1 != 0).then(|| self.evidence.capabilities()).flatten()
+  }
+
+  pub(super) fn cell_pixels(&self) -> Option<(u16, u16)> {
+    self.evidence.cell_pixels()
   }
 
   pub(super) fn finished(&self) -> bool {
-    self.evidence.seen == ALL_REPLIES && !self.parser.has_pending()
+    self.evidence.seen & self.requested == self.requested && !self.parser.has_pending()
   }
 
   /// Keep the same byte parser until all requested replies and partial input have completed.
@@ -182,21 +220,25 @@ impl Evidence {
     }
   }
 
-  fn capabilities(&self) -> Option<Capabilities> {
+  fn cell_pixels(&self) -> Option<(u16, u16)> {
     let (width, height) = self.pixels?;
     let (cols, rows) = self.cells?;
     let cell_pixels = (
       u16::try_from(width.checked_div(cols)?).ok()?,
       u16::try_from(height.checked_div(rows)?).ok()?,
     );
-    if !self.ack || cell_pixels.0 == 0 || cell_pixels.1 == 0 {
+    (cell_pixels.0 > 0 && cell_pixels.1 > 0).then_some(cell_pixels)
+  }
+
+  fn capabilities(&self) -> Option<Capabilities> {
+    if !self.ack {
       return None;
     }
     Some(Capabilities {
       foreground: self.foreground?,
       background: self.background?,
       accent: self.cursor.or(self.ansi6),
-      cell_pixels,
+      cell_pixels: self.cell_pixels()?,
     })
   }
 }
@@ -268,6 +310,42 @@ mod tests {
       assert!(!candidate(name, "xterm-kitty"));
     }
     assert!(!candidate("", "xterm-256color"));
+  }
+
+  #[test]
+  fn text_geometry_queries_need_neither_image_resources_nor_color_replies() {
+    let (input, mut output) = pipe();
+    output.write_all(b"\x1b[4;800;900t\x1b[8;40;100t").unwrap();
+    let mut commands = Vec::new();
+    let detection =
+      detect_queries(&mut commands, input.as_raw_fd(), Duration::ZERO, 0, SIZE_REPLIES).unwrap();
+    assert_eq!(commands, b"\x1b[14t\x1b[18t");
+    assert_eq!(detection.cell_pixels, Some((9, 20)));
+    assert!(detection.capabilities.is_none() && detection.pending.is_none());
+  }
+
+  #[test]
+  fn extra_replies_finish_geometry_without_enabling_unrequested_graphics() {
+    let (input, mut output) = pipe();
+    output.write_all(&replies("OK")).unwrap();
+    let detection =
+      detect_queries(&mut Vec::new(), input.as_raw_fd(), Duration::ZERO, PROBE_ID, SIZE_REPLIES)
+        .unwrap();
+    assert_eq!(detection.cell_pixels, Some((10, 20)));
+    assert!(detection.capabilities.is_none() && detection.pending.is_none());
+  }
+
+  #[test]
+  fn failed_graphics_ack_still_provides_geometry_for_the_text_backend() {
+    let (input, mut output) = pipe();
+    output.write_all(&replies("ENOTSUP")).unwrap();
+    let detection =
+      detect_fd(&mut Vec::new(), input.as_raw_fd(), Duration::ZERO, PROBE_ID).unwrap();
+    assert_eq!(detection.cell_pixels, Some((10, 20)));
+    assert!(detection.capabilities.is_none() && detection.pending.is_none());
+    let mut data = evidence();
+    data.pixels = Some((0, 600));
+    assert!(data.cell_pixels().is_none());
   }
 
   #[test]

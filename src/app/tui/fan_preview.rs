@@ -81,7 +81,7 @@ mod fan_preview {
       assert!(screen.contains("12.00 W"));
       assert_eq!(serde_json::to_value(&app.network).unwrap(), network_before);
       for place in &app.placements {
-        assert!((100..=120).contains(&place.side));
+        assert!((48..=120).contains(&place.side));
         assert_eq!(place.card.intersection(place.image), place.image);
         assert!(place.card.intersection(network).is_empty());
       }
@@ -104,6 +104,68 @@ mod fan_preview {
       let telemetry = app.layout(buffer.area).telemetry.unwrap();
       assert!(row(&buffer, telemetry.y).contains(&format!("CPU+GPU+ANE {power:.2} W")));
       assert!(screen_text(&buffer).contains("Temperature"));
+    }
+  }
+
+  #[test]
+  fn text_fans_keep_network_and_update_only_their_cached_image_cells() {
+    for (width, height) in [(120, 40), (80, 24)] {
+      for mode in ["one", "two", "zero", "missing"] {
+        let mut app = preview_app(mode, true);
+        app.cell_pixels = Some((9, 18));
+        let before = render_buffer(&mut app, width, height);
+        let text = screen_text(&before);
+        assert!(text.contains("Network "));
+        assert!(text.contains("en0") && text.contains("1.0 MiB/s"));
+        assert_eq!(app.placements.len(), app.cooling.items().len());
+        assert_eq!(app.fan_frames_active(), matches!(mode, "one" | "two"));
+        assert!(!app.fan_motion_visible, "the complete fan replaces the small glyph");
+        if app.placements.is_empty() { continue; }
+        assert!(text.chars().any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch)));
+        let baseline = app.fan_base.clone();
+        app.cooling.frame(Duration::from_millis(100));
+        assert!(app.cooling.rasterize(app.placements[0].side, theme::fan_mask_palette(), true));
+        let mut after = baseline.clone();
+        app.paint_text_fans(&mut after);
+        for y in 0..height {
+          for x in 0..width {
+            if !app.placements.iter().any(|place| place.image.contains((x, y).into())) {
+              assert_eq!(after[(x, y)], before[(x, y)]);
+            }
+          }
+        }
+        assert_eq!(baseline, app.fan_base, "animation must not change the cached widgets");
+        if mode == "zero" { assert_eq!(before, after); } else { assert_ne!(before, after); }
+        assert!(matches!(app.apply_event(Event::Tick, &RwLock::new(SAMPLE_MSEC)).unwrap(), ControlFlow::Continue(false)));
+      }
+    }
+  }
+
+  #[test]
+  fn resizing_and_cell_aspect_changes_preserve_intent_and_restore_complete_text_fans() {
+    let mut app = preview_app("two", true);
+    for cell in [(8, 16), (8, 20), (10, 16), (14, 28)] {
+      app.cell_pixels = Some(cell);
+      for (width, height, complete) in [(120, 40, true), (80, 24, true), (36, 12, false), (120, 40, true)] {
+        let screen = render_to_string(&mut app, width, height);
+        assert_eq!(app.placements.len(), if complete { 2 } else { 0 }, "{width}x{height} {cell:?}");
+        assert_eq!(app.fan_frames_active(), complete);
+        if complete { assert!(screen.contains("1800 RPM") && screen.contains("2400 RPM")); }
+        assert_saved_intent(&app, &RwLock::new(SAMPLE_MSEC), true);
+      }
+    }
+  }
+
+  #[test]
+  fn text_animation_rebuilds_if_the_backend_resizes_before_its_input_event() {
+    let mut app = preview_app("two", true);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    for (width, height) in [(80, 24), (36, 12), (120, 40)] {
+      terminal.backend_mut().resize(width, height);
+      terminal.draw(|frame| app.render_text_frame(frame)).unwrap();
+      assert_eq!(terminal.backend().buffer().area, Rect::new(0, 0, width, height));
+      assert_eq!(app.placements.len(), if width == 36 { 0 } else { 2 });
     }
   }
 
@@ -140,7 +202,7 @@ mod fan_preview {
       assert_saved_intent(&app, &interval, false);
     }
     let _ = app.apply_event(Event::Key(key('a')), &interval).unwrap();
-    render_buffer(&mut app, 60, 18);
+    render_buffer(&mut app, 36, 12);
     assert!(!app.fan_frames_active() && app.placements.is_empty());
     assert_saved_intent(&app, &interval, true);
     render_buffer(&mut app, 120, 40);
@@ -294,7 +356,14 @@ mod fan_preview {
     report["elapsed_seconds"] = started.elapsed().as_secs_f64().into();
     report["submitted_image_frames"] =
       super::super::fan_images::FRAME_SUBMISSIONS.load(Ordering::Relaxed).into();
-    report["native_images_enabled"] = app.capabilities.is_some().into();
+    report["native_images_enabled"] = app.native_enabled().into();
+    report["text_animation_frames"] = app.text_animation_frames.into();
+    report["full_widget_frames"] = app.widget_frames.into();
+    report["text_frame_times_msec"] = app.text_frame_times.iter().map(|time| time.duration_since(started).as_secs_f64() * 1000.0).collect::<Vec<_>>().into();
+    report["backend_mode"] = if app.placements.is_empty() { "none" } else if app.native_enabled() { "native" } else { "text" }.into();
+    report["placements"] = app.placements.iter().map(|p| serde_json::json!({
+      "side": p.side, "image": { "x": p.image.x, "y": p.image.y, "width": p.image.width, "height": p.image.height }
+    })).collect::<Vec<_>>().into();
     report["result"] = match &result {
       Ok(()) => "ok".into(),
       Err(error) => error.to_string().into(),

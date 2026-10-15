@@ -96,17 +96,21 @@ the latest chart sample and hot-load history stay prominent. Wide network tables
 totals to the panel edge while preserving the compact layout in narrow windows.
 
 Compatible Warp, Kitty and WezTerm sessions can show a complete, shaded seven-blade fan for
-each reported fan, normally 120 pixels across (100 when space is limited), with a recessed
+each reported fan, up to 120 pixels across, with a recessed
 mechanical housing, corner screws and curved metal highlights. The housing and hub stay fixed
 as the blades turn. Cards stay compact in large windows and preserve room for the process list.
-Images use the terminal's queried colors and require a successful capability query for the
+Fan diameter adapts to available space and physical cell dimensions, with RPM on the card's
+bottom border. Images use the terminal's queried colors and require a successful capability query for the
 actual image format and transport. Warp receives
-images inline; Kitty and WezTerm use private local files. Other terminals and small windows keep
-the compact RPM indicator. Window resizing adapts the panels. Restart macmon after changing the
-terminal font size to query fresh pixel dimensions.
+images inline; Kitty and WezTerm use private local files. Apple Terminal and other text terminals
+show the same complete fan geometry with ANSI-colored Braille characters. When a complete fan
+cannot fit, the compact RPM indicator preserves room for metrics, Network and processes.
+Window and font changes refresh pixel sizing through the terminal's window-size reports.
+If those reports omit pixels after a resize, macmon safely switches to text with an estimated
+1:2 cell aspect ratio; restart macmon to query native image dimensions again in such sessions.
 
 Each rotor follows its own reported RPM; zero RPM stays stationary and unavailable fans stay
-absent. Press `a` to toggle animation (enabled by default, saved as `animate_fans`). Native images
+absent. Press `a` to toggle animation (enabled by default, saved as `animate_fans`). Complete fans
 target 60 updates per second independently of metric/process sampling; compact indicators
 change at most four times per second. Animation pauses on focus loss, under help and when
 hidden, preserving your manual choice. It never controls hardware fans or changes the saved
