@@ -32,7 +32,8 @@ POWER does today.
       `ri_pkg_idle_wkups`), FDS (open file descriptors), DISK R/W/s (`rusage` disk bytes), PEAK
       MEM (`ri_lifetime_max_phys_footprint`). Fixed set, no configuration: new columns go into
       `DROP_ORDER`, so a narrow window drops them first. Decision point before the plan: which of
-      them earn a place in an 80-column window.
+      them earn a place in an 80-column window. Done: CPU TIME (`TIME`, before `CPU%`).
+      Plan: [docs/plans/completed/20261014-cpu-time.md](plans/completed/20261014-cpu-time.md).
 - [ ] **6. Column picker.** Only if item 5 leaves too many columns: an overlay with checkboxes
       (like htop's F2) saved in `~/.config/macmon.json` under a new field. Released versions
       ignore the field but drop it when they save, so a missing field means the default columns.
@@ -43,11 +44,12 @@ POWER does today.
       above the counts (cpu, mem, power, threads, uptime, parent) and presets on `s` / `S` (`all`,
       `files`, `network`, `home`, `not home`) saved in `~/.config/macmon.json`.
       Plan (first PR): [docs/plans/20261011-grouped-files.md](plans/20261011-grouped-files.md).
-- [ ] **8. macmon's own cost, before the release.** Measure what the TUI, `pipe` and `serve` cost
+- [x] **8. macmon's own cost, before the release.** Measure what the TUI, `pipe` and `serve` cost
       at 1000 ms and 250 ms: CPU time per minute and power (macmon's own POWER, `powermetrics`
       task energy, Activity Monitor's Energy Impact), with the process list shown and hidden.
       Profile the hot paths (sampling, IORegistry GPU reads, `ps`, rendering) and fix what is
       cheap to fix; report before / after numbers in the PR.
+      Plan: [docs/plans/completed/20261014-own-cost.md](plans/completed/20261014-own-cost.md).
 - [x] **9. Scrolling in the lists.** A scrollbar on the right border of the process list and the
       info overlay (ratatui's `Scrollbar`: `↑` / `↓` at the ends, a thumb between, as btop
       draws it), ↑ / ↓ wrapping around at the ends (not the wheel, PgUp / PgDn, Home / End), and
@@ -71,6 +73,13 @@ POWER does today.
       IOAccelerator client time.
       Plan (first PR): [docs/plans/completed/20261012-vm-start.md](plans/completed/20261012-vm-start.md).
       Plan (second PR): [docs/plans/completed/20261012-vm-power.md](plans/completed/20261012-vm-power.md).
+- [ ] **Upstream 13. Social preview card.** The repository still shows GitHub's template image. A
+      1280×640 card from a real TUI screenshot of the current release (HTML rendered to PNG),
+      uploaded by hand in the repository settings.
+
+Order for 0.11: 10, then 5 (decide which columns fit 80 cells; 6 only if too many), the second
+PR of 7, the third PR of 12. Items 11 and 4 need their decision first. Items 10, 12 and 13 are
+small and self-contained, good for an outside contributor.
 
 - [x] **13. Per-interface network monitoring.** Real-time receive/transmit rates and cumulative
       byte counters without sudo, in the TUI, JSON, Rust library, and Prometheus exporter.
