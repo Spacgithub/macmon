@@ -16,6 +16,19 @@ function bytes(value) {
   const scale = value > 0 ? Math.max(0, Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1)) : 0;
   return `${(value / 1024 ** scale).toLocaleString("en-US", { maximumSignificantDigits: 3 })} ${units[scale]}`;
 }
+function watts(value) {
+  if (!finite(value)) return "Unavailable";
+  const small = value > 0 && value < 1;
+  return `${(small ? value * 1000 : value).toLocaleString("en-US", { maximumSignificantDigits: 4 })} ${small ? "mW" : "W"}`;
+}
+function power(metrics) {
+  const read = (key) => !metrics.soc?.vm && finite(metrics[key]) ? metrics[key] : null;
+  for (const name of ["cpu", "gpu", "ane", "ram", "gpu_ram"]) put(`${name}-power`, watts(read(`${name}_power`)));
+  const reported = read("sys_power"), system = reported > 0 ? reported : null, compute = read("all_power");
+  put("system-power", watts(system));
+  put("compute-power", watts(compute));
+  return [system, compute];
+}
 function age() { return state.sample ? state.sample.age_ms + performance.now() - state.received : Infinity; }
 function limit() { return Math.max(3 * (state.sample?.interval_ms || 1000), 3 * (state.cadence?.effective_ms || 0), 3000); }
 function refreshCadence(value = state.cadence) {
@@ -111,6 +124,38 @@ function drawCharts() {
     });
     context.stroke();
   });
+  drawPowerChart();
+}
+function drawPowerChart() {
+  const values = state.history.flatMap((point) => point.slice(3)).filter(finite);
+  const peak = Math.max(0, ...values), unit = peak > 0 ? 10 ** Math.floor(Math.log10(peak)) : 1;
+  const rounded = [1, 2, 5, 10].map((step) => step * unit).find((value) => value >= peak);
+  const maximum = finite(rounded) && rounded > 0 ? rounded : peak || 1;
+  put("power-range", values.length ? `0–${maximum.toLocaleString("en-US", { maximumSignificantDigits: 3 })} W` : "Scale unavailable");
+  const canvas = $("power-chart"), context = canvas.getContext("2d");
+  const width = canvas.clientWidth, height = canvas.clientHeight, scale = window.devicePixelRatio || 1;
+  if (!context || !width || !height) return;
+  canvas.width = Math.round(width * scale);
+  canvas.height = Math.round(height * scale);
+  context.setTransform(scale, 0, 0, scale, 0, 0);
+  context.strokeStyle = "#29394c";
+  context.lineWidth = 1;
+  for (const ratio of [0, 0.5, 1]) { context.beginPath(); context.moveTo(0, ratio * height); context.lineTo(width, ratio * height); context.stroke(); }
+  ["--accent", "--power-subtotal"].forEach((color, index) => {
+    context.beginPath();
+    context.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue(color).trim();
+    context.lineWidth = 1.8;
+    context.setLineDash(index ? [5, 4] : []);
+    let connected = false;
+    state.history.forEach((point, position) => {
+      const value = point[index + 3];
+      if (!finite(value)) { connected = false; return; }
+      const x = width * (60 - state.history.length + position) / 59, y = height * (1 - value / maximum);
+      if (connected) context.lineTo(x, y); else context.moveTo(x, y);
+      connected = true;
+    });
+    context.stroke();
+  });
 }
 function network(metrics) {
   const rows = Array.isArray(metrics.network) ? metrics.network.filter((item) => item && typeof item.name === "string") : [];
@@ -195,12 +240,12 @@ function update(sample) {
     const value = metrics.temp?.[`${name}_temp_avg`];
     put(`${name}-temp`, typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(1)} \u00b0C` : "Unavailable");
   }
-  put("cpu-detail", `${number(vm ? null : metrics.cpu_power)} W / ${tiers}`);
-  put("gpu-detail", `${number(vm ? null : metrics.gpu_power)} W / ${number(gpuUnavailable ? null : metrics.gpu_freq_mhz, 0)} MHz`);
+  put("cpu-detail", `${watts(vm ? null : metrics.cpu_power)} / ${tiers}`);
+  put("gpu-detail", `${watts(vm ? null : metrics.gpu_power)} / ${number(gpuUnavailable ? null : metrics.gpu_freq_mhz, 0)} MHz`);
   put("ram-detail", `${bytes(memory.ram_usage)} used / ${bytes(memory.ram_total)} total / ${bytes(memory.swap_usage)} swap`);
   put("device", [metrics.soc?.chip_name || "Local device", metrics.soc?.mac_model, vm ? "Virtual machine" : ""].filter(Boolean).join(" / "));
   put("sample-time", `Sample ${new Date(sample.sampled_at).toLocaleTimeString("en-US", { hour12: false })}`);
-  state.history.push([metrics.cpu_active_ratio, gpu, ram]);
+  state.history.push([metrics.cpu_active_ratio, gpu, ram, ...power(metrics)]);
   if (state.history.length > 60) state.history.shift();
   network(metrics);
   cooling(metrics);

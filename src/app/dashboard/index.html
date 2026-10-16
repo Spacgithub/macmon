@@ -37,6 +37,30 @@
         <p class="detail" id="ram-detail">Waiting for a sample</p>
       </article>
     </section>
+    <section class="panel power" aria-labelledby="power-title">
+      <div class="panel-head"><div><p class="eyebrow">ENERGY TELEMETRY</p><h2 id="power-title">Power</h2></div><span class="tag">REPORTED ESTIMATES</span></div>
+      <div class="power-body">
+        <div class="power-totals">
+          <div><p class="muted">System estimate</p><p class="power-primary" id="system-power">Unavailable</p></div>
+          <div><p class="muted">CPU + GPU + ANE</p><p class="power-subtotal" id="compute-power">Unavailable</p></div>
+        </div>
+        <div class="power-history">
+          <div class="power-key"><span>System estimate</span><span>CPU + GPU + ANE</span></div>
+          <canvas id="power-chart" role="img" aria-label="System estimate and CPU plus GPU plus ANE subtotal history, separate lines on a shared watt scale, up to 60 samples" aria-describedby="power-range"></canvas>
+          <p class="muted power-axis"><span id="power-range">Scale unavailable</span><span>Latest 60 samples</span></p>
+        </div>
+      </div>
+      <dl class="power-components">
+        <div><dt>CPU</dt><dd id="cpu-power">Unavailable</dd></div>
+        <div><dt>GPU</dt><dd id="gpu-power">Unavailable</dd></div>
+        <div><dt>ANE</dt><dd id="ane-power">Unavailable</dd></div>
+        <div><dt>DRAM</dt><dd id="ram-power">Unavailable</dd></div>
+        <div><dt>GPU SRAM</dt><dd id="gpu_ram-power">Unavailable</dd></div>
+      </dl>
+      <details class="power-notes"><summary>About these readings</summary>
+        <p>The system estimate uses the larger of the system sensor reading and the CPU + GPU + ANE subtotal; it is not wall-socket power. DRAM and GPU SRAM are separate reported values and should not be added to these totals. Some unsupported counters report zero, so zero alone does not establish zero consumption. Missing and virtual-machine readings stay unavailable.</p>
+      </details>
+    </section>
     <div class="detail-grid">
     <section class="panel" aria-labelledby="network-title">
       <div class="panel-head"><div><p class="eyebrow">INTERFACE TELEMETRY</p><h2 id="network-title">Network</h2></div><span class="tag" id="network-count">NO DATA</span></div>
