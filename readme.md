@@ -523,6 +523,8 @@ Run `make check` and `make test` for Rust and HTTP checks. With Node.js installe
 `make test-dashboard` exercises the actual browser script against isolated DOM, clock and
 request fixtures. Node.js is used only for these development tests.
 
+The [upstream dev pre-release](https://github.com/vladkens/macmon/releases/tag/dev), built from upstream `main`, shows its git version in `macmon -V` and the TUI title, e.g. `macmon 0.9.0-12-g3672a1b` (local builds show the crate version); mention it when reporting an upstream issue. It does not include this fork's Network or browser additions.
+
 ## 📝 License
 
 Distributed under the [MIT License](LICENSE).

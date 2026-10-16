@@ -4,7 +4,7 @@
 //! has CPU time and RSS but no energy counter. GPU time of every process comes from the GPU's user
 //! clients in the IORegistry.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::mem;
 use std::process::{Command, Stdio};
@@ -118,6 +118,8 @@ pub struct ProcInfo {
   pub user: String,
   /// 100% = one fully busy core, as in Activity Monitor.
   pub cpu_pct: f32,
+  /// User + system CPU time since the process started; in 10 ms steps for other users' processes.
+  pub cpu_time_ns: u64,
   /// Physical footprint (Activity Monitor's "Memory") of the current user's processes. Other
   /// users' processes come from `ps`, which has only the resident size: it counts shared pages and
   /// leaves out compressed memory, so the two compare only roughly.
@@ -341,6 +343,11 @@ fn parse_ps_time(s: &str) -> Option<u64> {
   total.checked_mul(1_000_000_000)?.checked_add(frac_ns)
 }
 
+/// A uid as `ps` prints it: signed, so `nobody` (4294967294) reads `-2`.
+fn parse_uid(s: &str) -> Option<u32> {
+  s.parse::<i32>().map(|uid| uid as u32).or_else(|_| s.parse()).ok()
+}
+
 /// One line of `ps -o pid=,uid=,rss=,time=,comm=`; the command is the rest of the line.
 fn parse_ps_line(line: &str) -> Option<Raw> {
   let mut rest = line.trim();
@@ -351,7 +358,7 @@ fn parse_ps_line(line: &str) -> Option<Raw> {
   };
 
   let pid = field()?.parse().ok()?;
-  let uid = field()?.parse().ok()?;
+  let uid = parse_uid(field()?)?;
   let rss_kib = digits(field()?)?;
   let cpu_ns = parse_ps_time(field()?)?;
   let comm = rest.to_string();
@@ -374,9 +381,48 @@ fn parse_ps(out: &str) -> Vec<Raw> {
   out.lines().filter_map(parse_ps_line).collect()
 }
 
-/// Processes of all users from `/bin/ps`, without the `ps` process itself.
-fn run_ps() -> Vec<Raw> {
-  ps_rows(Command::new("/bin/ps").args(["-A", "-o", PS_COLUMNS]))
+/// Real user id of a process; readable for processes of any user.
+fn real_uid(pid: i32) -> Option<u32> {
+  let mut info: libc::proc_bsdshortinfo = unsafe { mem::zeroed() };
+  let size = mem::size_of::<libc::proc_bsdshortinfo>() as c_int;
+  let ptr = &mut info as *mut libc::proc_bsdshortinfo as *mut c_void;
+  let read = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO, 0, ptr, size) };
+  (read == size).then_some(info.pbsi_ruid)
+}
+
+/// `ps` options selecting the processes `(pid, real uid)` libproc can't read. Most go by the name
+/// of their real user (`-U`): `ps` then reads only the processes of these users, for a third of
+/// the CPU of `ps -A`. The rest go by pid (`-p`, which costs more per process): those of the real
+/// user `own` (the setuid `login` of each terminal tab), whose other processes libproc reads, and
+/// those of a user without a name (`name` gives the uid then), as `-U` takes only known users.
+fn ps_selection(
+  procs: &[(i32, u32)],
+  own: u32,
+  mut name: impl FnMut(u32) -> String,
+) -> Vec<String> {
+  let (mut users, mut pids) = (BTreeSet::new(), Vec::new());
+  for &(pid, ruid) in procs {
+    let user = name(ruid);
+    if ruid == own || user.bytes().all(|b| b.is_ascii_digit()) || user.contains(',') {
+      pids.push(pid.to_string());
+    } else {
+      users.insert(user);
+    }
+  }
+
+  let mut select = Vec::new();
+  if !users.is_empty() {
+    select.extend(["-U".to_string(), Vec::from_iter(users).join(",")]);
+  }
+  if !pids.is_empty() {
+    select.extend(["-p".to_string(), pids.join(",")]);
+  }
+  select
+}
+
+/// Processes `select`ed from `/bin/ps`, without the `ps` process itself.
+fn run_ps(select: &[String]) -> Vec<Raw> {
+  ps_rows(Command::new("/bin/ps").args(select).args(["-o", PS_COLUMNS]))
 }
 
 /// Rows `cmd` prints in the `ps` format, without its own process; none when it can't run.
@@ -651,16 +697,18 @@ impl ProcSampler {
 
     list_pids(&mut self.pids);
     let mut rows = Vec::with_capacity(self.pids.len());
-    let mut unreadable = false;
+    let mut unreadable = Vec::new();
     for &pid in &self.pids {
       match read_libproc(pid, self.flavor, self.timebase) {
         Some(raw) => rows.push(raw),
-        None => unreadable = true,
+        None => unreadable.extend(real_uid(pid).map(|ruid| (pid, ruid))),
       }
     }
 
-    if unreadable {
-      rows = merge(rows, run_ps());
+    if !unreadable.is_empty() {
+      let users = &mut self.users;
+      let name = |uid| users.entry(uid).or_insert_with(|| user_name(uid)).clone();
+      rows = merge(rows, run_ps(&ps_selection(&unreadable, unsafe { libc::getuid() }, name)));
     }
     for raw in &mut rows {
       raw.counters.gpu_ns = gpu.get(&raw.pid).copied();
@@ -751,6 +799,7 @@ impl ProcSampler {
         path: path.clone(),
         user,
         cpu_pct: usage.cpu_pct,
+        cpu_time_ns: raw.counters.cpu_ns,
         mem_bytes: raw.mem_bytes,
         power_w: usage.power_w,
         gpu_pct: usage.gpu_pct,
@@ -876,17 +925,22 @@ mod tests {
     assert!(raw.ps);
     let raw = parse_ps_line("574\t0 2624 0:00.03 endpointsecurityd\n").expect("valid");
     assert_eq!((raw.pid, raw.uid, raw.fallback.as_str()), (574, 0, "endpointsecurityd"));
+    // `nobody` is printed signed; its uid has the name
+    let raw = parse_ps_line("  343    -2    192   0:00.03 /usr/libexec/dhcp6d").expect("valid");
+    assert_eq!((raw.pid, raw.uid, user_name(raw.uid).as_str()), (343, 4294967294, "nobody"));
+    assert_eq!(parse_ps_line("1 4294967294 1 0:00.01 cmd").map(|raw| raw.uid), Some(4294967294));
 
     let bad = [
       "",
       "garbage",
-      "1 0 100 0:00.01",       // no command
-      "x 0 100 0:00.01 cmd",   // pid
-      "1 -1 100 0:00.01 cmd",  // uid
-      "1 0 -100 0:00.01 cmd",  // rss
-      "1 0 100 0:61.00 cmd",   // time
-      "1 0 100 cmd",           // missing column
-      "PID UID RSS TIME COMM", // header
+      "1 0 100 0:00.01",             // no command
+      "x 0 100 0:00.01 cmd",         // pid
+      "1 x 100 0:00.01 cmd",         // uid
+      "1 -2147483649 1 0:00.01 cmd", // uid out of range
+      "1 0 -100 0:00.01 cmd",        // rss
+      "1 0 100 0:61.00 cmd",         // time
+      "1 0 100 cmd",                 // missing column
+      "PID UID RSS TIME COMM",       // header
     ];
     for line in bad {
       assert_eq!(parse_ps_line(line), None, "{line:?}");
@@ -915,6 +969,20 @@ mod tests {
   }
 
   #[test]
+  fn ps_selects_other_users_by_name_and_the_rest_by_pid() {
+    let names = HashMap::from([(0, "root"), (88, "_windowserver"), (501, "me"), (7, "a,b")]);
+    let name = |uid: u32| names.get(&uid).map_or(uid.to_string(), |name| name.to_string());
+    // 501 is the own real user: its setuid `login` is unreadable, its other processes aren't
+    let procs = [(1, 0), (427, 88), (431, 0), (83402, 501), (600, 12345), (601, 7), (602, 88)];
+    let select = ps_selection(&procs, 501, name);
+    assert_eq!(select, ["-U", "_windowserver,root", "-p", "83402,600,601"]);
+
+    assert_eq!(ps_selection(&[(1, 0)], 501, name), ["-U", "root"]);
+    assert_eq!(ps_selection(&[(83402, 501)], 501, name), ["-p", "83402"]);
+    assert!(ps_selection(&[], 501, name).is_empty());
+  }
+
+  #[test]
   fn merge_prefers_libproc() {
     let libproc = vec![row(10, SEC, Some(SEC), "libproc"), row(11, 0, Some(0), "own")];
     let ps = vec![row(1, 0, None, "launchd"), row(10, 5 * SEC, None, "ps"), row(12, 0, None, "x")];
@@ -940,6 +1008,7 @@ mod tests {
     let second = sampler.update(vec![row(A, 2 * SEC, None, "a"), row(B, SEC, Some(SEC), "b")], SEC);
     assert_eq!((second[0].cpu_pct, second[0].power_w), (100.0, None)); // no energy counter
     assert_eq!((second[1].cpu_pct, second[1].power_w), (100.0, Some(1.0)));
+    assert_eq!((second[0].cpu_time_ns, second[1].cpu_time_ns), (2 * SEC, SEC)); // the totals
 
     // A new command under the same pid is a new process: no spike, fresh name.
     let third = sampler.update(vec![row(A, 9 * SEC, None, "c")], SEC);
@@ -1101,6 +1170,7 @@ mod tests {
     let second = sampler.sample();
     let me = second.iter().find(|p| p.pid == pid).expect("own process is sampled");
     assert!(me.cpu_pct > 0.0, "cpu_pct = {}", me.cpu_pct);
+    assert!(me.cpu_time_ns > 0);
     assert!(me.power_w.is_none_or(|w| w >= 0.0));
     assert!(second.iter().all(|p| (0.0..=100.0).contains(&p.gpu_pct)));
   }
