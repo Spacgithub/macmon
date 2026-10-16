@@ -1,3 +1,5 @@
+Done: 2026-10-16, PR #17
+
 # Dashboard power details
 
 ## Behavior and decisions
@@ -16,6 +18,13 @@
 ## Tasks
 
 - [x] Add honest component readings, totals and watt history.
-- [ ] Verify missing/zero/VM data and responsive layouts.
-- [ ] Run complete checks and independent review.
-- [ ] Publish the personal-fork PR and verify the installed preview with a retained backup.
+- [x] Verify missing/zero/VM data and responsive layouts.
+- [x] Run complete checks and independent review.
+- [x] Publish the personal-fork PR and verify the installed preview with a retained backup.
+
+## Result
+
+The browser now shows separate system and CPU+GPU+ANE power histories and five component
+readings, preserving tiny positive values in mW and explicit unavailable states. Complete
+checks, independent review, rootless hardware and desktop/narrow browser checks passed;
+the installed preview was refreshed with a retained backup and unchanged settings.

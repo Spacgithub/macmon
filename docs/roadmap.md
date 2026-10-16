@@ -159,6 +159,6 @@ what we need.
       separate terminal monitors.
       Plan: [docs/plans/completed/20261014-dashboard-control.md](plans/completed/20261014-dashboard-control.md).
 
-- [ ] **27. Show detailed browser power readings.** Distinguish the CPU+GPU+ANE subtotal
+- [x] **27. Show detailed browser power readings.** Distinguish the CPU+GPU+ANE subtotal
       from the system estimate, show component watts and retain a scaled 60-sample history.
-      Plan: [docs/plans/20261016-dashboard-power-details.md](plans/20261016-dashboard-power-details.md).
+      Plan: [docs/plans/completed/20261016-dashboard-power-details.md](plans/completed/20261016-dashboard-power-details.md).
