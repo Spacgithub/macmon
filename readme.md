@@ -176,6 +176,14 @@ The dashboard is bundled into the binary and uses no external assets or frontend
 It follows the service sampling interval, retains 60 distinct samples, ranks active interfaces first and keeps
 the full interface list in a scrollable panel. CPU/GPU activity uses active residency ratios.
 
+The Power panel separates the system estimate from the CPU + GPU + ANE subtotal and plots
+both on a shared watt scale over the latest 60 distinct samples. CPU, GPU, ANE, DRAM and GPU
+SRAM readings retain small positive values in milliwatts. The system estimate uses the larger
+of the system sensor reading and the CPU + GPU + ANE subtotal; it is not wall-socket power.
+Memory readings are separate and should not be added to either total. Missing, invalid and
+virtual-machine power stays unavailable; system zero is unavailable. Component zero remains
+a reported value because unsupported counters can also report zero.
+
 Named CPU and GPU temperature readings show Celsius or `Unavailable`. The Processes table
 includes names/PIDs, CPU, GPU and memory, sortable by usage; CPU 100% means one busy core.
 New processes and unavailable rates show a dash. Process sampling runs once per completed

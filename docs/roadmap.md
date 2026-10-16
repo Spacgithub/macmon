@@ -158,3 +158,7 @@ what we need.
       precisely owned launchd job from a small macOS app, preserving login preferences and
       separate terminal monitors.
       Plan: [docs/plans/completed/20261014-dashboard-control.md](plans/completed/20261014-dashboard-control.md).
+
+- [ ] **27. Show detailed browser power readings.** Distinguish the CPU+GPU+ANE subtotal
+      from the system estimate, show component watts and retain a scaled 60-sample history.
+      Plan: [docs/plans/20261016-dashboard-power-details.md](plans/20261016-dashboard-power-details.md).

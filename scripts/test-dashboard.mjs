@@ -65,7 +65,15 @@ class Element extends Target {
   get firstElementChild() { return this.children[0] || null; }
   getContext(kind) {
     assert.equal(kind, '2d');
-    return { setTransform() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {} };
+    this.context ??= { paths: [], dash: [],
+      setTransform() { this.paths = []; },
+      beginPath() { this.points = []; },
+      moveTo(x, y) { this.points.push(['moveTo', x, y]); },
+      lineTo(x, y) { this.points.push(['lineTo', x, y]); },
+      setLineDash(dash) { this.dash = [...dash]; },
+      stroke() { this.paths.push({ color: this.strokeStyle, dash: [...this.dash], points: this.points }); },
+    };
+    return this.context;
   }
 }
 
@@ -142,7 +150,7 @@ function boot({ reduced = false } = {}) {
   };
   const context = vm.createContext({ document, window: { devicePixelRatio: 2 }, console, AbortController,
     performance: { now: () => now }, fetch, matchMedia: () => media,
-    getComputedStyle: () => ({ getPropertyValue: () => '#72d8e8' }),
+    getComputedStyle: () => ({ getPropertyValue: (name) => name === '--power-subtotal' ? '#c1a4e8' : '#72d8e8' }),
     ResizeObserver: class { observe() {} },
     setTimeout: timer, clearTimeout: (id) => timers.delete(id),
     requestAnimationFrame(callback) { const id = nextId++; frames.set(id, callback); return id; },
@@ -193,6 +201,7 @@ function boot({ reduced = false } = {}) {
 function metrics(overrides = {}) {
   return { soc: { chip_name: 'Apple M2 Max', mac_model: 'MacBook Pro', vm: false },
     cpu_active_ratio: 0.25, gpu_active_ratio: 0.5, cpu_power: 8, gpu_power: 4,
+    ane_power: 0, ram_power: 0.7, gpu_ram_power: 0.0005, all_power: 12, sys_power: 20,
     gpu_freq_mhz: 900, cpu_tiers: [{ label: 'E', freq_mhz: 1200 }, { label: 'P', freq_mhz: 2400 }],
     memory: { ram_usage: 8 * 1024 ** 3, ram_total: 32 * 1024 ** 3, swap_usage: 0 },
     temp: { cpu_temp_avg: 45, gpu_temp_avg: 43 },
@@ -314,14 +323,20 @@ await check('real fan identities retain node and phase through reordering', asyn
 
 await check('same identity does not append history; a restart with the same sequence does', async () => {
   const h = boot(); await h.answer(sample({ sequence: 4 }));
-  await nextPoll(h); await h.answer(sample({ sequence: 4, age_ms: 1000 }));
+  await nextPoll(h); await h.answer(sample({ sequence: 4, age_ms: 1000, data: metrics({ sys_power: 1000000 }) }));
   assert.equal(h.state().history.length, 1);
+  assert.equal(h.text('system-power'), '20 W');
+  assert.equal(h.text('power-range'), '0–20 W');
   await nextPoll(h); await h.answer(sample({ sequence: 4, sampled_at: '2026-10-14T12:05:00Z' }));
   assert.equal(h.state().history.length, 2);
   for (let sequence = 5; sequence < 70; sequence++) {
-    await nextPoll(h); await h.answer(sample({ sequence, sampled_at: '2026-10-14T12:05:00Z' }));
+    await nextPoll(h); await h.answer(sample({ sequence, sampled_at: '2026-10-14T12:05:00Z', data: metrics({ sys_power: sequence, all_power: sequence / 2 }) }));
   }
   assert.equal(h.state().history.length, 60);
+  assert.equal(h.state().history[0][3], 10);
+  assert.equal(h.state().history.at(-1)[3], 69);
+  assert.equal(h.elements.get('power-chart').context.paths.at(-1).points.length, 60);
+  assert.equal(h.text('power-range'), '0–100 W');
   assert.equal(h.maximumFetches(), 1);
 });
 
@@ -413,6 +428,58 @@ await check('named temperature readings retain activity and distinguish missing 
   await nextPoll(h); await h.answer(sample({ sequence: 3, data: {} }));
   assert.equal(h.text('cpu-temp'), 'Unavailable'); assert.equal(h.text('gpu-temp'), 'Unavailable');
   assert.match(html, /CPU TEMP/); assert.match(html, /GPU TEMP/);
+});
+
+await check('power keeps provided totals separate from memory and retains tiny positive readings', async () => {
+  const h = boot();
+  await h.answer(sample({ data: metrics({ cpu_power: 8, gpu_power: 4, ane_power: 1.25,
+    ram_power: 7, gpu_ram_power: 0.00003, all_power: 13.25, sys_power: 40,
+    soc: { vm: false, gpu_freqs: [] } }) }));
+  assert.equal(h.text('system-power'), '40 W');
+  assert.equal(h.text('compute-power'), '13.25 W', 'DRAM and GPU SRAM do not increase the supplied subtotal');
+  assert.equal(h.text('cpu-power'), '8 W'); assert.equal(h.text('gpu-power'), '4 W');
+  assert.equal(h.text('ane-power'), '1.25 W'); assert.equal(h.text('ram-power'), '7 W');
+  assert.equal(h.text('gpu_ram-power'), '0.03 mW', 'Positive SRAM power must not round to zero');
+  assert.equal(h.text('gpu-value'), '—', 'Unavailable frequency tables do not hide reported GPU power');
+  await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ cpu_power: 0.00001, gpu_power: 0.125 }) }));
+  assert.equal(h.text('cpu-power'), '0.01 mW'); assert.equal(h.text('gpu-power'), '125 mW');
+  assert.match(h.text('cpu-detail'), /^0.01 mW/); assert.match(h.text('gpu-detail'), /^125 mW/);
+  assert.match(html, /unsupported counters report zero/); assert.match(html, /not wall-socket power/);
+});
+
+await check('power distinguishes reported zeros, invalid readings and VM placeholders', async () => {
+  const h = boot();
+  const ids = ['cpu-power', 'gpu-power', 'ane-power', 'ram-power', 'gpu_ram-power', 'compute-power'];
+  const zeros = { cpu_power: 0, gpu_power: 0, ane_power: 0, ram_power: 0, gpu_ram_power: 0, all_power: 0, sys_power: 0 };
+  await h.answer(sample({ data: metrics(zeros) }));
+  for (const id of ids) assert.equal(h.text(id), '0 W');
+  assert.equal(h.text('system-power'), 'Unavailable');
+  assert.equal(h.text('power-range'), '0–1 W');
+  await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ cpu_power: null, gpu_power: -1,
+    ane_power: NaN, ram_power: Infinity, gpu_ram_power: '5', all_power: undefined, sys_power: -Infinity }) }));
+  for (const id of [...ids, 'system-power']) assert.equal(h.text(id), 'Unavailable');
+  await nextPoll(h); await h.answer(sample({ sequence: 3, data: metrics({ soc: { vm: true } }) }));
+  for (const id of [...ids, 'system-power']) assert.equal(h.text(id), 'Unavailable');
+  assert.ok(Array.from(h.state().history.at(-1).slice(3)).every((value) => value === null));
+  const absent = boot(); await absent.answer(sample({ data: {} }));
+  for (const id of [...ids, 'system-power']) assert.equal(absent.text(id), 'Unavailable');
+  assert.equal(absent.text('power-range'), 'Scale unavailable');
+});
+
+await check('power chart uses separate shared watt-scaled lines and breaks across missing samples', async () => {
+  const h = boot(), traces = () => h.elements.get('power-chart').context.paths.slice(-2);
+  await h.answer(sample({ data: metrics({ sys_power: 40, all_power: 10 }) }));
+  await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ sys_power: 50, all_power: 20 }) }));
+  assert.equal(h.text('power-range'), '0–50 W');
+  const [system, compute] = traces();
+  assert.notEqual(system.color, compute.color); assert.deepEqual(system.dash, []); assert.deepEqual(compute.dash, [5, 4]);
+  assert.deepEqual(system.points.map((point) => point[0]), ['moveTo', 'lineTo']);
+  assert.ok(Math.abs(system.points[0][2] - 14.8) < 0.001);
+  assert.equal(system.points[1][2], 0);
+  assert.ok(Math.abs(compute.points[1][2] - 44.4) < 0.001, '20 W is 40% of the same 50 W range, not a stacked total');
+  await nextPoll(h); await h.answer(sample({ sequence: 3, data: metrics({ sys_power: 0, all_power: null }) }));
+  await nextPoll(h); await h.answer(sample({ sequence: 4, data: metrics({ sys_power: 25, all_power: 5 }) }));
+  for (const trace of traces()) assert.deepEqual(trace.points.map((point) => point[0]), ['moveTo', 'lineTo', 'moveTo']);
 });
 
 await check('all processes sort by real usage with missing rates last and safe names', async () => {
