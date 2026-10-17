@@ -216,14 +216,26 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
 }
 
 function metrics(overrides = {}) {
-  return { soc: { chip_name: 'Apple M2 Max', mac_model: 'MacBook Pro', vm: false },
-    cpu_active_ratio: 0.25, gpu_active_ratio: 0.5, cpu_power: 8, gpu_power: 4,
+  return { soc: { chip_name: 'Apple M2 Max', mac_model: 'MacBook Pro', vm: false, gpu_cores: 38, gpu_freqs: [0, 400, 900, 1400],
+    cpu_tiers: [{ label: 'E', cores: 2, freqs: [600, 1200, 2400] }, { label: 'P', cores: 2, freqs: [600, 2400, 3600] }] },
+    cpu_active_ratio: 0.25, cpu_scaled_ratio: 0.15, gpu_active_ratio: 0.5, gpu_scaled_ratio: 0.3, cpu_power: 8, gpu_power: 4,
     ane_power: 0, ram_power: 0.7, gpu_ram_power: 0.0005, all_power: 12, sys_power: 20,
-    gpu_freq_mhz: 900, cpu_tiers: [{ label: 'E', freq_mhz: 1200 }, { label: 'P', freq_mhz: 2400 }],
+    gpu_freq_mhz: 900, cpu_tiers: [{ label: 'E', freq_mhz: 1200, active_ratio: 0.2, scaled_ratio: 0.1,
+      cores: [0, 1].map((core_id) => ({ die_id: 0, core_id, freq_mhz: 1200, active_ratio: 0.2, scaled_ratio: 0.1 })) },
+      { label: 'P', freq_mhz: 2400, active_ratio: 0.3, scaled_ratio: 0.2,
+        cores: [0, 1].map((core_id) => ({ die_id: 0, core_id, freq_mhz: 2400, active_ratio: 0.3, scaled_ratio: 0.2 })) }],
     memory: { ram_usage: 8 * 1024 ** 3, ram_total: 32 * 1024 ** 3, swap_usage: 0 },
     temp: { cpu_temp_avg: 45, gpu_temp_avg: 43 },
     network: [{ name: 'en0', rx_bytes_per_sec: 1000, tx_bytes_per_sec: 500, rx_bytes: 4096, tx_bytes: 2048 }],
     fans: [{ name: 'fan0', rpm: 1800, max_rpm: 6800 }, { name: 'fan1', rpm: 2400 }], ...overrides };
+}
+function computeFixture(labels = ['E', 'P'], count = 2) {
+  const data = metrics();
+  data.soc.cpu_tiers = labels.map((label) => ({ label, cores: count, freqs: [600, 1200, 2400] }));
+  data.cpu_active_ratio = 0.4; data.cpu_scaled_ratio = 0.2;
+  data.cpu_tiers = labels.map((label) => ({ label, freq_mhz: 1200, active_ratio: 0.4, scaled_ratio: 0.2,
+    cores: Array.from({ length: count }, (_, i) => ({ die_id: Math.floor(i / 12), core_id: i % 12, freq_mhz: 1200, active_ratio: 0.4, scaled_ratio: 0.2 })) }));
+  return data;
 }
 function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, temperatures, memory_activity, thermal_state, disks } = {}) {
   return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, temperatures, memory_activity, thermal_state, disks };
@@ -309,12 +321,12 @@ await check('negative, unknown, zero and sub-byte network rates stay distinct', 
     { name: 'unknown', rx_bytes_per_sec: -1, tx_bytes_per_sec: null, rx_bytes: -1, tx_bytes: null },
   ] }) }));
   const rows = h.elements.get('network-rows').children;
-  assert.equal(rows[0].children[1].textContent, '0.5 B');
-  assert.equal(rows[0].children[2].textContent, '0 B');
-  assert.equal(rows[1].children[1].textContent, '—');
-  assert.equal(rows[1].children[2].textContent, '—');
+  assert.equal(rows[0].children[1].textContent, '0.5 B/s');
+  assert.equal(rows[0].children[2].textContent, '0 B/s');
+  assert.equal(rows[1].children[1].textContent, 'Unavailable');
+  assert.equal(rows[1].children[2].textContent, 'Pending');
   await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ network: [] }) }));
-  assert.match(h.text('network-empty'), /No active interfaces/i);
+  assert.match(h.text('network-empty'), /No interfaces reported/i);
   assert.equal(h.elements.get('network-table').hidden, true);
 });
 
@@ -437,7 +449,7 @@ await check('fetch timeout and invalid envelopes stay bounded and recover', asyn
   assert.equal(h.status(), 'live'); assert.equal(h.maximumFetches(), 1);
 });
 
-await check('all interfaces remain available and busiest interfaces sort first without mutating the sample', async () => {
+await check('all interfaces remain stably named while Auto follows the busiest without mutating the sample', async () => {
   const h = boot();
   const network = Array.from({ length: 21 }, (_, index) => ({
     name: `en${index}`, rx_bytes_per_sec: index, tx_bytes_per_sec: index * 2,
@@ -446,8 +458,9 @@ await check('all interfaces remain available and busiest interfaces sort first w
   await h.answer(sample({ data: metrics({ network }) }));
   const rows = h.elements.get('network-rows').children;
   assert.equal(rows.length, 21);
-  assert.equal(rows[0].children[0].textContent, 'en20');
-  assert.equal(rows.at(-1).children[0].textContent, 'en0');
+  assert.equal(rows[0].children[0].textContent, 'en0');
+  assert.equal(h.text('network-observer'), 'Auto / en20');
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), network.map((row) => row.name).sort((a, b) => a.localeCompare(b)));
   assert.deepEqual(network, before);
 });
 
@@ -646,7 +659,7 @@ await check('panels start compact and native buttons expose individual and all d
     assert.equal(button.tagName, 'BUTTON'); assert.equal(button.getAttribute('type'), 'button');
     assert.equal(button.getAttribute('aria-controls'), `${name}-details`);
     assert.equal(button.getAttribute('aria-expanded'), 'false');
-    if (!['network', 'process'].includes(name)) assert.equal(body.hidden, true);
+    if (name !== 'process') assert.equal(body.hidden, true);
   }
   await h.click('cpu-toggle');
   assert.equal(h.elements.get('cpu-toggle').getAttribute('aria-expanded'), 'true');
@@ -685,21 +698,21 @@ await check('detail preferences reload independently and unavailable or corrupt 
   assert.equal(denied.state().details.cooling, false);
 });
 
-await check('compact tables retain busiest named interfaces and selected-order top processes without losing any rows', async () => {
+await check('compact Network observes one named interface and Processes retains its top five without losing rows', async () => {
   const h = boot(), network = Array.from({ length: 27 }, (_, i) => ({ name: `utun${i}`, rx_bytes_per_sec: i, tx_bytes_per_sec: i * 2 }));
   const processes = Array.from({ length: 80 }, (_, i) => ({ pid: i + 1, name: `process${i}`, cpu_pct: i, mem_bytes: 100 - i }));
   await h.answer(sample({ data: metrics({ network }), processes, processes_age_ms: 0 }));
   const visible = (name) => h.elements.get(`${name}-rows`).children.filter((row) => row.visible);
-  assert.equal(visible('network').length, 3); assert.equal(visible('network')[0].children[0].textContent, 'utun26');
+  assert.equal(visible('network').length, 0); assert.equal(h.text('network-observer'), 'Auto / utun26');
   assert.equal(visible('process').length, 5); assert.match(visible('process')[0].children[0].textContent, /^process79/);
-  assert.equal(h.text('network-count'), '27 INTERFACES'); assert.equal(h.text('process-count'), '80 PROCESSES');
+  assert.equal(h.text('network-count'), '27 OBSERVED / 26 TRAFFIC / 0 PENDING'); assert.equal(h.text('process-count'), '80 PROCESSES');
   assert.match(h.text('network-scope'), /rates are kept separate/); assert.match(h.text('process-scope'), /Top 5 of 80/);
   await h.click('network-toggle'); await h.click('process-toggle');
   assert.equal(visible('network').length, 27); assert.equal(visible('process').length, 80);
   h.elements.get('process-sort').value = 'mem_bytes'; h.elements.get('process-sort').emit('change');
   await h.click('collapse-all');
   assert.match(visible('process')[0].children[0].textContent, /^process0/);
-  assert.equal(visible('network').length, 3); assert.equal(visible('process').length, 5);
+  assert.equal(visible('network').length, 0); assert.equal(visible('process').length, 5);
   assert.equal(h.elements.get('network-rows').children.length, 27);
   assert.equal(h.elements.get('process-rows').children.length, 80);
 });
@@ -1062,6 +1075,185 @@ await check('Disk history stays per generation, gaps unknown rates, keeps select
   assert.equal(h.state().diskSelected, 'a:2');
   await nextPoll(h); await h.answer(sample({ sequence: 67, disks: null }));
   assert.equal(h.state().diskHistory.size, 0); assert.match(h.text('disk-history-label'), /Select/);
+});
+
+await check('CPU GPU and memory details live outside balanced summaries and remain independently accessible', async () => {
+  const h = boot();
+  for (const name of ['cpu', 'gpu', 'ram']) assert.equal(h.elements.get(`${name}-details`).parentElement, h.elements.get('compute-details'));
+  assert.equal(h.elements.get('compute-details').hidden, true);
+  for (const [cpu, gpu] of [[true, false], [true, true], [false, true], [false, false]]) {
+    if (h.state().details.cpu !== cpu) await h.click('cpu-toggle');
+    if (h.state().details.gpu !== gpu) await h.click('gpu-toggle');
+    assert.equal(h.elements.get('cpu-details').hidden, !cpu); assert.equal(h.elements.get('gpu-details').hidden, !gpu);
+    assert.equal(h.elements.get('compute-details').hidden, !(cpu || gpu));
+  }
+  assert.equal(h.elements.get('swap-in-rate').visible, false); assert.equal(h.elements.get('memory-pressure').visible, true);
+  await h.click('ram-toggle'); assert.equal(h.elements.get('swap-in-rate').visible, true);
+  await h.click('network-toggle'); assert.equal(h.elements.get('detail-grid').dataset.expanded, 'true');
+  await h.click('cooling-toggle'); await h.click('network-toggle'); assert.equal(h.elements.get('detail-grid').dataset.expanded, 'true');
+  await h.click('cooling-toggle'); assert.equal(h.elements.get('detail-grid').dataset.expanded, 'false');
+  assert.equal(h.pending().url, '/api/sample');
+});
+
+await check('expanded CPU and GPU expose existing source measurements rather than only a headline graph', async () => {
+  const h = boot(); await h.answer(sample()); await h.click('cpu-toggle'); await h.click('gpu-toggle');
+  assert.equal(h.text('cpu-core-count'), '4 reported / 4 installed cores');
+  assert.equal(h.text('cpu-reported'), '25.0%'); assert.equal(h.text('cpu-weighted'), '15.0%'); assert.equal(h.text('cpu-package-power'), '8 W');
+  assert.equal(h.elements.get('cpu-tier-rows').children.length, 2); assert.equal(h.elements.get('cpu-core-rows').children.length, 4);
+  assert.deepEqual(h.elements.get('cpu-core-rows').children[0].children.map((cell) => cell.textContent), ['E', '0', '0', '20.0%', '10.0%', '1200 MHz']);
+  assert.equal(h.text('gpu-reported'), '50.0%'); assert.equal(h.text('gpu-weighted'), '30.0%');
+  assert.equal(h.text('gpu-frequency'), '900 MHz'); assert.equal(h.text('gpu-range'), '400–1400 MHz');
+  assert.equal(h.text('gpu-cores'), '38'); assert.equal(h.text('gpu-package-power'), '4 W');
+  for (const name of ['cpu', 'gpu']) {
+    const traces = h.elements.get(`${name}-chart`).context.paths.slice(-2);
+    assert.deepEqual(traces[0].dash, []); assert.deepEqual(traces[1].dash, [5, 4]); assert.notEqual(traces[0].color, traces[1].color);
+    assert.match(h.text(`${name}-history`), /0–100% \/ 1\/60 samples/);
+  }
+});
+
+await check('three-tier multi-die CPU rows are complete, stable and scrollable while measurements refresh', async () => {
+  const h = boot(), data = computeFixture(['E', 'P', 'S'], 24);
+  await h.answer(sample({ data })); await h.click('cpu-toggle');
+  const body = h.elements.get('cpu-core-rows'), nodes = [...body.children], scroll = h.elements.get('cpu-core-scroll');
+  assert.equal(nodes.length, 72); assert.equal(h.text('cpu-core-count'), '72 reported / 72 installed cores');
+  assert.deepEqual(nodes.at(-1).children.slice(0, 3).map((cell) => cell.textContent), ['S', '1', '11']);
+  scroll.focus(); scroll.scrollTop = 388;
+  let replaced = 0; const replace = body.replaceChildren.bind(body); body.replaceChildren = (...args) => { replaced++; replace(...args); };
+  const updated = structuredClone(data); updated.cpu_tiers.forEach((tier) => { tier.cores.reverse(); tier.cores.forEach((core) => { core.active_ratio = 0; core.scaled_ratio = 0; }); });
+  await nextPoll(h); await h.answer(sample({ sequence: 2, data: updated }));
+  assert.deepEqual(body.children, nodes); assert.equal(replaced, 0); assert.equal(scroll.scrollTop, 388); assert.equal(h.document.activeElement, scroll);
+  assert.equal(body.children[0].children[3].textContent, '0.0%');
+  await h.click('cpu-toggle'); await h.click('cpu-toggle'); assert.equal(scroll.scrollTop, 388); assert.deepEqual(body.children, nodes);
+});
+
+await check('single-tier tick fallbacks, VMs and incomplete coverage never borrow floored MHz as frequency evidence', async () => {
+  const cases = [];
+  for (const active of [0, 0.4]) {
+    const data = computeFixture(['E']); data.cpu_active_ratio = active; data.cpu_scaled_ratio = active;
+    data.cpu_tiers[0].freq_mhz = 600; data.cpu_tiers[0].active_ratio = active; data.cpu_tiers[0].scaled_ratio = active;
+    data.cpu_tiers[0].cores.forEach((core) => Object.assign(core, { freq_mhz: 0, active_ratio: active, scaled_ratio: active })); cases.push(data);
+  }
+  const partial = computeFixture(); partial.cpu_tiers[1].cores.pop(); cases.push(partial);
+  const vmData = computeFixture(); vmData.soc.vm = true; cases.push(vmData);
+  const noMetadata = computeFixture(); delete noMetadata.soc.cpu_tiers; cases.push(noMetadata);
+  for (const data of cases) {
+    const h = boot(); await h.answer(sample({ data }));
+    assert.equal(h.text('cpu-value'), `${(data.cpu_active_ratio * 100).toFixed(1)}%`); assert.equal(h.text('cpu-weighted'), 'Unavailable');
+    assert.equal(h.state().history[0][7], null);
+    for (const row of h.elements.get('cpu-core-rows').children) { assert.equal(row.children[4].textContent, 'Unavailable'); assert.equal(row.children[5].textContent, 'Not reported'); }
+    for (const row of h.elements.get('cpu-tier-rows').children) assert.equal(row.children[4].textContent, 'Not reported');
+    if (data === partial) assert.equal(h.text('cpu-core-count'), '3 reported / 4 installed cores');
+  }
+});
+
+await check('complete multi-tier idle preserves measured zero activity without inventing active frequency', async () => {
+  const data = computeFixture(); data.cpu_active_ratio = data.cpu_scaled_ratio = 0;
+  data.cpu_tiers.forEach((tier) => { Object.assign(tier, { active_ratio: 0, scaled_ratio: 0, freq_mhz: 600 }); tier.cores.forEach((core) => Object.assign(core, { active_ratio: 0, scaled_ratio: 0, freq_mhz: 0 })); });
+  const h = boot(); await h.answer(sample({ data }));
+  assert.equal(h.text('cpu-value'), '0.0%'); assert.equal(h.text('cpu-weighted'), '0.0%');
+  for (const row of h.elements.get('cpu-core-rows').children) assert.deepEqual(row.children.slice(3).map((cell) => cell.textContent), ['0.0%', '0.0%', 'Not reported']);
+  const single = computeFixture(['S']); await nextPoll(h); await h.answer(sample({ sequence: 2, data: single })); assert.equal(h.text('cpu-weighted'), '20.0%');
+});
+
+await check('missing and malformed CPU fields stay unavailable, raw names are text, and duplicate core identities are not fabricated', async () => {
+  for (const value of [null, -1, 1.01, NaN, Infinity, '0.4', true, {}]) {
+    const h = boot(); await h.answer(sample({ data: metrics({ cpu_active_ratio: value, cpu_scaled_ratio: value, cpu_tiers: [null, {}, { label: 'E', cores: [null, { die_id: -1, core_id: 0 }] }] }) }));
+    assert.equal(h.status(), 'live'); assert.equal(h.text('cpu-value'), '—'); assert.equal(h.text('cpu-weighted'), 'Unavailable');
+    assert.equal(h.elements.get('cpu-core-rows').children.length, 0); assert.equal(h.elements.get('cpu-core-empty').hidden, false);
+  }
+  const data = computeFixture(['<b onload=x>']); data.cpu_tiers[0].cores.push({ ...data.cpu_tiers[0].cores[0] });
+  const h = boot(); await h.answer(sample({ data })); assert.equal(h.elements.get('cpu-tier-rows').children[0].children[0].textContent, '<b onload=x>');
+  assert.equal(h.elements.get('cpu-core-rows').children.length, 2); assert.equal(h.text('cpu-weighted'), 'Unavailable');
+  await nextPoll(h); await h.answer(sample({ sequence: 2, data: {} })); assert.equal(h.text('cpu-core-count'), '0 reported / unknown installed cores');
+});
+
+await check('zero or unavailable GPU frequency never becomes an idle or weighted-availability claim', async () => {
+  const h = boot(); await h.answer(sample({ data: metrics({ gpu_active_ratio: 0, gpu_scaled_ratio: 0, gpu_freq_mhz: 0 }) }));
+  assert.equal(h.text('gpu-value'), '0.0%'); assert.equal(h.text('gpu-reported'), '0.0%'); assert.equal(h.text('gpu-weighted'), 'Unavailable');
+  assert.equal(h.text('gpu-frequency'), 'Not reported'); assert.equal(h.state().history[0][8], null);
+  for (const [index, value] of [null, -1, NaN, Infinity, '900', 0.5].entries()) {
+    await nextPoll(h); await h.answer(sample({ sequence: index + 2, data: metrics({ gpu_freq_mhz: value }) }));
+    assert.equal(h.text('gpu-frequency'), 'Not reported'); assert.equal(h.text('gpu-weighted'), 'Unavailable');
+  }
+  for (const [index, gpu_freqs] of [[], [0], [400], [0, NaN, 900]].entries()) {
+    await nextPoll(h); await h.answer(sample({ sequence: index + 10, data: metrics({ soc: { ...metrics().soc, gpu_freqs } }) }));
+    assert.equal(h.text('gpu-range'), 'Unavailable'); assert.equal(h.text('gpu-weighted'), 'Unavailable');
+  }
+  await nextPoll(h); await h.answer(sample({ sequence: 20, data: metrics({ soc: { ...metrics().soc, vm: true } }) }));
+  for (const id of ['gpu-reported', 'gpu-weighted', 'gpu-range', 'gpu-cores', 'gpu-package-power']) assert.equal(h.text(id), 'Unavailable');
+});
+
+await check('activity histories retain sixty samples with independent weighted gaps, honest statistics and no line across missing data', async () => {
+  const h = boot({ expanded: true }); await h.answer(sample());
+  await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ cpu_active_ratio: null, cpu_scaled_ratio: null, gpu_active_ratio: null, gpu_scaled_ratio: null }) }));
+  await nextPoll(h); await h.answer(sample({ sequence: 3, data: metrics({ cpu_active_ratio: 0, cpu_scaled_ratio: 0, gpu_active_ratio: 0, gpu_scaled_ratio: 0 }) }));
+  assert.match(h.text('cpu-history'), /Activity 2 valid \/ mean 12.5% \/ peak 25.0%/); assert.match(h.text('cpu-history'), /Weighted 2 valid \/ mean 7.5%/);
+  for (const name of ['cpu', 'gpu']) for (const trace of h.elements.get(`${name}-chart`).context.paths.slice(-2)) assert.deepEqual(trace.points.map((point) => point[0]), ['moveTo', 'moveTo']);
+  for (let sequence = 4; sequence <= 66; sequence++) { await nextPoll(h); await h.answer(sample({ sequence })); }
+  assert.equal(h.state().history.length, 60); assert.match(h.text('gpu-history'), /60\/60 samples/);
+});
+
+await check('Network distinguishes unavailable, empty, pending, real zero and traffic without connectivity claims', async () => {
+  const h = boot(); assert.equal(h.text('network-observer'), 'Waiting for a sample');
+  const cases = [
+    [null, 'INTERFACE TELEMETRY UNAVAILABLE', 'Collection unavailable', 'Unavailable', 'Unavailable'],
+    [[], '0 OBSERVED / 0 TRAFFIC / 0 PENDING', 'No observation interface', 'Unavailable', 'Unavailable'],
+    [[{ name: 'en0', rx_bytes_per_sec: null, tx_bytes_per_sec: null }], '1 OBSERVED / 0 TRAFFIC / 1 PENDING', 'Rates pending', 'Pending', 'Pending'],
+    [[{ name: 'en0', rx_bytes_per_sec: 0, tx_bytes_per_sec: 0 }], '1 OBSERVED / 0 TRAFFIC / 0 PENDING', 'Measured zero rates', '0 B/s', '0 B/s'],
+    [[{ name: 'en0', rx_bytes_per_sec: 1024, tx_bytes_per_sec: null }], '1 OBSERVED / 1 TRAFFIC / 1 PENDING', 'Observed traffic', '1 KiB/s', 'Pending'],
+  ];
+  for (const [index, [network, count, status, rx, tx]] of cases.entries()) {
+    if (index) await nextPoll(h); await h.answer(sample({ sequence: index + 1, data: metrics({ network }) }));
+    assert.equal(h.text('network-count'), count); assert.equal(h.text('network-state'), status); assert.equal(h.text('network-rx'), rx); assert.equal(h.text('network-tx'), tx);
+  }
+  assert.match(h.text('network-scope'), /counts may overlap/); assert.match(h.text('network-scope'), /does not establish Internet connectivity/);
+});
+
+await check('Network Auto prefers measured zero over pending, ranks extreme finite rates without overflow and permits overlapping counts', async () => {
+  const h = boot(); await h.answer(sample({ data: metrics({ network: [
+    { name: 'a-pending', rx_bytes_per_sec: null, tx_bytes_per_sec: null }, { name: 'z-zero', rx_bytes_per_sec: 0, tx_bytes_per_sec: 0 },
+  ] }) }));
+  assert.equal(h.text('network-observer'), 'Auto / z-zero'); assert.equal(h.text('network-state'), 'Rates pending');
+  assert.equal(h.text('network-count'), '2 OBSERVED / 0 TRAFFIC / 1 PENDING');
+  await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ network: [
+    { name: 'a-both', rx_bytes_per_sec: Number.MAX_VALUE * 0.9, tx_bytes_per_sec: Number.MAX_VALUE * 0.9 },
+    { name: 'z-both', rx_bytes_per_sec: Number.MAX_VALUE, tx_bytes_per_sec: Number.MAX_VALUE },
+    { name: 'm-partial', rx_bytes_per_sec: Number.MAX_VALUE, tx_bytes_per_sec: null },
+  ] }) }));
+  assert.equal(h.text('network-observer'), 'Auto / z-both'); assert.equal(h.text('network-count'), '3 OBSERVED / 3 TRAFFIC / 1 PENDING');
+  assert.equal(h.text('network-rx'), '1.56e+290 EiB/s'); assert.equal(h.text('network-tx'), '1.56e+290 EiB/s');
+  const partial = h.elements.get('network-rows').children.find((row) => row.children[0].textContent === 'm-partial');
+  assert.equal(partial.children[1].textContent, '1.56e+290 EiB/s'); assert.equal(partial.children[2].textContent, 'Pending');
+  await nextPoll(h); await h.answer(sample({ sequence: 3, data: metrics({ network: [
+    { name: 'z-pending', rx_bytes_per_sec: null, tx_bytes_per_sec: null }, { name: 'a-pending', rx_bytes_per_sec: null, tx_bytes_per_sec: null },
+  ] }) }));
+  assert.equal(h.text('network-observer'), 'Auto / a-pending'); assert.equal(h.text('network-state'), 'Rates pending');
+});
+
+await check('Network status follows live sample age and retains cached traffic through offline waiting stale and recovery', async () => {
+  const h = boot({ expanded: true }); await h.answer(sample());
+  const body = h.elements.get('network-rows'), nodes = [...body.children], scroll = h.elements.get('network-details');
+  scroll.focus(); scroll.scrollTop = 120;
+  let replaced = 0; const replace = body.replaceChildren.bind(body); body.replaceChildren = (...args) => { replaced++; replace(...args); };
+  assert.equal(h.text('network-state'), 'Observed traffic');
+  await nextPoll(h); await h.fail(); assert.equal(h.status(), 'offline'); assert.equal(h.text('network-state'), 'Retained / Observed traffic');
+  await nextPoll(h); await h.answer(null, 503); assert.equal(h.status(), 'waiting'); assert.equal(h.text('network-state'), 'Retained / Observed traffic');
+  await nextPoll(h); await h.answer(sample({ sequence: 2, age_ms: 2990 })); assert.equal(h.text('network-state'), 'Observed traffic');
+  await h.advance(12); assert.equal(h.status(), 'stale'); assert.equal(h.text('network-state'), 'Retained / Observed traffic');
+  await nextPoll(h); await h.answer(sample({ sequence: 3 })); assert.equal(h.status(), 'live'); assert.equal(h.text('network-state'), 'Observed traffic');
+  assert.deepEqual(body.children, nodes); assert.equal(replaced, 0); assert.equal(h.document.activeElement, scroll); assert.equal(scroll.scrollTop, 120);
+});
+
+await check('Network Auto selects only one interface with deterministic ties and stable complete detail rows', async () => {
+  const h = boot(), network = [{ name: 'utun1', rx_bytes_per_sec: 2048, tx_bytes_per_sec: 1024 }, { name: 'en0', rx_bytes_per_sec: 2048, tx_bytes_per_sec: 1024 }, { name: 'bridge0', rx_bytes_per_sec: null, tx_bytes_per_sec: 0 }];
+  await h.answer(sample({ data: metrics({ network }) })); await h.click('network-toggle');
+  assert.equal(h.text('network-observer'), 'Auto / en0'); assert.equal(h.text('network-rx'), '2 KiB/s'); assert.equal(h.text('network-tx'), '1 KiB/s');
+  const body = h.elements.get('network-rows'), nodes = [...body.children], scroll = h.elements.get('network-details'); scroll.scrollTop = 123; scroll.focus();
+  let replaced = 0; const replace = body.replaceChildren.bind(body); body.replaceChildren = (...args) => { replaced++; replace(...args); };
+  await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ network: [...network].reverse().map((item) => item.name === 'utun1' ? { ...item, rx_bytes_per_sec: 4096 } : item) }) }));
+  assert.equal(h.text('network-observer'), 'Auto / utun1'); assert.equal(h.text('network-rx'), '4 KiB/s');
+  assert.deepEqual(body.children, nodes); assert.equal(replaced, 0); assert.equal(h.document.activeElement, scroll); assert.equal(scroll.scrollTop, 123);
+  assert.equal(body.children.length, 3); await h.click('network-toggle'); assert.equal(body.children.length, 3);
 });
 
 console.log(`${tests.length} dashboard checks passed.`);

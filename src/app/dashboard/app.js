@@ -2,6 +2,9 @@
 const $ = (id) => document.getElementById(id);
 const unknown = "\u2014";
 const finite = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+const ratio = (value) => finite(value) && value <= 1 ? value : null;
+const residency = (value) => ratio(value) === null ? "Unavailable" : percent(value);
+const frequency = (value) => Number.isSafeInteger(value) && value > 0 && value <= 4294967295 ? value : null;
 const number = (value, digits = 1) => finite(value) ? value.toFixed(digits) : unknown;
 const percent = (value) => finite(value) ? `${(Math.min(value, 1) * 100).toFixed(1)}%` : unknown;
 const put = (id, value) => { $(id).textContent = value; };
@@ -12,7 +15,7 @@ function loadDetails() {
   try { saved = JSON.parse(localStorage.getItem(preferenceKey)); } catch { /* Browser storage is optional. */ }
   return Object.fromEntries(Object.keys(panelNames).map((name) => [name, saved?.[name] === true]));
 }
-const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], disks: new Map(), diskHistory: new Map(), diskSelected: null, frame: 0, last: 0, cadence: null, changing: false, intervalError: false, details: loadDetails() };
+const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], disks: new Map(), diskHistory: new Map(), diskSelected: null, cpuTierRows: new Map(), cpuCoreRows: new Map(), networkRows: new Map(), networkStatus: "Waiting for rates", frame: 0, last: 0, cadence: null, changing: false, intervalError: false, details: loadDetails() };
 const motion = $("motion");
 const reduced = matchMedia("(prefers-reduced-motion: reduce)");
 motion.checked = !reduced.matches;
@@ -35,6 +38,62 @@ function memoryActivity(sample) {
   put("memory-pressure", level === "unavailable" ? "Unavailable" : level[0].toUpperCase() + level.slice(1));
   put("swap-in-rate", finite(activity?.swap_in_bytes_per_sec) ? `${bytes(activity.swap_in_bytes_per_sec)}/s` : "Unavailable");
   put("swap-out-rate", finite(activity?.swap_out_bytes_per_sec) ? `${bytes(activity.swap_out_bytes_per_sec)}/s` : "Unavailable");
+}
+function measuredRows(id, cache, items, headings) {
+  const next = new Map(), nodes = items.map(([key, values]) => {
+    const row = cache.get(key) || document.createElement("tr");
+    if (!row.children.length) headings.forEach((heading) => { const cell = document.createElement("td"); cell.dataset.label = heading; row.append(cell); });
+    values.forEach((value, index) => { if (row.children[index].textContent !== value) row.children[index].textContent = value; });
+    next.set(key, row); return row;
+  });
+  diskChildren($(id), nodes);
+  return next;
+}
+function computeDetails(metrics, gpuUnavailable) {
+  const soc = metrics.soc || {}, raw = Array.isArray(metrics.cpu_tiers) ? metrics.cpu_tiers : [], info = Array.isArray(soc.cpu_tiers) ? soc.cpu_tiers : [];
+  const tiers = raw.flatMap((tier, index) => {
+    const label = diskText(tier?.label, 32);
+    if (!label) return [];
+    const metadata = info[index]?.label === label ? info[index] : null, installed = diskInteger(metadata?.cores) > 0 && metadata.cores <= 255 ? metadata.cores : null;
+    const seen = new Set(), reported = Array.isArray(tier.cores) ? tier.cores : [];
+    const cores = reported.filter((core) => {
+      if (!core || diskInteger(core.die_id) === null || diskInteger(core.core_id) === null) return false;
+      const key = `${core.die_id}/${core.core_id}`;
+      if (seen.has(key)) return false;
+      seen.add(key); return true;
+    }).slice().sort((a, b) => a.die_id - b.die_id || a.core_id - b.core_id);
+    const complete = installed > 0 && cores.length === installed && cores.length === reported.length
+      && Array.isArray(metadata?.freqs) && metadata.freqs.length > 0 && metadata.freqs.every((value) => frequency(value) !== null)
+      && cores.every((core) => ratio(core.active_ratio) !== null && ratio(core.scaled_ratio) !== null && (frequency(core.freq_mhz) !== null || (core.freq_mhz === 0 && core.active_ratio === 0)));
+    return [{ tier, label, index, installed, cores, complete }];
+  });
+  // A single-tier tick fallback can retain a positive, floored tier MHz even with a SoC table.
+  const weighted = !soc.vm && tiers.length > 0 && tiers.length === raw.length && tiers.length === info.length
+    && tiers.every((item) => item.complete && ratio(item.tier.active_ratio) !== null && ratio(item.tier.scaled_ratio) !== null)
+    && (tiers.length > 1 || tiers.some((item) => item.cores.some((core) => frequency(core.freq_mhz) !== null)));
+  const total = tiers.reduce((sum, item) => sum + item.cores.length, 0), installed = tiers.length > 0 && tiers.length === info.length && tiers.every((item) => item.installed !== null) ? tiers.reduce((sum, item) => sum + item.installed, 0) : null;
+  put("cpu-core-count", `${total} reported / ${installed === null ? "unknown" : installed} installed cores`);
+  put("cpu-reported", residency(metrics.cpu_active_ratio));
+  put("cpu-weighted", residency(weighted ? metrics.cpu_scaled_ratio : null));
+  put("cpu-package-power", watts(soc.vm ? null : metrics.cpu_power));
+  const tierFrequency = (item) => weighted && item.cores.some((core) => frequency(core.freq_mhz) !== null) ? frequency(item.tier.freq_mhz) : null;
+  state.cpuTierRows = measuredRows("cpu-tier-rows", state.cpuTierRows, tiers.map((item) => [`${item.index}/${item.label}`, [item.label,
+    `${item.cores.length} / ${item.installed === null ? "unknown" : item.installed}`, residency(item.cores.length ? item.tier.active_ratio : null), residency(weighted ? item.tier.scaled_ratio : null), tierFrequency(item) === null ? "Not reported" : `${tierFrequency(item)} MHz`]]),
+  ["Type", "Reported / installed cores", "Activity", "Weighted", "Aggregate MHz"]);
+  state.cpuCoreRows = measuredRows("cpu-core-rows", state.cpuCoreRows, tiers.flatMap((item) => item.cores.map((core) => [`${item.index}/${item.label}/${core.die_id}/${core.core_id}`,
+    [item.label, String(core.die_id), String(core.core_id), residency(core.active_ratio), residency(weighted ? core.scaled_ratio : null), weighted && frequency(core.freq_mhz) !== null ? `${core.freq_mhz} MHz` : "Not reported"]])),
+  ["Type", "Die", "Core", "Activity", "Weighted", "Active MHz"]);
+  $("cpu-tier-table").hidden = !tiers.length; $("cpu-core-table").hidden = !total; $("cpu-core-empty").hidden = !!total;
+  put("cpu-detail", `${watts(soc.vm ? null : metrics.cpu_power)} / ${tiers.map((item) => `${item.label} ${tierFrequency(item) === null ? "frequency unavailable" : `${tierFrequency(item)} MHz`}`).join(" / ") || "Tier telemetry unavailable"}`);
+  const frequencies = !soc.vm && Array.isArray(soc.gpu_freqs) && soc.gpu_freqs.length > 1 && soc.gpu_freqs.every((value) => value === 0 || frequency(value) !== null) ? soc.gpu_freqs.slice(1).filter((value) => frequency(value) !== null) : [];
+  const gpuFrequency = !gpuUnavailable && frequencies.length ? frequency(metrics.gpu_freq_mhz) : null, gpuWeighted = gpuFrequency === null ? null : ratio(metrics.gpu_scaled_ratio);
+  put("gpu-reported", residency(gpuUnavailable ? null : metrics.gpu_active_ratio)); put("gpu-weighted", residency(gpuWeighted));
+  put("gpu-frequency", gpuFrequency === null ? "Not reported" : `${gpuFrequency} MHz`);
+  put("gpu-range", frequencies.length ? `${frequencies.reduce((min, value) => Math.min(min, value))}–${frequencies.reduce((max, value) => Math.max(max, value))} MHz` : "Unavailable");
+  put("gpu-cores", !soc.vm && diskInteger(soc.gpu_cores) > 0 && soc.gpu_cores <= 255 ? String(soc.gpu_cores) : "Unavailable");
+  put("gpu-package-power", watts(soc.vm ? null : metrics.gpu_power));
+  put("gpu-detail", `${watts(soc.vm ? null : metrics.gpu_power)} / ${gpuFrequency === null ? "Active frequency not reported" : `${gpuFrequency} MHz`}`);
+  return [weighted ? ratio(metrics.cpu_scaled_ratio) : null, gpuWeighted];
 }
 const diskInteger = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
 const diskByte = (value, maximum = 255) => diskInteger(value) !== null && value <= maximum ? value : null;
@@ -234,9 +293,7 @@ function moving() { return state.details.cooling && live() && !document.hidden &
 function rowDetails(name, limit) {
   const rows = [...$(`${name}-rows`).children], all = state.details[name];
   rows.forEach((row, index) => { row.hidden = !all && index >= limit; });
-  put(`${name}-scope`, name === "network"
-    ? `${all ? "All" : `Top ${Math.min(limit, rows.length)}`} of ${rows.length} interfaces by current traffic; rates are kept separate.`
-    : `${all ? "All" : `Top ${Math.min(limit, rows.length)}`} of ${rows.length} processes in the selected order.`);
+  put(`${name}-scope`, `${all ? "All" : `Top ${Math.min(limit, rows.length)}`} of ${rows.length} processes in the selected order.`);
 }
 function applyDetails() {
   for (const [name, label] of Object.entries(panelNames)) {
@@ -245,11 +302,13 @@ function applyDetails() {
     button.setAttribute("aria-label", `${all ? "Less" : "Show"} ${label} details`);
     button.textContent = all ? "Less" : "Details";
     body.dataset.expanded = String(all);
-    if (name === "network" || name === "process") {
-      body.setAttribute("aria-label", `${name === "network" ? "Network interfaces" : "Processes"}; ${all ? "scroll to see all" : "expand details to see all"}`);
-      rowDetails(name, name === "network" ? 3 : 5);
+    if (name === "process") {
+      body.setAttribute("aria-label", `Processes; ${all ? "scroll to see all" : "expand details to see all"}`);
+      rowDetails(name, 5);
     } else body.hidden = !all;
   }
+  $("compute-details").hidden = !["cpu", "gpu", "ram"].some((name) => state.details[name]);
+  $("detail-grid").dataset.expanded = String(state.details.network || state.details.cooling);
   diskScope();
   drawCharts();
   settle();
@@ -264,6 +323,7 @@ function settle() {
   const status = state.waiting ? "waiting" : state.online === null ? "connecting" : !state.online ? "offline" : live() ? "live" : "stale";
   $("status").dataset.state = status;
   put("status", status.toUpperCase());
+  put("network-state", `${state.sample && !live() ? "Retained / " : ""}${state.networkStatus}`);
   const processAge = finite(state.sample?.processes_age_ms) ? state.sample.processes_age_ms + performance.now() - state.received : Infinity;
   const processState = state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : processAge > limit() ? "STALE / " : "";
   put("process-status", Array.isArray(state.sample?.processes) ? `${processState}${finite(processAge) ? `${Math.floor(processAge / 1000)}s old` : "Age unavailable"} / CPU 100% = one core` : "Unavailable for this request");
@@ -295,8 +355,14 @@ function animate(now) {
   state.frame = requestAnimationFrame(animate);
 }
 function drawCharts() {
-  const color = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
   ["cpu", "gpu", "ram"].forEach((name, index) => {
+    if (name !== "ram") {
+      const summary = (column) => {
+        const values = state.history.map((point) => point[column]).filter((value) => ratio(value) !== null);
+        return values.length ? `${values.length} valid / mean ${residency(values.reduce((sum, value) => sum + value, 0) / values.length)} / peak ${residency(Math.max(...values))}` : "Unavailable";
+      };
+      put(`${name}-history`, `0–100% / ${state.history.length}/60 samples · Activity ${summary(index)} · Weighted ${summary(index + 7)}`);
+    }
     const canvas = $(`${name}-chart`);
     const context = canvas.getContext("2d");
     const width = canvas.clientWidth, height = canvas.clientHeight, scale = window.devicePixelRatio || 1;
@@ -307,18 +373,21 @@ function drawCharts() {
     context.strokeStyle = "#29394c";
     context.lineWidth = 1;
     for (const ratio of [0.25, 0.5, 0.75]) { context.beginPath(); context.moveTo(0, ratio * height); context.lineTo(width, ratio * height); context.stroke(); }
-    context.beginPath();
-    context.strokeStyle = color;
-    context.lineWidth = 1.7;
-    let connected = false;
-    state.history.forEach((values, point) => {
-      const value = values[index];
-      if (!finite(value)) { connected = false; return; }
-      const x = width * (60 - state.history.length + point) / 59, y = height * (1 - Math.min(value, 1));
-      if (connected) context.lineTo(x, y); else context.moveTo(x, y);
-      connected = true;
+    (name === "ram" ? [index] : [index, index + 7]).forEach((column, series) => {
+      context.beginPath(); context.setLineDash(series ? [5, 4] : []);
+      context.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue(series ? "--power-subtotal" : "--accent").trim();
+      context.lineWidth = 1.7;
+      let connected = false;
+      state.history.forEach((values, point) => {
+        const value = values[column];
+        if (ratio(value) === null) { connected = false; return; }
+        const x = width * (60 - state.history.length + point) / 59, y = height * (1 - value);
+        if (connected) context.lineTo(x, y); else context.moveTo(x, y);
+        connected = true;
+      });
+      context.stroke();
     });
-    context.stroke();
+    context.setLineDash([]);
   });
   drawPowerChart();
   drawTemperatureChart();
@@ -406,24 +475,24 @@ function temperatures(sample) {
   }));
 }
 function network(metrics) {
-  const rows = Array.isArray(metrics.network) ? metrics.network.filter((item) => item && typeof item.name === "string") : [];
-  const traffic = (item) => [item.rx_bytes_per_sec, item.tx_bytes_per_sec].reduce((sum, rate) => sum + (finite(rate) ? rate : 0), 0);
-  rows.sort((a, b) => traffic(b) - traffic(a) || a.name.localeCompare(b.name));
+  const seen = new Set(), rows = Array.isArray(metrics.network) ? metrics.network.filter((item) => {
+    if (!diskText(item?.name, 160) || seen.has(item.name)) return false;
+    seen.add(item.name); return true;
+  }).slice().sort((a, b) => a.name.localeCompare(b.name)) : [];
+  const rates = (item) => [item.rx_bytes_per_sec, item.tx_bytes_per_sec], traffic = (item) => rates(item).reduce((sum, rate) => sum + (finite(rate) ? rate / 2 : 0), 0);
+  const selected = rows.slice().sort((a, b) => Number(rates(b).some(finite)) - Number(rates(a).some(finite)) || traffic(b) - traffic(a) || a.name.localeCompare(b.name))[0];
+  const available = Array.isArray(metrics.network) && (!metrics.network.length || rows.length > 0);
+  const active = rows.filter((item) => rates(item).some((value) => finite(value) && value > 0)).length, pending = rows.filter((item) => !rates(item).every(finite)).length;
+  const rate = (value) => finite(value) ? `${diskBytes(value)}/s` : value == null ? "Pending" : "Unavailable";
   $("network-table").hidden = !rows.length;
   $("network-empty").hidden = !!rows.length;
-  put("network-empty", Array.isArray(metrics.network) ? "No active interfaces reported." : "Network telemetry unavailable.");
-  put("network-count", `${rows.length} INTERFACES`);
-  $("network-rows").replaceChildren(...rows.map((item) => {
-    const row = document.createElement("tr");
-    [item.name, bytes(item.rx_bytes_per_sec), bytes(item.tx_bytes_per_sec), bytes(item.rx_bytes), bytes(item.tx_bytes)].forEach((value, index) => {
-      const cell = document.createElement("td");
-      cell.textContent = value;
-      cell.dataset.label = ["Interface", "RX / s", "TX / s", "RX total", "TX total"][index];
-      row.append(cell);
-    });
-    return row;
-  }));
-  rowDetails("network", 3);
+  put("network-empty", available ? "No interfaces reported." : "Network telemetry unavailable.");
+  put("network-count", available ? `${rows.length} OBSERVED / ${active} TRAFFIC / ${pending} PENDING` : "INTERFACE TELEMETRY UNAVAILABLE");
+  put("network-observer", selected ? `Auto / ${selected.name}` : available ? "Auto / no interface" : "Auto / unavailable");
+  put("network-rx", selected ? rate(selected.rx_bytes_per_sec) : "Unavailable"); put("network-tx", selected ? rate(selected.tx_bytes_per_sec) : "Unavailable");
+  state.networkStatus = !available ? "Collection unavailable" : !rows.length ? "No observation interface" : active ? "Observed traffic" : pending ? "Rates pending" : "Measured zero rates";
+  put("network-scope", "Auto selects one busiest observed interface; rates are kept separate. Traffic and pending counts may overlap. This does not establish Internet connectivity.");
+  state.networkRows = measuredRows("network-rows", state.networkRows, rows.map((item) => [item.name, [item.name, rate(item.rx_bytes_per_sec), rate(item.tx_bytes_per_sec), diskBytes(diskInteger(item.rx_bytes)), diskBytes(diskInteger(item.tx_bytes))]]), ["Interface", "RX / s", "TX / s", "RX total", "TX total"]);
 }
 function cooling(metrics) {
   const next = new Map();
@@ -483,17 +552,15 @@ function update(sample) {
   const gpuUnavailable = vm || (Array.isArray(frequencies) && !frequencies.some((frequency, index) => index > 0 && finite(frequency) && frequency > 0));
   const gpu = gpuUnavailable ? null : metrics.gpu_active_ratio;
   const ram = finite(memory.ram_usage) && finite(memory.ram_total) && memory.ram_total > 0 ? memory.ram_usage / memory.ram_total : null;
-  put("cpu-value", percent(metrics.cpu_active_ratio));
-  put("gpu-value", percent(gpu));
+  put("cpu-value", percent(ratio(metrics.cpu_active_ratio)));
+  put("gpu-value", percent(ratio(gpu)));
   put("ram-value", percent(ram));
-  const tiers = vm ? unknown : (Array.isArray(metrics.cpu_tiers) ? metrics.cpu_tiers : []).map((tier) => `${tier.label} ${number(tier.freq_mhz, 0)} MHz`).join(" / ") || unknown;
   for (const name of ["cpu", "gpu"]) {
     const value = vm ? null : metrics.temp?.[`${name}_temp_avg`];
     put(`${name}-temp`, celsius(value));
     put(`cooling-${name}-temp`, celsius(value));
   }
-  put("cpu-detail", `${watts(vm ? null : metrics.cpu_power)} / ${tiers}`);
-  put("gpu-detail", `${watts(vm ? null : metrics.gpu_power)} / ${number(gpuUnavailable ? null : metrics.gpu_freq_mhz, 0)} MHz`);
+  const weighted = computeDetails(metrics, gpuUnavailable);
   put("ram-detail", `${bytes(memory.ram_usage)} used / ${bytes(memory.ram_total)} total / Swap ${bytes(memory.swap_usage)} used / ${bytes(memory.swap_total)} allocated`);
   put("ram-summary", `${bytes(memory.ram_usage)} / ${bytes(memory.ram_total)}`);
   memoryActivity(sample);
@@ -502,7 +569,7 @@ function update(sample) {
   put("thermal-state", thermal === "unavailable" ? "Unavailable" : thermal[0].toUpperCase() + thermal.slice(1));
   put("device", [metrics.soc?.chip_name || "Local device", metrics.soc?.mac_model, vm ? "Virtual machine" : ""].filter(Boolean).join(" / "));
   put("sample-time", `Sample ${new Date(sample.sampled_at).toLocaleTimeString("en-US", { hour12: false })}`);
-  state.history.push([metrics.cpu_active_ratio, gpu, ram, ...power(metrics), ...["cpu", "gpu"].map((name) => vm ? null : metrics.temp?.[`${name}_temp_avg`])]);
+  state.history.push([ratio(metrics.cpu_active_ratio), ratio(gpu), ram, ...power(metrics), ...["cpu", "gpu"].map((name) => vm ? null : metrics.temp?.[`${name}_temp_avg`]), ...weighted]);
   if (state.history.length > 60) state.history.shift();
   network(metrics);
   disks(sample);
@@ -573,6 +640,6 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) controller?.abort("hidden"); else { state.urgent = true; poll(); }
   settle();
 });
-new ResizeObserver(drawCharts).observe($("cpu-chart").parentElement.parentElement);
+new ResizeObserver(drawCharts).observe($("dashboard"));
 applyDetails();
 poll();
