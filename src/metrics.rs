@@ -14,6 +14,7 @@ use crate::sources::{
   IOHIDSensors, IOReport, IOReportIteratorItem, SMC, SocInfo, cfio_get_residencies, cfio_watts,
   cpu_load_ticks, get_soc_info, libc_ram, libc_swap,
 };
+use crate::temperature::{TemperatureGroup, TemperatureReading, TemperatureSource};
 
 type WithError<T> = Result<T, Box<dyn std::error::Error>>;
 type CpuCoreKey = String;
@@ -217,6 +218,64 @@ fn is_valid_temp(val: f32) -> bool {
 fn temperature_average(values: &[f32]) -> Option<f32> {
   let valid: Vec<f32> = values.iter().copied().filter(|&val| is_valid_temp(val)).collect();
   (!valid.is_empty()).then(|| valid.iter().sum::<f32>() / valid.len() as f32)
+}
+
+fn temperature_snapshot(
+  readings: impl IntoIterator<Item = (String, TemperatureGroup, f32)>,
+  source: TemperatureSource,
+) -> (TempMetrics, Vec<TemperatureReading>) {
+  let mut details: Vec<_> = readings
+    .into_iter()
+    .filter(|(_, _, value)| is_valid_temp(*value))
+    .map(|(name, group, celsius)| TemperatureReading { name, group, source, celsius })
+    .collect();
+  let average = |group| {
+    temperature_average(
+      &details
+        .iter()
+        .filter(|reading| reading.group == group)
+        .map(|r| r.celsius)
+        .collect::<Vec<_>>(),
+    )
+  };
+  // Calculate in the original read order: sorting or deduplicating first can change the averages.
+  let metrics = TempMetrics {
+    cpu_temp_avg: average(TemperatureGroup::Cpu),
+    gpu_temp_avg: average(TemperatureGroup::Gpu),
+  };
+  details.sort_by(|a, b| a.group.cmp(&b.group).then_with(|| a.name.cmp(&b.name)));
+  (metrics, details)
+}
+
+fn smc_temperature_snapshot(
+  cpu_keys: &[String],
+  gpu_keys: &[String],
+  mut read: impl FnMut(&str) -> WithError<f32>,
+) -> WithError<(TempMetrics, Vec<TemperatureReading>)> {
+  let mut readings = Vec::new();
+  for (keys, group) in [(cpu_keys, TemperatureGroup::Cpu), (gpu_keys, TemperatureGroup::Gpu)] {
+    for name in keys {
+      readings.push((name.clone(), group, read(name)?));
+    }
+  }
+  Ok(temperature_snapshot(readings, TemperatureSource::Smc))
+}
+
+fn hid_temperature_snapshot(
+  readings: Vec<(String, f32)>,
+) -> (TempMetrics, Vec<TemperatureReading>) {
+  let readings = readings.into_iter().filter_map(|(name, value)| {
+    let group =
+      if name.starts_with("pACC MTR Temp Sensor") || name.starts_with("eACC MTR Temp Sensor") {
+        TemperatureGroup::Cpu
+      } else if name.starts_with("GPU MTR Temp Sensor") {
+        TemperatureGroup::Gpu
+      } else {
+        return None;
+      };
+    Some((name, group, value))
+  });
+  temperature_snapshot(readings, TemperatureSource::Hid)
 }
 
 fn is_valid_fan_rpm(val: f32) -> bool {
@@ -539,6 +598,7 @@ pub struct Sampler {
   smc_cpu_keys: Vec<String>,
   smc_gpu_keys: Vec<String>,
   smc_fan_keys: Vec<String>,
+  temperature_details: Vec<TemperatureReading>,
 }
 
 impl Sampler {
@@ -564,6 +624,7 @@ impl Sampler {
       smc_cpu_keys: smc_sensors.cpu_keys,
       smc_gpu_keys: smc_sensors.gpu_keys,
       smc_fan_keys: smc_sensors.fan_keys,
+      temperature_details: Vec::new(),
     })
   }
 
@@ -575,57 +636,25 @@ impl Sampler {
     Ok(sampler)
   }
 
-  fn get_temp_smc(&mut self) -> WithError<TempMetrics> {
+  fn get_temp_smc(&mut self) -> WithError<(TempMetrics, Vec<TemperatureReading>)> {
     let smc = self.smc.as_mut().ok_or("SMC unavailable")?;
-    let mut cpu_metrics = Vec::new();
-    for sensor in &self.smc_cpu_keys {
-      cpu_metrics.push(smc.read_float_val(sensor)?);
-    }
-
-    let mut gpu_metrics = Vec::new();
-    for sensor in &self.smc_gpu_keys {
-      gpu_metrics.push(smc.read_float_val(sensor)?);
-    }
-
-    let cpu_temp_avg = temperature_average(&cpu_metrics);
-    let gpu_temp_avg = temperature_average(&gpu_metrics);
-
-    Ok(TempMetrics { cpu_temp_avg, gpu_temp_avg })
+    smc_temperature_snapshot(&self.smc_cpu_keys, &self.smc_gpu_keys, |key| smc.read_float_val(key))
   }
 
-  fn get_temp_hid(&mut self) -> WithError<TempMetrics> {
-    let metrics = self.hid.get_metrics();
-
-    let mut cpu_values = Vec::new();
-    let mut gpu_values = Vec::new();
-
-    for (name, value) in &metrics {
-      if name.starts_with("pACC MTR Temp Sensor") || name.starts_with("eACC MTR Temp Sensor") {
-        // println!("{}: {}", name, value);
-        cpu_values.push(*value);
-        continue;
-      }
-
-      if name.starts_with("GPU MTR Temp Sensor") {
-        // println!("{}: {}", name, value);
-        gpu_values.push(*value);
-        continue;
-      }
-    }
-
-    let cpu_temp_avg = temperature_average(&cpu_values);
-    let gpu_temp_avg = temperature_average(&gpu_values);
-
-    Ok(TempMetrics { cpu_temp_avg, gpu_temp_avg })
+  fn get_temp_hid(&mut self) -> WithError<(TempMetrics, Vec<TemperatureReading>)> {
+    Ok(hid_temperature_snapshot(self.hid.get_metrics()))
   }
 
   fn get_temp(&mut self) -> WithError<TempMetrics> {
+    self.temperature_details.clear();
     // HID for M1, SMC for M2/M3
     // UPD: Looks like HID/SMC related to OS version, not to the chip (SMC available from macOS 14)
-    match !self.smc_cpu_keys.is_empty() {
+    let (metrics, details) = match !self.smc_cpu_keys.is_empty() {
       true => self.get_temp_smc(),
       false => self.get_temp_hid(),
-    }
+    }?;
+    self.temperature_details = details;
+    Ok(metrics)
   }
 
   fn get_fans(&mut self) -> Vec<FanMetric> {
@@ -740,6 +769,7 @@ impl Sampler {
   ///
   /// `duration` is the requested polling interval in milliseconds.
   pub fn get_metrics(&mut self, duration: u32) -> WithError<Metrics> {
+    self.temperature_details.clear();
     // CPU Stats channel naming by chip family (see: https://github.com/vladkens/macmon/issues/47)
     //   M1-M4:  ECPU* = efficiency cores (lower tier)
     //           PCPU* = performance cores (top tier)
@@ -794,6 +824,15 @@ impl Sampler {
   pub fn get_soc_info(&self) -> &SocInfo {
     &self.soc
   }
+
+  /// Valid named CPU/GPU readings from the last successful [`Self::get_metrics`] acquisition.
+  ///
+  /// Empty before the first acquisition and after a failed acquisition. Entries are sorted by
+  /// group and original sensor name; duplicate readings are retained, as in the averages.
+  /// This does not read hardware or add fields to [`Metrics`] or [`TempMetrics`].
+  pub fn temperature_details(&self) -> &[TemperatureReading] {
+    &self.temperature_details
+  }
 }
 
 #[cfg(test)]
@@ -808,13 +847,14 @@ mod tests {
   use super::{
     CpuCoreKind, CpuCoreMetrics, CpuTierCores, CpuTierMetrics, Metrics, PowerSources, Sampler,
     TempMetrics, aggregate_ioreport_metrics, calc_freq_from_residencies, collect_cpu_core_metrics,
-    cpu_cores_from_ticks, parse_cpu_core_channel, smc_numeric_value, temperature_average,
-    uses_cpu_ticks,
+    cpu_cores_from_ticks, hid_temperature_snapshot, parse_cpu_core_channel, smc_numeric_value,
+    smc_temperature_snapshot, temperature_average, temperature_snapshot, uses_cpu_ticks,
   };
   use crate::sources::{
     CpuTierInfo, IOHIDSensors, IOReportIteratorItem, SocInfo, cpu_load_ticks, cpu_tier_infos,
     tiers_from_perflevels,
   };
+  use crate::{TemperatureGroup, TemperatureReading, TemperatureSource};
 
   #[test]
   fn ane_power_uses_pmp_only_when_energy_model_is_absent() {
@@ -891,6 +931,7 @@ mod tests {
       smc_cpu_keys: vec![],
       smc_gpu_keys: vec![],
       smc_fan_keys: vec![],
+      temperature_details: vec![],
     }
   }
 
@@ -968,6 +1009,120 @@ mod tests {
     let value = serde_json::to_value(metrics).unwrap();
     assert_eq!(value["cpu_temp_avg"], 45.0);
     assert!(value["gpu_temp_avg"].is_null());
+  }
+
+  #[test]
+  fn temperature_details_retain_duplicates_and_sort_without_changing_the_averages() {
+    use TemperatureGroup::{Cpu, Gpu};
+    let readings = [
+      ("Tp09".into(), Cpu, 60.0),
+      ("Tg02".into(), Gpu, 50.0),
+      ("Tp01".into(), Cpu, 40.0),
+      ("Tp01".into(), Cpu, 40.0),
+      ("invalid".into(), Gpu, f32::NAN),
+    ];
+    let (metrics, details) = temperature_snapshot(readings, TemperatureSource::Smc);
+    assert_eq!(metrics.cpu_temp_avg, temperature_average(&[60.0, 40.0, 40.0]));
+    assert_eq!(metrics.gpu_temp_avg, Some(50.0));
+    assert_eq!(
+      details.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+      ["Tp01", "Tp01", "Tp09", "Tg02"]
+    );
+    assert_eq!(details.iter().map(|r| r.celsius).collect::<Vec<_>>(), [40.0, 40.0, 60.0, 50.0]);
+    assert!(details.iter().all(|r| r.source == TemperatureSource::Smc));
+
+    // The large value followed by small ones has a different f32 sum after name sorting.
+    let values =
+      std::iter::once(150.0).chain(std::iter::repeat_n(0.000001, 32)).collect::<Vec<_>>();
+    let readings = values
+      .iter()
+      .enumerate()
+      .map(|(i, &value)| (if i == 0 { "z" } else { "a" }.into(), Cpu, value));
+    let (metrics, _) = temperature_snapshot(readings, TemperatureSource::Smc);
+    assert_eq!(metrics.cpu_temp_avg, temperature_average(&values));
+    let sorted = values[1..].iter().copied().chain([values[0]]).collect::<Vec<_>>();
+    assert_ne!(metrics.cpu_temp_avg, temperature_average(&sorted));
+  }
+
+  #[test]
+  fn temperature_details_do_not_turn_missing_or_invalid_values_into_zero() {
+    let readings = [0.0, -1.0, 151.0, f32::NAN, f32::INFINITY]
+      .into_iter()
+      .map(|value| ("Tp01".into(), TemperatureGroup::Cpu, value));
+    let (metrics, details) = temperature_snapshot(readings, TemperatureSource::Smc);
+    assert_eq!(metrics.cpu_temp_avg, None);
+    assert_eq!(metrics.gpu_temp_avg, None);
+    assert!(details.is_empty());
+    let (metrics, details) = temperature_snapshot([], TemperatureSource::Hid);
+    assert_eq!(metrics.cpu_temp_avg, None);
+    assert_eq!(metrics.gpu_temp_avg, None);
+    assert!(details.is_empty());
+  }
+
+  #[test]
+  fn hid_details_keep_original_names_and_only_the_existing_temperature_groups() {
+    let readings = [
+      ("pACC MTR Temp Sensor1", 42.0),
+      ("eACC MTR Temp Sensor0", 38.0),
+      ("GPU MTR Temp Sensor0", 50.0),
+      ("Battery Temperature", 30.0),
+      ("GPU MTR Temp Sensor1", f32::NAN),
+    ]
+    .map(|(name, value)| (name.into(), value));
+    let (metrics, details) = hid_temperature_snapshot(readings.to_vec());
+    assert_eq!(metrics.cpu_temp_avg, Some(40.0));
+    assert_eq!(metrics.gpu_temp_avg, Some(50.0));
+    assert_eq!(
+      details.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+      ["eACC MTR Temp Sensor0", "pACC MTR Temp Sensor1", "GPU MTR Temp Sensor0"]
+    );
+    assert!(details.iter().all(|r| r.source == TemperatureSource::Hid));
+    assert_eq!(details[2].group, TemperatureGroup::Gpu);
+  }
+
+  #[test]
+  fn smc_details_reuse_each_read_once_and_preserve_fail_fast_errors() {
+    let cpu = ["Tp09".into(), "Tp01".into()];
+    let gpu = ["Tg01".into()];
+    let mut reads = Vec::new();
+    let (metrics, details) = smc_temperature_snapshot(&cpu, &gpu, |key| {
+      reads.push(key.to_owned());
+      Ok(if key == "Tg01" { 50.0 } else { 40.0 })
+    })
+    .unwrap();
+    assert_eq!(reads, ["Tp09", "Tp01", "Tg01"]);
+    assert_eq!(metrics.cpu_temp_avg, Some(40.0));
+    assert_eq!(metrics.gpu_temp_avg, Some(50.0));
+    assert_eq!(details.len(), reads.len());
+
+    reads.clear();
+    let failed = smc_temperature_snapshot(&cpu, &gpu, |key| {
+      reads.push(key.to_owned());
+      if key == "Tp01" { Err("sensor read failed".into()) } else { Ok(40.0) }
+    });
+    assert_eq!(failed.unwrap_err().to_string(), "sensor read failed");
+    assert_eq!(reads, ["Tp09", "Tp01"]);
+  }
+
+  #[test]
+  fn failed_temperature_or_earlier_metrics_acquisitions_clear_previous_details() {
+    let mut sampler = sampler_without_sources(4, true);
+    assert!(sampler.temperature_details().is_empty());
+    let previous = TemperatureReading {
+      name: "Tp01".into(),
+      group: TemperatureGroup::Cpu,
+      source: TemperatureSource::Smc,
+      celsius: 45.0,
+    };
+    sampler.temperature_details.push(previous.clone());
+    // CPU keys select SMC as before: an unavailable SMC must fail, without falling back to HID.
+    sampler.smc_cpu_keys.push("Tp01".into());
+    assert_eq!(sampler.get_temp().unwrap_err().to_string(), "SMC unavailable");
+    assert!(sampler.temperature_details().is_empty());
+    sampler.temperature_details.push(previous);
+    // Forced CLPC without IOReport fails before temperatures are acquired.
+    assert!(sampler.get_metrics(0).is_err());
+    assert!(sampler.temperature_details().is_empty());
   }
 
   fn core(

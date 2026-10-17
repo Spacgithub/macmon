@@ -165,7 +165,7 @@ Available endpoints:
 | `GET /json`    | JSON       | Current metrics snapshot (same format as `pipe --soc-info`)                                       |
 | `GET /metrics` | Prometheus | Metrics in [Prometheus text format](https://prometheus.io/docs/instrumenting/exposition_formats/) |
 | `GET /dashboard/` | HTML | Local browser dashboard with CPU/GPU activity and temperature, memory, Network, cooling and Processes |
-| `GET /api/sample` | JSON | Successful-sample sequence, timestamp, age, interval, service cadence and metrics; local-only process snapshot |
+| `GET /api/sample` | JSON | Successful-sample sequence, timestamp, age, interval, service cadence, metrics and named temperature readings; local-only process snapshot |
 | `POST /api/interval` | JSON | Adjust real service sampling with `{"adjustment":"increase"}` or `"decrease"`; local same-origin requests only |
 
 #### Local dashboard
@@ -191,6 +191,15 @@ metrics cycle, independently of browsers. Only loopback clients with a matching 
 receive process names and PIDs; other requests get `processes: null`. Snapshot age is reported
 as `processes_age_ms`, and all processes remain accessible in the scrollable table.
 System metric timestamps and age include the time spent collecting the separate process snapshot.
+
+`/api/sample` also includes a top-level `temperatures` array from the same successful hardware
+sample, for example `{"name":"Tp01","group":"cpu","source":"smc","celsius":45.0}`.
+Each entry retains its original sensor name, the existing CPU/GPU group and SMC/HID source.
+SMC grouping is heuristic: these names do not establish physical core, battery or storage
+locations. Only finite readings above 0 and at most 150 °C are retained; missing detail is an
+empty array. Library callers can use `Sampler::temperature_details()` after `get_metrics()`;
+the accessor performs no hardware reads and is empty before sampling or after a failed sample.
+Existing `Metrics`/`TempMetrics` structs, `pipe`, `/json` and Prometheus formats are unchanged.
 
 The −/+ controls change the service's real sampling window in 250 ms steps, from 250 to
 10000 ms, using the terminal's adjustment rules. The displayed interval becomes effective

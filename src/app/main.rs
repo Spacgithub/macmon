@@ -308,8 +308,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         match sampler.get_metrics(window) {
           Ok(m) => {
             let time = serve::sample_time();
+            let temperatures = sampler.temperature_details().to_vec();
             let processes = processes.sample_dashboard();
-            serve::publish_sample(&shared, m, window, Some(processes), time);
+            serve::publish_sample(&shared, m, temperatures, window, Some(processes), time);
           }
           Err(e) => eprintln!("sampling error: {e}"),
         }

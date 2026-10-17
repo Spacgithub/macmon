@@ -80,6 +80,7 @@ pub mod metrics;
 mod network;
 mod shared;
 pub mod sources;
+mod temperature;
 
 // Re-export the commonly used types.
 #[doc(inline)]
@@ -90,3 +91,5 @@ pub use metrics::{
 pub use network::NetworkMetric;
 #[doc(inline)]
 pub use sources::{CpuTierInfo, SocInfo};
+#[doc(inline)]
+pub use temperature::{TemperatureGroup, TemperatureReading, TemperatureSource};
