@@ -86,8 +86,10 @@
     <section class="panel" aria-labelledby="cooling-title">
       <div class="panel-head"><div><p class="eyebrow">THERMAL SYSTEM</p><h2 id="cooling-title">Temperature &amp; cooling</h2></div><button id="cooling-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="cooling-details" aria-label="Show temperature and cooling details">Details</button></div>
       <dl class="thermal-summary"><div><dt>CPU mean</dt><dd id="cooling-cpu-temp">Unavailable</dd></div><div><dt>GPU mean</dt><dd id="cooling-gpu-temp">Unavailable</dd></div></dl>
+      <p class="muted thermal-note">OS thermal state: <strong id="thermal-state" data-level="unavailable">Unavailable</strong></p>
       <p class="muted" id="fan-summary">Waiting for fan telemetry</p>
       <div id="cooling-details" hidden>
+        <p class="muted thermal-note">The OS reports this state independently of sensor temperatures; it is not a Celsius threshold or proof of CPU/GPU throttling. Nominal can also mean an unknown or unsupported platform. Virtual-machine host state remains unavailable.</p>
         <div class="thermal-key"><span>CPU mean</span><span>GPU mean</span></div>
         <canvas id="temperature-chart" role="img" aria-label="CPU and GPU mean temperature history, separate lines in degrees Celsius, up to 60 samples" aria-describedby="temperature-range temperature-peaks"></canvas>
         <p class="muted" id="temperature-range">Scale unavailable</p><p class="muted thermal-note" id="temperature-peaks">History mean peaks unavailable</p>

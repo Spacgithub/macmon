@@ -23,7 +23,7 @@
 - 💾 RAM / Swap usage, system memory pressure and swap-in/out rates
 - 🌐 Per-interface network receive/transmit rates and cumulative traffic
 - 📈 Historical charts with average and max values
-- 🌡️ Average CPU / GPU temperature
+- 🌡️ Average CPU / GPU temperature and OS thermal state
 - 📋 Process list with per-process CPU, memory, power and GPU usage
 - 🎨 Follows your terminal's color scheme
 - 🪟 Can be displayed in a small window
@@ -247,6 +247,19 @@ and hottest raw sensor name, the full source-labelled sensor list, and a 60-samp
 mean-temperature history. History peaks describe recorded group means; current sensor maxima
 describe individual readings. Missing values leave gaps. The compact view keeps means and
 fan RPM visible, while folding Cooling pauses its fan animation.
+
+Cooling also displays the macOS-reported **Nominal / Fair / Serious / Critical** thermal
+state in both interfaces. This is the public
+[ProcessInfo thermal state](https://developer.apple.com/documentation/foundation/processinfo/thermalstate-swift.enum),
+independent of the sensor temperatures; it is not a Celsius threshold or proof of CPU/GPU
+throttling. Apple can also report Nominal when the platform's thermal state is unknown or
+unsupported. Virtual machines, missing APIs and unrecognized values show `Unavailable`.
+Expand Cooling for the state explanation alongside the existing sensors and fan readings.
+
+`Sampler::thermal_state()` returns the cached `Option<ThermalState>` from the latest successful
+acquisition, or `None` before sampling or after a failed acquisition. `/api/sample` adds a
+top-level `thermal_state` string (`nominal`, `fair`, `serious`, `critical`) or `null`. Existing
+metric structs, legacy outputs and preferences remain unchanged.
 
 The −/+ controls change the service's real sampling window in 250 ms steps, from 250 to
 10000 ms, using the terminal's adjustment rules. The displayed interval becomes effective

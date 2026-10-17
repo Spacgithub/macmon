@@ -18,5 +18,5 @@
 ## Tasks
 
 - [x] Add safe public system-state sampling, state decoding and failure/VM tests.
-- [ ] Integrate same-sample library/HTTP access and both interfaces with unavailable fallbacks.
+- [x] Integrate same-sample library/HTTP access and both interfaces with unavailable fallbacks.
 - [ ] Run full checks, independent review and a real rootless ProcessInfo comparison.

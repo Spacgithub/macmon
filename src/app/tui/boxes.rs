@@ -576,7 +576,9 @@ impl App {
           .left(hint("Tab/Enter", "focus/toggle"))
           .left(hint("d", "all"))
           .left(hint("f", self.panels.focus.name()))
+          .left(dim(format!("OS thermal {}", self.thermal_label())))
           .right(dim(format!("v{}", env!("CARGO_PKG_VERSION")))),
+        Titles::new(branded.clone()).right(dim(format!("OS thermal {}", self.thermal_label()))),
         Titles::new(branded.clone()).right(dim(format!("v{}", env!("CARGO_PKG_VERSION")))),
         Titles::new(branded),
         Titles::new(chip),

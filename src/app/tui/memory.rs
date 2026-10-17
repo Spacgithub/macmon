@@ -120,7 +120,10 @@ mod tests {
     };
     assert!(
       app
-        .handle_event(Event::Update(Box::new(metrics), Vec::new(), activity), &RwLock::new(1000))
+        .handle_event(
+          Event::Update(Box::new(metrics), Vec::new(), activity, None),
+          &RwLock::new(1000)
+        )
         .is_continue()
     );
   }

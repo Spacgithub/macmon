@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use macmon::{MemoryActivity, Metrics, SocInfo, TemperatureReading};
+use macmon::{MemoryActivity, Metrics, SocInfo, TemperatureReading, ThermalState};
 
 use crate::config::{TUI_MAX_MS, TUI_MIN_MS};
 use crate::metrics_to_json_value;
@@ -51,6 +51,7 @@ impl Cadence {
 pub(crate) struct SampleDetails {
   pub temperatures: Vec<TemperatureReading>,
   pub memory_activity: MemoryActivity,
+  pub thermal_state: Option<ThermalState>,
 }
 
 impl From<Vec<TemperatureReading>> for SampleDetails {
@@ -249,6 +250,7 @@ fn to_sample(sample: &Sample, soc: &SocInfo, local: bool, cadence: &Cadence) -> 
     "metrics": json_value(&sample.metrics, soc, &sample.sampled_at),
     "temperatures": sample.details.temperatures,
     "memory_activity": sample.details.memory_activity,
+    "thermal_state": sample.details.thermal_state.filter(|_| !soc.vm),
     "processes": processes.map(|snapshot| &snapshot.rows),
     "processes_age_ms": processes.map(|snapshot| snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
   })
@@ -744,6 +746,42 @@ mod tests {
       assert_eq!(legacy["memory"].as_object().unwrap().len(), 4);
       assert_eq!(body(&get(&shared, "/metrics")), expected_prometheus);
     }
+  }
+
+  #[test]
+  fn thermal_states_share_the_sample_and_keep_legacy_outputs_and_vm_fallbacks() {
+    use macmon::ThermalState::{Critical, Fair, Nominal, Serious};
+
+    let shared = Arc::new(RwLock::new(None));
+    let soc = SocInfo::default();
+    let cadence = Cadence::new(1000);
+    let expected_prometheus = to_prometheus(&Metrics::default(), &soc);
+    for (index, state) in
+      [Some(Nominal), Some(Fair), Some(Serious), Some(Critical), None].into_iter().enumerate()
+    {
+      let details = super::SampleDetails { thermal_state: state, ..Default::default() };
+      publish_sample(&shared, Metrics::default(), details, 1000, None, super::sample_time());
+      let response: serde_json::Value =
+        serde_json::from_str(body(&get(&shared, "/api/sample"))).unwrap();
+      assert_eq!(response["sequence"], index + 1);
+      assert_eq!(response["thermal_state"], serde_json::to_value(state).unwrap());
+      assert!(response["metrics"].get("thermal_state").is_none());
+      let legacy: serde_json::Value = serde_json::from_str(body(&get(&shared, "/json"))).unwrap();
+      assert!(legacy.get("thermal_state").is_none());
+      assert_eq!(body(&get(&shared, "/metrics")), expected_prometheus);
+      let lock = shared.read().unwrap();
+      let sample = lock.as_ref().unwrap();
+      let vm = SocInfo { vm: true, ..Default::default() };
+      for local in [true, false] {
+        let response: serde_json::Value =
+          serde_json::from_str(&to_sample(sample, &vm, local, &cadence)).unwrap();
+        assert!(response["thermal_state"].is_null());
+      }
+    }
+    publish_sample(&shared, Metrics::default(), Vec::new(), 1000, None, super::sample_time());
+    let response: serde_json::Value =
+      serde_json::from_str(body(&get(&shared, "/api/sample"))).unwrap();
+    assert!(response["thermal_state"].is_null());
   }
 
   #[test]

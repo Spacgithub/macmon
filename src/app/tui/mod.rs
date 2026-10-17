@@ -34,7 +34,9 @@ use fan_protocol::{Capabilities, PendingQueries};
 use info::Info;
 use kill::Kill;
 use layout::LayoutPlan;
-use macmon::{MemoryActivity, Metrics, NetworkMetric, Sampler, SocInfo, TemperatureReading};
+use macmon::{
+  MemoryActivity, Metrics, NetworkMetric, Sampler, SocInfo, TemperatureReading, ThermalState,
+};
 use panels::{Panel, PanelState, Temperatures};
 use proc_view::ProcView;
 use ratatui::crossterm::event::{
@@ -123,7 +125,7 @@ fn set_mouse_capture(out: &mut impl Write, on: bool, want: bool) -> io::Result<b
 // MARK: Threads
 
 enum Event {
-  Update(Box<Metrics>, Vec<TemperatureReading>, MemoryActivity),
+  Update(Box<Metrics>, Vec<TemperatureReading>, MemoryActivity, Option<ThermalState>),
   /// The sampler failed: the app ends with this error.
   Failed(String),
   /// A process sample with the number of the panel showing it was started in.
@@ -270,7 +272,11 @@ fn run_sampler_thread(tx: mpsc::Sender<Event>, msec: Arc<RwLock<u32>>) {
         let metrics = sampler.get_metrics(window)?;
         let temperatures = sampler.temperature_details().to_vec();
         let memory_activity = *sampler.memory_activity();
-        if tx.send(Event::Update(Box::new(metrics), temperatures, memory_activity)).is_err() {
+        let thermal_state = sampler.thermal_state();
+        if tx
+          .send(Event::Update(Box::new(metrics), temperatures, memory_activity, thermal_state))
+          .is_err()
+        {
           return Ok(());
         }
         window = msec.read().map_or(TUI_MIN_MS, |x| *x).max(TUI_MIN_MS);
@@ -380,6 +386,7 @@ pub struct App {
   soc: SocInfo,
   mem: MemoryStore,
   memory_activity: MemoryActivity,
+  thermal_state: Option<ThermalState>,
 
   cpu_power: PowerStore,
   gpu_power: PowerStore,
@@ -520,8 +527,9 @@ impl App {
         self.handle_mouse(mouse);
         return ControlFlow::Continue(());
       }
-      Event::Update(data, temperatures, memory_activity) => {
+      Event::Update(data, temperatures, memory_activity, thermal_state) => {
         self.memory_activity = memory_activity;
+        self.thermal_state = thermal_state;
         self.temperatures.push(temperatures, &data.temp);
         self.update_metrics(*data);
         return ControlFlow::Continue(());
@@ -1009,7 +1017,7 @@ mod tests {
     terminal.draw(|frame| app.render(frame)).unwrap();
     for _ in 0..10 {
       let mut events = vec![Event::Tick, Event::Tick, Event::Tick, Event::Tick];
-      events.push(Event::Update(Box::new(test_metrics()), Vec::new(), Default::default()));
+      events.push(Event::Update(Box::new(test_metrics()), Vec::new(), Default::default(), None));
       let showing = app.procs_shown.showing().unwrap();
       events.push(Event::Procs { showing, procs: test_procs() });
       for event in events {
@@ -1181,7 +1189,7 @@ mod tests {
         assert_eq!(
           app
             .apply_event(
-              Event::Update(Box::new(metrics), Vec::new(), Default::default()),
+              Event::Update(Box::new(metrics), Vec::new(), Default::default(), None),
               &interval
             )
             .unwrap(),

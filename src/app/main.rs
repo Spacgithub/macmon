@@ -309,8 +309,11 @@ fn main() -> Result<(), Box<dyn Error>> {
           Ok(m) => {
             let time = serve::sample_time();
             let temperatures = sampler.temperature_details().to_vec();
-            let details =
-              serve::SampleDetails { temperatures, memory_activity: *sampler.memory_activity() };
+            let details = serve::SampleDetails {
+              temperatures,
+              memory_activity: *sampler.memory_activity(),
+              thermal_state: sampler.thermal_state(),
+            };
             let processes = processes.sample_dashboard();
             serve::publish_sample(&shared, m, details, window, Some(processes), time);
           }
