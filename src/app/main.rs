@@ -313,6 +313,7 @@ fn main() -> Result<(), Box<dyn Error>> {
               temperatures,
               memory_activity: *sampler.memory_activity(),
               thermal_state: sampler.thermal_state(),
+              disks: sampler.disks().map(<[_]>::to_vec),
             };
             let processes = processes.sample_dashboard();
             serve::publish_sample(&shared, m, details, window, Some(processes), time);
