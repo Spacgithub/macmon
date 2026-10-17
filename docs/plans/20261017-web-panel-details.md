@@ -16,7 +16,7 @@
 
 ## Tasks
 
-- [ ] Add accessible per-panel and global overview/detail controls with persistence.
-- [ ] Add temperature summaries, trends and real sensor details.
-- [ ] Verify lifecycle, missing/stale data, storage fallback and responsive browser layouts.
-- [ ] Run checks, tests and independent review.
+- [x] Add accessible per-panel and global overview/detail controls with persistence.
+- [x] Add temperature summaries, trends and real sensor details.
+- [x] Verify lifecycle, missing/stale data, storage fallback and responsive browser layouts.
+- [x] Run checks, tests and independent review.

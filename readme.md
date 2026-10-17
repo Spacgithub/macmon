@@ -173,8 +173,12 @@ Available endpoints:
 Run `macmon serve --host 127.0.0.1`, then open
 [http://127.0.0.1:9090/dashboard/](http://127.0.0.1:9090/dashboard/).
 The dashboard is bundled into the binary and uses no external assets or frontend build step.
-It follows the service sampling interval, retains 60 distinct samples, ranks active interfaces first and keeps
-the full interface list in a scrollable panel. CPU/GPU activity uses active residency ratios.
+It follows the service sampling interval and retains 60 distinct samples. CPU/GPU activity uses
+active residency ratios. Each panel starts with a compact summary; use its **Details** / **Less**
+button or **Expand all** / **Collapse all** to choose how much to show. These choices are saved
+locally in the browser and remain usable when browser storage is blocked. Summaries keep the
+three busiest interfaces and five processes in the selected sort order; expand to scroll
+through all rows. Folding a panel keeps live sampling and summaries running.
 
 The Power panel separates the system estimate from the CPU + GPU + ANE subtotal and plots
 both on a shared watt scale over the latest 60 distinct samples. CPU, GPU, ANE, DRAM and GPU
@@ -200,6 +204,12 @@ locations. Only finite readings above 0 and at most 150 °C are retained; missin
 empty array. Library callers can use `Sampler::temperature_details()` after `get_metrics()`;
 the accessor performs no hardware reads and is empty before sampling or after a failed sample.
 Existing `Metrics`/`TempMetrics` structs, `pipe`, `/json` and Prometheus formats are unchanged.
+
+Expand **Temperature & cooling** for each group's current sensor count, minimum, maximum
+and hottest raw sensor name, the full source-labelled sensor list, and a 60-sample CPU/GPU
+mean-temperature history. History peaks describe recorded group means; current sensor maxima
+describe individual readings. Missing values leave gaps. The compact view keeps means and
+fan RPM visible, while folding Cooling pauses its fan animation.
 
 The −/+ controls change the service's real sampling window in 250 ms steps, from 250 to
 10000 ms, using the terminal's adjustment rules. The displayed interval becomes effective

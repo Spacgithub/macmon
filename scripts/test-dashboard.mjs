@@ -638,9 +638,17 @@ await check('panels start compact and native buttons expose individual and all d
   assert.equal(h.elements.get('cpu-details').hidden, false);
   assert.equal(h.elements.get('gpu-details').hidden, true);
   await h.click('expand-all');
-  for (const name of names) assert.equal(h.elements.get(`${name}-toggle`).getAttribute('aria-expanded'), 'true');
+  for (const name of names) {
+    const button = h.elements.get(`${name}-toggle`);
+    assert.equal(button.getAttribute('aria-expanded'), 'true');
+    assert.ok(button.getAttribute('aria-label').toLowerCase().includes(button.textContent.toLowerCase()), 'The accessible name includes the visible button label');
+  }
   await h.click('collapse-all');
-  for (const name of names) assert.equal(h.elements.get(`${name}-toggle`).getAttribute('aria-expanded'), 'false');
+  for (const name of names) {
+    const button = h.elements.get(`${name}-toggle`);
+    assert.equal(button.getAttribute('aria-expanded'), 'false');
+    assert.ok(button.getAttribute('aria-label').toLowerCase().includes(button.textContent.toLowerCase()));
+  }
   assert.equal(h.pending().url, '/api/sample', 'View controls never start additional sampling requests');
 });
 

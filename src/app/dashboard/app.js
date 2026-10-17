@@ -85,7 +85,7 @@ function applyDetails() {
   for (const [name, label] of Object.entries(panelNames)) {
     const all = state.details[name], button = $(`${name}-toggle`), body = $(`${name}-details`);
     button.setAttribute("aria-expanded", String(all));
-    button.setAttribute("aria-label", `${all ? "Hide" : "Show"} ${label} details`);
+    button.setAttribute("aria-label", `${all ? "Less" : "Show"} ${label} details`);
     button.textContent = all ? "Less" : "Details";
     body.dataset.expanded = String(all);
     if (name === "network" || name === "process") {
