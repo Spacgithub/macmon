@@ -177,6 +177,6 @@ what we need.
       temperature history and named sensors, with concise live summaries.
       Plan: [docs/plans/completed/20261017-web-panel-details.md](plans/completed/20261017-web-panel-details.md).
 
-- [ ] **31. Add terminal overview/detail controls.** Keyboard-accessible per-panel and
+- [x] **31. Add terminal overview/detail controls.** Keyboard-accessible per-panel and
       global expansion, full lists and temperature details with compatible preferences.
-      Plan: [docs/plans/20261017-terminal-panel-details.md](plans/20261017-terminal-panel-details.md).
+      Plan: [docs/plans/completed/20261017-terminal-panel-details.md](plans/completed/20261017-terminal-panel-details.md).

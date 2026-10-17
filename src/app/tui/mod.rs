@@ -13,6 +13,7 @@ mod help;
 mod info;
 mod kill;
 mod layout;
+mod panels;
 mod proc_view;
 mod store;
 mod theme;
@@ -32,7 +33,8 @@ use fan_protocol::{Capabilities, PendingQueries};
 use info::Info;
 use kill::Kill;
 use layout::LayoutPlan;
-use macmon::{Metrics, NetworkMetric, Sampler, SocInfo};
+use macmon::{Metrics, NetworkMetric, Sampler, SocInfo, TemperatureReading};
+use panels::{Panel, PanelState, Temperatures};
 use proc_view::ProcView;
 use ratatui::crossterm::event::{
   self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, KeyCode,
@@ -108,8 +110,7 @@ fn restore_term_once(
 }
 
 /// Turns mouse capture on or off to `want`, if it isn't already (`on`); returns the new state.
-/// Only the process list uses the mouse, so capture is off while it is hidden and the terminal
-/// selects text as usual.
+/// Panel headers, detail scrolling and the process list use capture; help releases it for links.
 fn set_mouse_capture(out: &mut impl Write, on: bool, want: bool) -> io::Result<bool> {
   match (on, want) {
     (false, true) => out.execute(EnableMouseCapture).map(|_| true),
@@ -121,7 +122,7 @@ fn set_mouse_capture(out: &mut impl Write, on: bool, want: bool) -> io::Result<b
 // MARK: Threads
 
 enum Event {
-  Update(Box<Metrics>),
+  Update(Box<Metrics>, Vec<TemperatureReading>),
   /// The sampler failed: the app ends with this error.
   Failed(String),
   /// A process sample with the number of the panel showing it was started in.
@@ -266,7 +267,8 @@ fn run_sampler_thread(tx: mpsc::Sender<Event>, msec: Arc<RwLock<u32>>) {
 
       loop {
         let metrics = sampler.get_metrics(window)?;
-        if tx.send(Event::Update(Box::new(metrics))).is_err() {
+        let temperatures = sampler.temperature_details().to_vec();
+        if tx.send(Event::Update(Box::new(metrics), temperatures)).is_err() {
           return Ok(());
         }
         window = msec.read().map_or(TUI_MIN_MS, |x| *x).max(TUI_MIN_MS);
@@ -278,9 +280,8 @@ fn run_sampler_thread(tx: mpsc::Sender<Event>, msec: Arc<RwLock<u32>>) {
   });
 }
 
-/// Whether the process panel is on screen, shared with the process thread, which samples only
-/// while it is. Every change wakes the thread, and every show starts a new showing, so the thread
-/// also notices a hide when the panel is back before it gets to look.
+/// Whether processes are requested, shared with the process thread. Detail folding and window
+/// size do not pause collection. Hiding with `p` wakes the thread and ends the current showing.
 #[derive(Debug, Default)]
 struct ProcsShown {
   state: Mutex<Showing>,
@@ -289,7 +290,7 @@ struct ProcsShown {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct Showing {
-  /// The panel is on screen.
+  /// Processes are requested (`p`), including when viewing another full panel.
   on: bool,
   /// Times the panel was shown: the number of the current showing while `on`.
   count: u64,
@@ -406,6 +407,8 @@ pub struct App {
   fan_motion_visible: bool,
   unfocused: bool,
   network: Option<Vec<NetworkMetric>>,
+  panels: PanelState,
+  temperatures: Temperatures,
 
   /// CPU clusters, lowest tier first (E / P on M1–M4, E / S on M5, P / S on M5 Pro/Max, E / P / S
   /// on M6).
@@ -414,10 +417,9 @@ pub struct App {
 
   /// Process panel state with the latest process list (none until the first sample with rates).
   proc_view: ProcView,
-  /// Whether the process panel is on screen; the process thread samples only then.
+  /// Whether processes are requested; folding and resizing retain the sampling session.
   procs_shown: Arc<ProcsShown>,
-  /// The window of the last frame has room for the process list, whether it is shown or not;
-  /// `p` works only then (no room before the first frame).
+  /// The last window has cells; `p` remains usable when only the focused table can fit.
   procs_fit: bool,
 
   /// The help overlay (`?`) with its first line on screen, while it is open.
@@ -438,7 +440,11 @@ impl App {
   fn from_parts(soc: SocInfo, cfg: Config) -> Self {
     let clusters = CpuClusters::from_soc(&soc);
     let proc_view = ProcView::new(cfg.proc_sort, cfg.proc_sort_desc);
-    Self { cfg, soc, clusters, proc_view, ..Default::default() }
+    let mut panels = PanelState::default();
+    if !cfg.show_procs {
+      panels.focus = Panel::Compute;
+    }
+    Self { cfg, soc, clusters, proc_view, panels, ..Default::default() }
   }
 
   fn update_metrics(&mut self, data: Metrics) {
@@ -511,7 +517,8 @@ impl App {
         self.handle_mouse(mouse);
         return ControlFlow::Continue(());
       }
-      Event::Update(data) => {
+      Event::Update(data, temperatures) => {
+        self.temperatures.push(temperatures, &data.temp);
         self.update_metrics(*data);
         return ControlFlow::Continue(());
       }
@@ -612,7 +619,20 @@ impl App {
       return ControlFlow::Continue(());
     }
 
-    if self.procs_visible() && self.update_proc_view(|view| view.handle_key(key)) {
+    // Filter text and existing overlays always get first refusal; panel digits remain text.
+    if self.procs_visible()
+      && self.proc_view.typing()
+      && self.update_proc_view(|view| view.handle_key(key))
+    {
+      return ControlFlow::Continue(());
+    }
+    if self.handle_panel_key(key) {
+      return ControlFlow::Continue(());
+    }
+    if self.procs_visible()
+      && self.panels.focus == Panel::Processes
+      && self.update_proc_view(|view| view.handle_key(key))
+    {
       return ControlFlow::Continue(());
     }
 
@@ -629,26 +649,27 @@ impl App {
       KeyCode::Char('p') if self.procs_fit => self.cfg.toggle_procs(),
       KeyCode::Char('v') => self.cfg.toggle_view_type(),
       // the last `Char` arm: it takes every character left while the list is on screen
-      KeyCode::Char(c) if self.procs_visible() => match (c, self.proc_view.selected()) {
-        ('i', Some(proc)) => self.info = Some(Info::new(proc, &*self.kill.sys)),
-        ('k', Some(proc)) => self.kill.open(proc),
-        ('e', Some(proc)) if !proc.path.is_empty() => self.kill.sys.reveal(&proc.path),
-        ('c', Some(proc)) if !proc.path.is_empty() => {
-          self.kill.sys.copy(&proc.path);
-          self.proc_view.copied = true;
+      KeyCode::Char(c) if self.procs_visible() && self.panels.focus == Panel::Processes => {
+        match (c, self.proc_view.selected()) {
+          ('i', Some(proc)) => self.info = Some(Info::new(proc, &*self.kill.sys)),
+          ('k', Some(proc)) => self.kill.open(proc),
+          ('e', Some(proc)) if !proc.path.is_empty() => self.kill.sys.reveal(&proc.path),
+          ('c', Some(proc)) if !proc.path.is_empty() => {
+            self.kill.sys.copy(&proc.path);
+            self.proc_view.copied = true;
+          }
+          _ => {}
         }
-        _ => {}
-      },
+      }
       _ => {}
     }
 
     ControlFlow::Continue(())
   }
 
-  /// Whether the mouse is captured: only for the process list on screen, and not under the help,
-  /// so the terminal handles clicks there (its link, text selection).
+  /// Panel headers and lists capture clicks; help leaves links and text selection to the terminal.
   fn wants_mouse(&self) -> bool {
-    self.procs_visible() && self.help.is_none()
+    self.help.is_none() && (self.procs_visible() || !self.panels.targets.is_empty())
   }
 
   /// Applies a mouse event at the cells of the last frame to the process list, only while the
@@ -663,7 +684,8 @@ impl App {
       info.handle_mouse(mouse);
     } else if self.kill.is_open() {
       self.kill.handle_mouse(mouse);
-    } else if self.wants_mouse() {
+    } else if self.handle_panel_mouse(mouse) {
+    } else if self.wants_mouse() && self.panels.focus == Panel::Processes {
       self.update_proc_view(|view| view.handle_mouse(mouse));
     }
   }
@@ -697,7 +719,11 @@ impl App {
   }
 
   fn fans_visible(&self) -> bool {
-    self.help.is_none() && !self.placements.is_empty()
+    self.help.is_none()
+      && self.info.is_none()
+      && !self.kill.is_open()
+      && self.cooling_detailed()
+      && !self.placements.is_empty()
   }
 
   fn fan_frames_active(&self) -> bool {
@@ -778,10 +804,12 @@ impl App {
   /// Layout of a frame for the window `area`, with the state that follows the window updated
   /// before anything is drawn: whether the process list fits, and whether it is on screen.
   fn layout_frame(&mut self, area: Rect) -> LayoutPlan {
-    self.procs_fit = self.cooling_layout(area, true).0.proc.is_some();
+    self.procs_fit = !area.is_empty();
     let (plan, placements) = self.cooling_layout(area, self.cfg.show_procs);
     self.placements = placements;
-    self.set_procs_visible(plan.proc.is_some());
+    // Layout pressure never discards the process selection or pauses a requested sample.
+    // `f` can still show the complete list when the advanced grid has no table rectangle.
+    self.set_procs_visible(self.cfg.show_procs);
     plan
   }
 
@@ -790,6 +818,11 @@ impl App {
     {
       self.widget_frames += 1;
     }
+    if !self.panels_legacy() {
+      self.render_panels(f);
+      return;
+    }
+    self.panels.targets.clear();
     let plan = self.layout_frame(f.area());
     self.fan_motion_visible = self.help.is_none()
       && self.placements.is_empty()
@@ -801,9 +834,12 @@ impl App {
     self.cooling.render(f, &self.placements);
     if let Some(r) = plan.proc {
       self.render_proc_box(f, r);
-      self.info.iter_mut().for_each(|info| info.render(f, r));
-      self.kill.render(f, r);
+    } else {
+      self.proc_view.clear_targets();
     }
+    let overlay = plan.proc.unwrap_or(f.area());
+    self.info.iter_mut().for_each(|info| info.render(f, overlay));
+    self.kill.render(f, overlay);
     if let Some(scroll) = self.help {
       self.help = Some(help::render(f, f.area(), scroll));
     }
@@ -859,8 +895,11 @@ impl App {
     loop {
       if redraw {
         self.refresh_cell_pixels();
-        let next = self.cooling_layout(term.size()?.into(), self.cfg.show_procs).1;
-        if (self.help.is_some() || next != self.placements)
+        let next = self.next_fan_placements(term.size()?.into());
+        if (self.help.is_some()
+          || self.info.is_some()
+          || self.kill.is_open()
+          || next != self.placements)
           && let Some(images) = &mut images
         {
           images.hide(&mut stdout().lock())?;
@@ -966,7 +1005,7 @@ mod tests {
     terminal.draw(|frame| app.render(frame)).unwrap();
     for _ in 0..10 {
       let mut events = vec![Event::Tick, Event::Tick, Event::Tick, Event::Tick];
-      events.push(Event::Update(Box::new(test_metrics())));
+      events.push(Event::Update(Box::new(test_metrics()), Vec::new()));
       let showing = app.procs_shown.showing().unwrap();
       events.push(Event::Procs { showing, procs: test_procs() });
       for event in events {
@@ -1136,7 +1175,7 @@ mod tests {
         let mut metrics = test_metrics();
         metrics.fans[0].rpm = rpm;
         assert_eq!(
-          app.apply_event(Event::Update(Box::new(metrics)), &interval).unwrap(),
+          app.apply_event(Event::Update(Box::new(metrics), Vec::new()), &interval).unwrap(),
           ControlFlow::Continue(true)
         );
         assert_eq!(displayed(&mut app), last, "sampling {rpm} must not turn the fan");
@@ -1160,7 +1199,7 @@ mod tests {
   }
 
   #[test]
-  fn resize_without_a_sample_updates_layout_and_process_showing() {
+  fn resizing_retains_process_samples_and_selection_with_full_view_available() {
     for vm in [false, true] {
       let mut app = network_app();
       app.soc.vm = vm;
@@ -1169,26 +1208,26 @@ mod tests {
       let interval = RwLock::new(10_000);
       terminal.draw(|frame| app.render(frame)).unwrap();
       let previous = app.procs_shown.showing().unwrap();
-      for (width, height, visible) in [(60, 18, false), (80, 24, true)] {
+      for (width, height) in [(60, 18), (80, 24)] {
         terminal.backend_mut().resize(width, height);
         assert_eq!(app.apply_event(Event::Resize, &interval).unwrap(), ControlFlow::Continue(true));
         let buf = terminal.draw(|frame| app.render(frame)).unwrap().buffer.clone();
         assert_eq!(buf.area, Rect::new(0, 0, width, height));
-        assert_eq!(app.procs_visible(), visible);
-        assert!(app.proc_view.procs().is_none());
+        assert!(app.procs_visible());
+        assert_eq!(app.proc_view.procs().unwrap().len(), 3);
         let network = app.layout(buf.area).network.unwrap();
         assert!(network.right() <= width && network.bottom() <= height);
         assert!(row(&buf, network.y + 1).contains("↓ RX/s"));
       }
       let current = app.procs_shown.showing().unwrap();
-      assert_ne!(current, previous);
+      assert_eq!(current, previous);
       assert!(
         app
           .apply_event(Event::Procs { showing: previous, procs: test_procs() }, &interval)
           .unwrap()
           .is_continue()
       );
-      assert!(app.proc_view.procs().is_none());
+      assert_eq!(app.proc_view.procs().unwrap().len(), 3);
       assert!(
         app
           .apply_event(Event::Procs { showing: current, procs: test_procs() }, &interval)
@@ -1343,7 +1382,10 @@ mod tests {
 
   /// App for `test_soc` with a few samples of `test_metrics` changed by `edit`.
   fn test_app_with(edit: impl Fn(&mut Metrics)) -> App {
-    let mut app = App::from_parts(test_soc(), Config::default());
+    // Existing metric/table regressions exercise the all-expanded advanced layout.
+    let mut cfg = Config::default();
+    cfg.panel_details = [true; 6];
+    let mut app = App::from_parts(test_soc(), cfg);
     // Legacy metric/process tests exercise the compact RPM path. Complete native/text fans
     // and their adaptive placement are covered with valid cell geometry in fan_preview.
     app.cell_pixels = Some((0, 0));
@@ -1456,7 +1498,9 @@ mod tests {
 
   /// `test_app` saving its settings to `file`.
   fn saving_app(file: &TempConfig) -> App {
-    App { cfg: Config::load_from(Some(file.path())), ..test_app() }
+    let mut cfg = Config::load_from(Some(file.path()));
+    cfg.panel_details = [true; 6];
+    App { cfg, ..test_app() }
   }
 
   fn render_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
@@ -1682,7 +1726,7 @@ mod tests {
   }
 
   #[test]
-  fn p_toggles_the_list_unless_the_window_is_too_small() {
+  fn p_toggles_sampling_even_when_the_advanced_table_does_not_fit() {
     let file = TempConfig::new("p_toggles_the_list_unless_the_window_is_too_small");
     let mut app = with_procs(saving_app(&file), varied_procs());
     assert!(app.procs_visible());
@@ -1700,13 +1744,12 @@ mod tests {
     assert!(render_to_string(&mut app, 200, 50).contains("collecting…"));
     assert!(app.procs_visible());
 
-    // a window too small for the list keeps it hidden whatever the setting: `p` changes nothing,
-    // and the key hints leave it out
+    // A short window keeps sampling; p can still stop it, while f can show the full table.
     let buf = render_buffer(&mut app, 100, 12);
-    assert!(!app.procs_visible());
+    assert!(app.procs_visible());
     assert!(app.handle_key(key('p')).is_continue());
-    assert!(app.cfg.show_procs);
-    assert!(row(&buf, 11).contains(" ? | quit | view "), "{}", row(&buf, 11));
+    assert!(!app.cfg.show_procs);
+    assert!(row(&buf, 11).contains("procs"), "{}", row(&buf, 11));
   }
 
   #[test]
@@ -2015,6 +2058,7 @@ mod tests {
       });
       // with every sensor, without swap, fans and system power, and before the first sample
       for (i, mut app) in [test_app(), bare, App::default()].into_iter().enumerate() {
+        app.cfg.panel_details = [true; 6];
         app.proc_view.set_procs(varied_procs());
         let buf = render_buffer(&mut app, width, height);
         let plan = app.layout(buf.area);
@@ -2084,7 +2128,9 @@ mod tests {
       gpu_cores: 12,
       ..Default::default()
     };
-    let mut app = App::from_parts(soc, Config::default());
+    let mut cfg = Config::default();
+    cfg.panel_details = [true; 6];
+    let mut app = App::from_parts(soc, cfg);
     let cpu_tiers = vec![
       cpu_tier("E", 2940, 0.71, 0.71),
       cpu_tier("P", 2394, 0.25, 0.25),
@@ -2115,7 +2161,9 @@ mod tests {
       vm: true,
       ..Default::default()
     };
-    let mut app = App::from_parts(soc, Config::default());
+    let mut cfg = Config::default();
+    cfg.panel_details = [true; 6];
+    let mut app = App::from_parts(soc, cfg);
     let metrics = Metrics { cpu_tiers: vec![cpu_tier("_", 0, 0.63, 0.63)], ..Default::default() };
     app.update_metrics(Metrics { memory: test_metrics().memory, ..metrics });
     // own processes have an energy counter, but it does not move in a VM; launchd has none
@@ -2152,7 +2200,9 @@ mod tests {
     // processes sampled before the first metrics sample: the chip already tells a VM
     for (vm, boxes, power, note) in [(false, 4, "1.50W", true), (true, 4, "-", false)] {
       let soc = SocInfo { vm, ..test_soc() };
-      let app = &mut with_procs(App::from_parts(soc, Config::default()), varied_procs());
+      let mut cfg = Config::default();
+      cfg.panel_details = [true; 6];
+      let app = &mut with_procs(App::from_parts(soc, cfg), varied_procs());
       let buf = render_buffer(app, 200, 50);
       assert_eq!(app.layout(buf.area).boxes.len(), boxes, "vm {vm}");
       assert_eq!(app.layout(buf.area).telemetry.is_some(), !vm, "vm {vm}");
@@ -2253,6 +2303,7 @@ mod tests {
       }
     }
     let mut app = App::default();
+    app.cfg.panel_details = [true; 6];
     let top = row(&render_buffer(&mut app, 80, 24), 0);
     assert!(top.contains("macmon") && !top.contains("macmon / macmon"), "{top}");
   }
@@ -2558,10 +2609,10 @@ mod tests {
     assert!(!app.kill.is_open());
     assert_eq!(fake.calls(), [(631, 0), (631, libc::SIGKILL)]);
 
-    // the window too small for the list
+    // Resizing does not silently dismiss a selected-process action.
     assert!(app.handle_key(key('k')).is_continue());
     drop(render_buffer(&mut app, 60, 12));
-    assert!(!app.kill.is_open());
+    assert!(app.kill.is_open());
   }
 
   /// `kill_app` with the cwd and a log file open in WindowServer.
@@ -2622,10 +2673,10 @@ mod tests {
     assert!(press(&mut app, KeyCode::Down).is_continue());
     assert_eq!(app.proc_view.selected_pid(), Some(2301));
 
-    // it closes with the list
+    // Resizing retains the selected process and its open detail view.
     assert!(press(&mut app, KeyCode::Up).is_continue() && app.handle_key(key('i')).is_continue());
     render_buffer(&mut app, 60, 12);
-    assert!(app.info.is_none());
+    assert!(app.info.is_some());
   }
 
   #[test]
@@ -2675,8 +2726,11 @@ mod tests {
   #[test]
   fn e_shows_the_selected_process_in_finder() {
     let (mut app, fake) = info_app();
-    // `f` is not bound
+    // `f` opens the full process panel without revealing a path.
     assert!(app.handle_key(key('f')).is_continue() && fake.0.borrow().revealed.is_empty());
+    assert!(app.panels.fullscreen);
+    assert!(app.handle_key(key('f')).is_continue());
+    assert!(!app.panels.fullscreen);
     assert!(app.handle_key(key('e')).is_continue());
     assert_eq!(fake.0.borrow().revealed, [WINDOW_SERVER]);
 
@@ -2774,7 +2828,9 @@ mod tests {
     // the baseline, then a sample that runs while the panel is hidden and shown again
     finish_sample();
     started.recv_timeout(timeout).expect("no sample started");
+    app.cfg.show_procs = false;
     render_buffer(&mut app, 60, 12);
+    app.cfg.show_procs = true;
     render_buffer(&mut app, 200, 50);
     assert!(app.procs_visible());
     release.send(()).unwrap();

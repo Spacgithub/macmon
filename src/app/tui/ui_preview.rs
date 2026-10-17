@@ -7,6 +7,14 @@ mod ui_preview {
 
   use super::*;
 
+  /// Root agent's private PTY drives real hardware, resizing and keys without reading/saving settings.
+  #[test]
+  #[ignore = "interactive real-hardware terminal check"]
+  fn real_hardware_detail_fixture() {
+    let mut app = App::from_parts(SocInfo::new().unwrap(), Config::load_from(None));
+    app.run_loop(None).unwrap();
+  }
+
   fn demo() -> App {
     let mut app = network_app();
     if std::env::var("MACMON_UI_PREVIEW_VIEW").as_deref() == Ok("gauge") {

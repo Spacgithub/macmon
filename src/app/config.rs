@@ -77,6 +77,10 @@ pub struct Config {
   #[serde_inline_default(true)]
   pub animate_fans: bool,
 
+  /// Compute, memory, power, network, cooling and processes: independently detailed (`1`–`6`).
+  #[serde_inline_default([false; 6])]
+  pub panel_details: [bool; 6],
+
   #[serde_inline_default(ProcSort::Cpu)]
   pub proc_sort: ProcSort,
 
@@ -234,6 +238,16 @@ impl Config {
     self.save();
   }
 
+  pub fn toggle_panel(&mut self, panel: usize) {
+    self.panel_details[panel] = !self.panel_details[panel];
+    self.save();
+  }
+
+  pub fn toggle_all_panels(&mut self) {
+    self.panel_details = [!self.panel_details.iter().all(|detail| *detail); 6];
+    self.save();
+  }
+
   pub fn set_proc_sort(&mut self, sort: ProcSort, desc: bool) {
     self.proc_sort = sort;
     self.proc_sort_desc = desc;
@@ -339,6 +353,28 @@ mod tests {
 
     // anything but a JSON object gives the defaults
     assert_eq!(parse("not json").interval, 1000);
+  }
+
+  #[test]
+  fn panel_details_are_optional_validated_and_saved_without_changing_released_fields() {
+    assert_eq!(parse(r#"{"view_type":"Sparkline"}"#).panel_details, [false; 6]);
+    for bad in ["null", "true", "[true]", "[true,true,true,true,true,1]"] {
+      let cfg = parse(&format!(r#"{{"interval":500,"panel_details":{bad}}}"#));
+      assert_eq!(cfg.panel_details, [false; 6]);
+      assert_eq!(cfg.interval(), 500);
+    }
+    let file = TempConfig::new("panel_details");
+    let mut cfg = Config::load_from(Some(file.path()));
+    cfg.toggle_panel(3);
+    assert_eq!(
+      file.saved()["panel_details"],
+      serde_json::json!([false, false, false, true, false, false])
+    );
+    assert_eq!(file.saved()["view_type"], "Sparkline");
+    cfg.toggle_all_panels();
+    assert_eq!(Config::load_from(Some(file.path())).panel_details, [true; 6]);
+    cfg.toggle_all_panels();
+    assert_eq!(Config::load_from(Some(file.path())).panel_details, [false; 6]);
   }
 
   #[test]

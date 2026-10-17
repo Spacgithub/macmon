@@ -349,17 +349,29 @@ struct MetricBox<'a> {
 
 impl App {
   pub(super) fn render_network_box(&self, f: &mut Frame, area: Rect) {
+    self.render_network_page(f, area, 0, 3);
+  }
+
+  pub(super) fn render_network_page(&self, f: &mut Frame, area: Rect, offset: usize, limit: usize) {
     let metrics = self.network.as_deref().unwrap_or_default();
-    let shown = usize::from(area.height.saturating_sub(3)).min(3).min(metrics.len());
+    let shown = usize::from(area.height.saturating_sub(3))
+      .min(limit)
+      .min(metrics.len().saturating_sub(offset));
+    let label = if self.panels_legacy() { "Network" } else { "4 Network" };
     let title =
-      vec![theme::value("Network", theme::SECTION), dim(format!(" {shown}/{}", metrics.len()))];
-    let inner = draw_box(f, area, Titles::new(title));
+      vec![theme::value(label, theme::SECTION), dim(format!(" {shown}/{}", metrics.len()))];
+    let hint_label = if self.panels.fullscreen { "back" } else { "all interfaces" };
+    let inner = draw_box(f, area, Titles::new(title).right(hint("f", hint_label)));
     if metrics.is_empty() {
       let status = if self.network.is_none() { "unavailable" } else { "no active interfaces" };
       f.render_widget(Paragraph::new(dim(status)), inner);
       return;
     }
-    let mut widths = [15u16, 12, 12, 11, 11];
+    let mut widths = if !self.panels_legacy() && inner.width < 44 {
+      [8u16, 11, 11, 11, 11]
+    } else {
+      [15u16, 12, 12, 11, 11]
+    };
     let headers = ["Interface", "↓ RX/s", "↑ TX/s", "RX total", "TX total"];
     let mut columns = widths.len();
     while columns > 1 && widths[..columns].iter().sum::<u16>() + columns as u16 - 1 > inner.width {
@@ -378,7 +390,7 @@ impl App {
       };
       Cell::from(line.right_aligned())
     };
-    let rows = metrics.iter().take(shown).map(|m| {
+    let rows = metrics.iter().skip(offset).take(shown).map(|m| {
       let values = [
         Cell::from(
           if m.rx_bytes_per_sec.unwrap_or(0.0) + m.tx_bytes_per_sec.unwrap_or(0.0) > 0.0 {
@@ -430,6 +442,7 @@ impl App {
     if self.procs_fit {
       hints.push(hint("p", "procs"));
     }
+    hints.extend([hint("1-6/d", "panels"), hint("f", self.panels.focus.name())]);
     let modes = [RatioMode::Scaled, RatioMode::Active].map(|mode| mode.label().len());
     let mode = format!("{:1$}", self.cfg.ratio_mode.label(), modes.into_iter().max().unwrap_or(0));
     let interval = format!("{:>1$}ms", self.cfg.interval(), TUI_MAX_MS.to_string().len());
@@ -530,6 +543,12 @@ impl App {
     fit_titles(
       width,
       vec![
+        Titles::new(branded.clone())
+          .left(hint("1-6", "panels"))
+          .left(hint("Tab/Enter", "focus/toggle"))
+          .left(hint("d", "all"))
+          .left(hint("f", self.panels.focus.name()))
+          .right(dim(format!("v{}", env!("CARGO_PKG_VERSION")))),
         Titles::new(branded.clone()).right(dim(format!("v{}", env!("CARGO_PKG_VERSION")))),
         Titles::new(branded),
         Titles::new(chip),
