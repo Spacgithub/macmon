@@ -578,6 +578,14 @@ impl ProcView {
     self.typing = false;
   }
 
+  pub(super) fn clear_targets(&mut self) {
+    self.targets = Targets::default();
+  }
+
+  pub(super) fn contains_mouse(&self, mouse: MouseEvent) -> bool {
+    self.targets.area.contains(Position::new(mouse.column, mouse.row))
+  }
+
   #[cfg(test)]
   pub(super) fn selected_pid(&self) -> Option<i32> {
     self.selected.map(|s| s.pid)
@@ -830,11 +838,68 @@ impl ProcView {
 // MARK: Render
 
 impl App {
+  /// Sorted top five without moving the selection, page or filter of the full table.
+  pub(super) fn render_proc_summary(&mut self, f: &mut Frame, area: Rect) {
+    let view = &self.proc_view;
+    let count = view.procs().map_or(0, <[_]>::len);
+    let title = if view.typing() || !view.filter().is_empty() {
+      view.titles(area.width).right(hint("f", "full"))
+    } else {
+      Titles::new(theme::value(format!("6 Processes · top 5 / {count}"), theme::SECTION))
+        .right(hint("f", "full"))
+    };
+    let inner = draw_box(f, area, title);
+    self.proc_view.targets = Targets::default();
+    if inner.is_empty() {
+      return;
+    }
+    if self.proc_view.procs().is_none() {
+      f.render_widget(Line::from(dim("collecting…")), inner);
+      return;
+    }
+    let columns = fit_columns(inner.width, self.proc_view.sort);
+    let header: Vec<_> = columns
+      .iter()
+      .map(|(column, _)| text(column.header_text(self.proc_view.sort, self.proc_view.sort_desc)))
+      .collect();
+    draw_row(f.buffer_mut(), Rect { height: 1, ..inner }, &columns, header.into_iter());
+    let rows = self.proc_view.rows().take(5).take(inner.height.saturating_sub(1) as usize);
+    for (index, proc) in rows.enumerate() {
+      let row = columns.iter().map(|(column, _)| self.proc_cell(*column, proc));
+      let area = Rect { y: inner.y + index as u16 + 1, height: 1, ..inner };
+      draw_row(f.buffer_mut(), area, &columns, row);
+      if self.proc_view.selected().is_some_and(|selected| selected.pid == proc.pid) {
+        f.buffer_mut().set_style(area, theme::SELECTED);
+      }
+    }
+    if self.proc_view.row_count() > 5 && area.height > 1 {
+      let shown = inner.height.saturating_sub(1).min(5);
+      let label =
+        Line::from(dim(format!(" {shown}/{} matched · f full ", self.proc_view.row_count())))
+          .right_aligned();
+      f.render_widget(
+        label,
+        Rect {
+          x: area.x + 1,
+          y: area.bottom() - 1,
+          width: area.width.saturating_sub(2),
+          height: 1,
+        },
+      );
+    }
+  }
+
   /// Process panel: count, filter and sort hint in the title, a header row with the sort arrow,
   /// the process rows with a scrollbar when they don't fit, and the POWER note and the key hints
   /// on the bottom border. Keeps the cells that react to the mouse for `ProcView::handle_mouse`.
   pub(super) fn render_proc_box(&mut self, f: &mut Frame, area: Rect) {
-    let inner = draw_box(f, area, self.proc_view.titles(area.width));
+    let titles = self.proc_view.titles(area.width);
+    let titles = if self.panels_legacy() {
+      titles
+    } else {
+      titles.left(hint("6", "detail")).left(hint("f", "full"))
+    };
+    let inner = draw_box(f, area, titles);
     let (headers, body) = self.render_proc_table(f, inner);
     let power_shown = headers.iter().any(|&(column, _)| column == ProcSort::Power);
     self.proc_view.targets = Targets { area, headers, body };

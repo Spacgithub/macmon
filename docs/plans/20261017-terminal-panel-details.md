@@ -18,7 +18,7 @@
 
 ## Tasks
 
-- [ ] Add panel detail preferences and consistent keyboard controls.
-- [ ] Integrate compact summaries, accessible full lists and temperature details/history.
-- [ ] Verify geometry combinations, resize, filtering, selection and fan cleanup.
+- [x] Add panel detail preferences and consistent keyboard controls.
+- [x] Integrate compact summaries, accessible full lists and temperature details/history.
+- [x] Verify geometry combinations, resize, filtering, selection and fan cleanup.
 - [ ] Run checks, rootless runtime validation and independent review.

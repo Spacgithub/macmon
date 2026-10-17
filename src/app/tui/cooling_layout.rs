@@ -51,6 +51,22 @@ fn placements(row: Rect, count: u16, size: CardSize) -> Vec<Placement> {
     .collect()
 }
 
+/// Small cards confined to an expanded cooling panel; hidden/short panels have no image writes.
+pub(super) fn panel_cards(
+  area: Rect,
+  count: usize,
+  cell: (u16, u16),
+  native: bool,
+) -> Vec<Placement> {
+  if !(1..=2).contains(&count) || cell.0 == 0 || cell.1 == 0 {
+    return Vec::new();
+  }
+  let row = area.inner(Margin::new(1, 1));
+  fit(row.width, row.height.min(8), count as u16, cell, native)
+    .map(|size| placements(row, count as u16, size))
+    .unwrap_or_default()
+}
+
 fn outer(area: Rect, procs: bool, minimum: u16) -> (Rect, Option<Rect>) {
   let top = Rect { height: if procs { minimum } else { area.height }, ..area };
   let proc = procs.then_some(Rect { y: top.bottom(), height: area.height - top.height, ..area });

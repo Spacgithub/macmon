@@ -24,6 +24,12 @@ enum Row {
 const HELP: &[Row] = &[
   Section("Keys"),
   Key("q", "quit"),
+  Key("1–6", "toggle Compute, Memory, Power, Network, Cooling, Processes"),
+  Key("Tab / ⇧Tab", "select a panel (starts on Processes)"),
+  Key("Enter", "expand / summarize the selected panel"),
+  Key("d", "expand all / summarize all panels"),
+  Key("f", "full panel view; f / Esc returns to the overview"),
+  Key("↑ ↓ / PgUp", "scroll a detail panel (PgDn / Home / End also work)"),
   Key("p", "show / hide the processes"),
   Key("v", "graph / gauge"),
   Key("r", "CPU and GPU usage: freq / raw"),
@@ -50,6 +56,9 @@ const HELP: &[Row] = &[
   Term("TIME", "CPU time used since the process started"),
   Term("freq", "usage weighted by frequency; raw: share of time busy"),
   Term("POWER -", "not available for other users' processes"),
+  Term("Network", "per-interface counters; tunnels are never added together"),
+  Term("Temperature", "raw sensor names are not physical-core identities"),
+  Term("Temp history", "latest 60 sampling windows; missing readings leave gaps"),
 ];
 
 /// Cells of the key column, the gap after it included.
@@ -205,7 +214,7 @@ mod tests {
     assert!(top.starts_with("╮↑┃") && top.ends_with("│↓╯"), "{top}");
     assert!(end.starts_with("╮↑│") && end.ends_with("┃↓╯"), "{end}");
     // all of it on screen: the plain border
-    let tall = border(40, 0);
+    let tall = border(super::lines().len() as u16 + 2, 0);
     assert_eq!(tall, format!("╮{}╯", "│".repeat(tall.chars().count() - 2)));
   }
 }
