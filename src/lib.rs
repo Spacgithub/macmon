@@ -82,6 +82,7 @@ mod network;
 mod shared;
 pub mod sources;
 mod temperature;
+mod thermal;
 
 // Re-export the commonly used types.
 #[doc(inline)]
@@ -96,3 +97,5 @@ pub use network::NetworkMetric;
 pub use sources::{CpuTierInfo, SocInfo};
 #[doc(inline)]
 pub use temperature::{TemperatureGroup, TemperatureReading, TemperatureSource};
+#[doc(inline)]
+pub use thermal::ThermalState;

@@ -225,8 +225,8 @@ function metrics(overrides = {}) {
     network: [{ name: 'en0', rx_bytes_per_sec: 1000, tx_bytes_per_sec: 500, rx_bytes: 4096, tx_bytes: 2048 }],
     fans: [{ name: 'fan0', rpm: 1800, max_rpm: 6800 }, { name: 'fan1', rpm: 2400 }], ...overrides };
 }
-function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, temperatures, memory_activity } = {}) {
-  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, temperatures, memory_activity };
+function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, temperatures, memory_activity, thermal_state } = {}) {
+  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, temperatures, memory_activity, thermal_state };
 }
 const cadence = (requested_ms = 1000, effective_ms = requested_ms) => ({ requested_ms, effective_ms, pending: requested_ms !== effective_ms });
 async function nextPoll(harness) {
@@ -824,6 +824,40 @@ await check('memory activity refreshes in a collapsed card without changing deta
   await nextPoll(h); await h.answer(sample({ sequence: 3, memory_activity: null }));
   assert.equal(h.status(), 'live'); assert.equal(h.text('memory-pressure'), 'Unavailable');
   assert.equal(h.state().details.ram, true); assert.equal(h.document.activeElement, button);
+});
+
+await check('OS thermal states refresh while folded without deriving state from Celsius or RAM pressure', async () => {
+  const h = boot(); await h.answer(sample());
+  const button = h.elements.get('cooling-toggle'); button.focus();
+  assert.equal(h.text('thermal-state'), 'Unavailable');
+  for (const [index, level] of ['nominal', 'fair', 'serious', 'critical'].entries()) {
+    await nextPoll(h); await h.answer(sample({ sequence: index + 2, thermal_state: level,
+      data: metrics({ temp: { cpu_temp_avg: 80, gpu_temp_avg: 80 } }), memory_activity: { pressure: 'normal' } }));
+    assert.equal(h.text('thermal-state'), level[0].toUpperCase() + level.slice(1));
+    assert.equal(h.elements.get('thermal-state').dataset.level, level);
+    assert.equal(h.elements.get('cooling-details').hidden, true);
+    assert.equal(h.elements.get('thermal-state').visible, true);
+    assert.equal(h.document.activeElement, button);
+  }
+  await h.click('cooling-toggle'); assert.equal(h.state().details.cooling, true);
+  await nextPoll(h); await h.answer(sample({ sequence: 6, thermal_state: null }));
+  assert.equal(h.text('thermal-state'), 'Unavailable');
+  assert.equal(h.state().details.cooling, true); assert.equal(h.document.activeElement, button);
+  assert.match(html, /Nominal can also mean an unknown or unsupported platform/);
+  assert.match(html, /not a Celsius threshold or proof of CPU\/GPU throttling/);
+});
+
+await check('thermal state rejects unknown, unsafe and legacy values and physical-host claims on a VM', async () => {
+  const h = boot(); await h.answer(sample({ thermal_state: 'critical' }));
+  for (const [index, level] of [undefined, null, -1, 0, 4, 'Nominal', '__proto__', 'constructor', 'toString', '<script>', {}, []].entries()) {
+    await nextPoll(h); await h.answer(sample({ sequence: index + 2, thermal_state: level }));
+    assert.equal(h.text('thermal-state'), 'Unavailable');
+    assert.equal(h.elements.get('thermal-state').dataset.level, 'unavailable');
+  }
+  await nextPoll(h); await h.answer(sample({ sequence: 14, thermal_state: 'nominal', data: metrics({ soc: { vm: true } }) }));
+  assert.equal(h.text('thermal-state'), 'Unavailable');
+  await nextPoll(h); await h.answer(sample({ sequence: 15, thermal_state: 'fair' }));
+  assert.equal(h.text('thermal-state'), 'Fair');
 });
 
 console.log(`${tests.length} dashboard checks passed.`);

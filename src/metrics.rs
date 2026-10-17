@@ -16,6 +16,7 @@ use crate::sources::{
   cpu_load_ticks, get_soc_info, libc_ram, libc_swap,
 };
 use crate::temperature::{TemperatureGroup, TemperatureReading, TemperatureSource};
+use crate::thermal::{ThermalState, read_thermal_state};
 
 type WithError<T> = Result<T, Box<dyn std::error::Error>>;
 type CpuCoreKey = String;
@@ -601,6 +602,7 @@ pub struct Sampler {
   smc_gpu_keys: Vec<String>,
   smc_fan_keys: Vec<String>,
   temperature_details: Vec<TemperatureReading>,
+  thermal_state: Option<ThermalState>,
 }
 
 impl Sampler {
@@ -628,6 +630,7 @@ impl Sampler {
       smc_gpu_keys: smc_sensors.gpu_keys,
       smc_fan_keys: smc_sensors.fan_keys,
       temperature_details: Vec::new(),
+      thermal_state: None,
     })
   }
 
@@ -773,6 +776,7 @@ impl Sampler {
   /// `duration` is the requested polling interval in milliseconds.
   pub fn get_metrics(&mut self, duration: u32) -> WithError<Metrics> {
     self.temperature_details.clear();
+    self.thermal_state = None;
     // Until this acquisition completes successfully, the public getter and baseline stay empty.
     // Any early error drops the previous interval, rather than averaging across failed samples.
     let mut memory_activity = std::mem::take(&mut self.memory_activity);
@@ -822,6 +826,7 @@ impl Sampler {
       Ok(val) => val.max(rs.all_power),
       Err(_) => 0.0,
     };
+    self.thermal_state = read_thermal_state(self.soc.vm);
 
     memory_activity.sample();
     self.memory_activity = memory_activity;
@@ -850,6 +855,15 @@ impl Sampler {
   /// This getter does not read hardware or add fields to [`Metrics`] or [`MemMetrics`].
   pub fn memory_activity(&self) -> &MemoryActivity {
     self.memory_activity.latest()
+  }
+
+  /// OS-reported thermal state from the last successful acquisition, without another API read.
+  ///
+  /// Unavailable before sampling, after failed acquisition, in a VM or for an unavailable API
+  /// or unknown value. `Nominal` can also be the OS fallback for unsupported thermal telemetry;
+  /// it does not prove that hardware is unrestricted. This adds no fields to [`Metrics`].
+  pub fn thermal_state(&self) -> Option<ThermalState> {
+    self.thermal_state
   }
 }
 
@@ -951,6 +965,7 @@ mod tests {
       smc_gpu_keys: vec![],
       smc_fan_keys: vec![],
       temperature_details: vec![],
+      thermal_state: None,
     }
   }
 
@@ -1161,6 +1176,17 @@ mod tests {
     assert!(value.get("memory_activity").is_none());
     assert_eq!(value["memory"].as_object().unwrap().len(), 4);
     assert!(value["memory"].get("pressure").is_none());
+  }
+
+  #[test]
+  fn thermal_state_starts_unavailable_and_failed_acquisition_clears_a_previous_state() {
+    let mut sampler = sampler_without_sources(4, true);
+    assert_eq!(sampler.thermal_state(), None);
+    sampler.thermal_state = Some(crate::ThermalState::Critical);
+    // Forced CLPC without IOReport fails before any state is published.
+    assert!(sampler.get_metrics(0).is_err());
+    assert_eq!(sampler.thermal_state(), None);
+    assert_eq!(serde_json::to_value(Metrics::default()).unwrap().get("thermal_state"), None);
   }
 
   fn core(

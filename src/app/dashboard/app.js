@@ -342,6 +342,9 @@ function update(sample) {
   put("ram-detail", `${bytes(memory.ram_usage)} used / ${bytes(memory.ram_total)} total / Swap ${bytes(memory.swap_usage)} used / ${bytes(memory.swap_total)} allocated`);
   put("ram-summary", `${bytes(memory.ram_usage)} / ${bytes(memory.ram_total)}`);
   memoryActivity(sample);
+  const thermal = !vm && ["nominal", "fair", "serious", "critical"].includes(sample.thermal_state) ? sample.thermal_state : "unavailable";
+  $("thermal-state").dataset.level = thermal;
+  put("thermal-state", thermal === "unavailable" ? "Unavailable" : thermal[0].toUpperCase() + thermal.slice(1));
   put("device", [metrics.soc?.chip_name || "Local device", metrics.soc?.mac_model, vm ? "Virtual machine" : ""].filter(Boolean).join(" / "));
   put("sample-time", `Sample ${new Date(sample.sampled_at).toLocaleTimeString("en-US", { hour12: false })}`);
   state.history.push([metrics.cpu_active_ratio, gpu, ram, ...power(metrics), ...["cpu", "gpu"].map((name) => vm ? null : metrics.temp?.[`${name}_temp_avg`])]);

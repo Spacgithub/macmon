@@ -236,6 +236,13 @@ fn areas(
 }
 
 impl App {
+  pub(super) fn thermal_label(&self) -> String {
+    self
+      .thermal_state
+      .filter(|_| !self.soc.vm)
+      .map_or_else(|| "Unavailable".into(), |state| format!("{state:?}"))
+  }
+
   pub(super) fn cooling_detailed(&self) -> bool {
     self.cfg.panel_details[Panel::Cooling as usize]
       || (self.panels.fullscreen && self.panels.focus == Panel::Cooling)
@@ -490,8 +497,11 @@ impl App {
           } else {
             self.fans.label()
           })),
+          Line::from(text(format!("OS thermal {}", self.thermal_label()))),
         ];
         if detailed {
+          lines.push(Line::from(dim("OS state, not a Celsius threshold or proof of throttling")));
+          lines.push(Line::from(dim("Nominal may also mean an unknown or unsupported platform")));
           lines.extend(self.temperatures.lines(width));
         }
         lines
@@ -640,6 +650,63 @@ mod tests {
 
   fn sensor(name: &str, group: TemperatureGroup, celsius: f32) -> TemperatureReading {
     TemperatureReading { name: name.into(), group, source: TemperatureSource::Smc, celsius }
+  }
+
+  #[test]
+  fn thermal_state_is_sample_scoped_and_folding_keeps_the_cooling_summary_and_processes() {
+    use std::sync::RwLock;
+
+    use macmon::{Metrics, ThermalState};
+
+    use crate::tui::Event;
+
+    let mut app = app();
+    let interval = RwLock::new(1000);
+    render(&mut app, 80, 24);
+    let showing = app.procs_shown.showing();
+    for (state, label) in [
+      (Some(ThermalState::Nominal), "Nominal"),
+      (Some(ThermalState::Fair), "Fair"),
+      (Some(ThermalState::Serious), "Serious"),
+      (Some(ThermalState::Critical), "Critical"),
+      (None, "Unavailable"),
+    ] {
+      let metrics = Metrics {
+        temp: TempMetrics { cpu_temp_avg: Some(80.0), gpu_temp_avg: Some(80.0) },
+        ..Default::default()
+      };
+      assert!(
+        app
+          .handle_event(
+            Event::Update(Box::new(metrics), Vec::new(), Default::default(), state),
+            &interval,
+          )
+          .is_continue()
+      );
+      assert_eq!(app.thermal_state, state);
+      let summary = render(&mut app, 80, 24);
+      assert!(summary.contains(&format!("OS thermal {label}")), "{summary}");
+      assert!(summary.contains("top 5") && summary.contains("Network"));
+      assert_eq!(app.cfg.panel_details, [false; 6]);
+      app.panels.focus = Panel::Cooling;
+      press(&mut app, KeyCode::Char('f'));
+      for (width, height) in [(28, 12), (80, 24)] {
+        assert!(render(&mut app, width, height).contains(&format!("OS thermal {label}")));
+      }
+      let detail = render(&mut app, 80, 24);
+      assert!(detail.contains("not a Celsius threshold or proof of throttling"));
+      assert!(detail.contains("unknown or unsupported platform"));
+      press(&mut app, KeyCode::Char('f'));
+      app.cfg.panel_details = [true; 6];
+      let advanced = render(&mut app, 120, 40);
+      assert!(advanced.contains(&format!("OS thermal {label}")), "{advanced}");
+      app.cfg.panel_details = [false; 6];
+      assert_eq!(app.procs_shown.showing(), showing);
+    }
+    app.soc.vm = true;
+    app.thermal_state = Some(ThermalState::Critical);
+    assert!(render(&mut app, 80, 24).contains("OS thermal Unavailable"));
+    assert!(!render(&mut app, 80, 24).contains("OS thermal Critical"));
   }
 
   #[test]

@@ -185,3 +185,8 @@ what we need.
       level and independent swap-in/out page-equivalent rates, with compatible snapshots and
       concise terminal/browser summaries and details.
       Plan: [docs/plans/completed/20261017-memory-activity.md](plans/completed/20261017-memory-activity.md).
+
+- [x] **33. Show the operating system's thermal state.** Read the public ProcessInfo state
+      and display it alongside existing temperatures and fan readings, without inferring
+      state from individual sensor thresholds or changing legacy outputs.
+      Plan: [docs/plans/completed/20261017-system-thermal-state.md](plans/completed/20261017-system-thermal-state.md).
