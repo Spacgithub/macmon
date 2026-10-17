@@ -1,3 +1,5 @@
+Done: 2026-10-17, PR #21
+
 # Terminal overview and detail controls
 
 ## Behavior and decisions
@@ -21,4 +23,11 @@
 - [x] Add panel detail preferences and consistent keyboard controls.
 - [x] Integrate compact summaries, accessible full lists and temperature details/history.
 - [x] Verify geometry combinations, resize, filtering, selection and fan cleanup.
-- [ ] Run checks, rootless runtime validation and independent review.
+- [x] Run checks, rootless runtime validation and independent review.
+
+## Result
+
+Six live panels support independent summaries/details, a shared full-panel view and compatible
+saved preferences. Complete interface and sensor lists, temperature trends and existing
+process state survive view changes and resizing. Full checks, independent source and CLI
+review, and real rootless M2 Max / macOS 15.6.1 PTY interaction and cleanup checks passed.
