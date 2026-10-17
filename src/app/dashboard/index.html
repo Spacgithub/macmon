@@ -18,38 +18,44 @@
         </div><p id="interval-feedback" class="muted" role="status" aria-live="polite">Waiting for service settings</p>
       </div>
     </header>
+    <nav class="detail-controls" aria-label="Panel detail controls"><span class="muted">Your view</span><button id="expand-all" type="button">Expand all</button><button id="collapse-all" type="button">Collapse all</button></nav>
     <section class="overview" aria-label="Processor and memory overview">
       <article class="metric">
-        <div class="metric-top"><h2>CPU activity</h2><span class="tag">COMPUTE</span></div>
+        <div class="metric-top"><h2>CPU activity</h2><button id="cpu-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="cpu-details" aria-label="Show CPU details">Details</button></div>
         <div class="readings"><p class="reading" id="cpu-value">&mdash;</p><div class="temperature"><span>CPU TEMP</span><strong id="cpu-temp">Unavailable</strong></div></div>
+        <div id="cpu-details" hidden>
         <canvas id="cpu-chart" role="img" aria-label="CPU activity history, up to 60 samples"></canvas>
         <p class="detail" id="cpu-detail">Waiting for a sample</p>
+        </div>
       </article>
       <article class="metric">
-        <div class="metric-top"><h2>GPU activity</h2><span class="tag">GRAPHICS</span></div>
+        <div class="metric-top"><h2>GPU activity</h2><button id="gpu-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="gpu-details" aria-label="Show GPU details">Details</button></div>
         <div class="readings"><p class="reading" id="gpu-value">&mdash;</p><div class="temperature"><span>GPU TEMP</span><strong id="gpu-temp">Unavailable</strong></div></div>
+        <div id="gpu-details" hidden>
         <canvas id="gpu-chart" role="img" aria-label="GPU activity history, up to 60 samples"></canvas>
         <p class="detail" id="gpu-detail">Waiting for a sample</p>
+        </div>
       </article>
       <article class="metric">
-        <div class="metric-top"><h2>Unified memory</h2><span class="tag">MEMORY</span></div>
-        <p class="reading" id="ram-value">&mdash;</p><canvas id="ram-chart" role="img" aria-label="Memory usage history, up to 60 samples"></canvas>
+        <div class="metric-top"><h2>Unified memory</h2><button id="ram-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="ram-details" aria-label="Show memory details">Details</button></div>
+        <p class="reading" id="ram-value">&mdash;</p><p class="muted" id="ram-summary">Waiting for a sample</p>
+        <div id="ram-details" hidden><canvas id="ram-chart" role="img" aria-label="Memory usage history, up to 60 samples"></canvas>
         <p class="detail" id="ram-detail">Waiting for a sample</p>
+        </div>
       </article>
     </section>
     <section class="panel power" aria-labelledby="power-title">
-      <div class="panel-head"><div><p class="eyebrow">ENERGY TELEMETRY</p><h2 id="power-title">Power</h2></div><span class="tag">REPORTED ESTIMATES</span></div>
-      <div class="power-body">
+      <div class="panel-head"><div><p class="eyebrow">ENERGY TELEMETRY</p><h2 id="power-title">Power</h2></div><button id="power-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="power-details" aria-label="Show power details">Details</button></div>
         <div class="power-totals">
           <div><p class="muted">System estimate</p><p class="power-primary" id="system-power">Unavailable</p></div>
           <div><p class="muted">CPU + GPU + ANE</p><p class="power-subtotal" id="compute-power">Unavailable</p></div>
         </div>
+      <div id="power-details" hidden>
         <div class="power-history">
           <div class="power-key"><span>System estimate</span><span>CPU + GPU + ANE</span></div>
           <canvas id="power-chart" role="img" aria-label="System estimate and CPU plus GPU plus ANE subtotal history, separate lines on a shared watt scale, up to 60 samples" aria-describedby="power-range"></canvas>
           <p class="muted power-axis"><span id="power-range">Scale unavailable</span><span>Latest 60 samples</span></p>
         </div>
-      </div>
       <dl class="power-components">
         <div><dt>CPU</dt><dd id="cpu-power">Unavailable</dd></div>
         <div><dt>GPU</dt><dd id="gpu-power">Unavailable</dd></div>
@@ -60,12 +66,14 @@
       <details class="power-notes"><summary>About these readings</summary>
         <p>The system estimate uses the larger of the system sensor reading and the CPU + GPU + ANE subtotal; it is not wall-socket power. DRAM and GPU SRAM are separate reported values and should not be added to these totals. Some unsupported counters report zero, so zero alone does not establish zero consumption. Missing and virtual-machine readings stay unavailable.</p>
       </details>
+      </div>
     </section>
     <div class="detail-grid">
     <section class="panel" aria-labelledby="network-title">
-      <div class="panel-head"><div><p class="eyebrow">INTERFACE TELEMETRY</p><h2 id="network-title">Network</h2></div><span class="tag" id="network-count">NO DATA</span></div>
+      <div class="panel-head"><div><p class="eyebrow" id="network-count">INTERFACE TELEMETRY</p><h2 id="network-title">Network</h2></div><button id="network-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="network-details" aria-label="Show network details">Details</button></div>
       <p class="muted" id="network-empty">Waiting for a sample</p>
-      <div class="network-scroll" tabindex="0" role="region" aria-label="Network interfaces; scroll to see all">
+      <p class="muted table-note" id="network-scope">Top 3 interfaces by current traffic; rates are kept separate.</p>
+      <div id="network-details" class="network-scroll" tabindex="0" role="region" aria-label="Network interfaces; expand details to see all" data-expanded="false">
       <table id="network-table" hidden>
         <caption class="sr-only">Receive and transmit rates and cumulative bytes for each interface</caption>
         <thead><tr><th scope="col">Interface</th><th scope="col">RX / s</th><th scope="col">TX / s</th><th scope="col">RX total</th><th scope="col">TX total</th></tr></thead>
@@ -74,15 +82,27 @@
       </div>
     </section>
     <section class="panel" aria-labelledby="cooling-title">
-      <div class="panel-head"><div><p class="eyebrow">THERMAL SYSTEM</p><h2 id="cooling-title">Cooling</h2></div><label class="motion"><input id="motion" type="checkbox"> Fan motion</label></div>
-      <p class="muted" id="fan-empty">Waiting for a sample</p><div class="fans" id="fans" hidden></div>
+      <div class="panel-head"><div><p class="eyebrow">THERMAL SYSTEM</p><h2 id="cooling-title">Temperature &amp; cooling</h2></div><button id="cooling-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="cooling-details" aria-label="Show temperature and cooling details">Details</button></div>
+      <dl class="thermal-summary"><div><dt>CPU mean</dt><dd id="cooling-cpu-temp">Unavailable</dd></div><div><dt>GPU mean</dt><dd id="cooling-gpu-temp">Unavailable</dd></div></dl>
+      <p class="muted" id="fan-summary">Waiting for fan telemetry</p>
+      <div id="cooling-details" hidden>
+        <div class="thermal-key"><span>CPU mean</span><span>GPU mean</span></div>
+        <canvas id="temperature-chart" role="img" aria-label="CPU and GPU mean temperature history, separate lines in degrees Celsius, up to 60 samples" aria-describedby="temperature-range temperature-peaks"></canvas>
+        <p class="muted" id="temperature-range">Scale unavailable</p><p class="muted thermal-note" id="temperature-peaks">History mean peaks unavailable</p>
+        <p class="muted thermal-note" id="temperature-groups">Sensor detail unavailable</p>
+        <p class="muted thermal-note">Current ranges describe the reported sensor groups. SMC grouping is heuristic; names do not identify physical cores, batteries or storage.</p>
+        <div id="temperature-scroll" class="sensor-scroll" tabindex="0" role="region" aria-label="Temperature sensors; scroll to see all"><table id="temperature-table" hidden><caption class="sr-only">Raw sensor name, heuristic group, source and current degrees Celsius</caption><thead><tr><th scope="col">Sensor</th><th scope="col">Group</th><th scope="col">Source</th><th scope="col">°C</th></tr></thead><tbody id="temperature-rows"></tbody></table></div>
+        <label class="motion fan-motion"><input id="motion" type="checkbox"> Fan motion</label>
+        <p class="muted" id="fan-empty">Waiting for a sample</p><div class="fans" id="fans" hidden></div>
+      </div>
     </section>
     </div>
     <section class="panel processes" aria-labelledby="process-title">
       <div class="panel-head"><div><p class="eyebrow" id="process-count">PROCESS TELEMETRY</p><h2 id="process-title">Processes</h2></div>
-        <label class="motion">Sort by <select id="process-sort"><option value="cpu_pct">CPU usage</option><option value="gpu_pct">GPU usage</option><option value="mem_bytes">Memory</option></select></label></div>
+        <div class="panel-actions"><label class="motion">Sort by <select id="process-sort"><option value="cpu_pct">CPU usage</option><option value="gpu_pct">GPU usage</option><option value="mem_bytes">Memory</option></select></label><button id="process-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="process-details" aria-label="Show process details">Details</button></div></div>
       <p class="muted" id="process-status">Waiting for a sample</p><p class="muted" id="process-empty">Waiting for a sample</p>
-      <div class="process-scroll" tabindex="0" role="region" aria-label="Processes; scroll to see all">
+      <p class="muted table-note" id="process-scope">Top 5 processes in the selected order.</p>
+      <div id="process-details" class="process-scroll" tabindex="0" role="region" aria-label="Processes; expand details to see all" data-expanded="false">
         <table id="process-table" hidden><caption class="sr-only">Process name and PID, CPU percent (100% is one core), GPU percent and memory; unavailable rates shown as a dash</caption>
           <thead><tr><th scope="col">Process / PID</th><th scope="col">CPU %</th><th scope="col">GPU %</th><th scope="col">Memory</th></tr></thead><tbody id="process-rows"></tbody>
         </table>

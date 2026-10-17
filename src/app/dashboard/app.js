@@ -5,7 +5,14 @@ const finite = (value) => typeof value === "number" && Number.isFinite(value) &&
 const number = (value, digits = 1) => finite(value) ? value.toFixed(digits) : unknown;
 const percent = (value) => finite(value) ? `${(Math.min(value, 1) * 100).toFixed(1)}%` : unknown;
 const put = (id, value) => { $(id).textContent = value; };
-const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], frame: 0, last: 0, cadence: null, changing: false, intervalError: false };
+const panelNames = { cpu: "CPU", gpu: "GPU", ram: "memory", power: "power", network: "network", cooling: "temperature and cooling", process: "process" };
+const preferenceKey = "macmon.panel-details.v1";
+function loadDetails() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(preferenceKey)); } catch { /* Browser storage is optional. */ }
+  return Object.fromEntries(Object.keys(panelNames).map((name) => [name, saved?.[name] === true]));
+}
+const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], frame: 0, last: 0, cadence: null, changing: false, intervalError: false, details: loadDetails() };
 const motion = $("motion");
 const reduced = matchMedia("(prefers-reduced-motion: reduce)");
 motion.checked = !reduced.matches;
@@ -66,7 +73,34 @@ async function adjustInterval(adjustment) {
   }
 }
 function live() { return state.online && !state.waiting && state.sample && age() <= limit(); }
-function moving() { return live() && !document.hidden && motion.checked && [...state.fans.values()].some((fan) => fan.rpm > 0); }
+function moving() { return state.details.cooling && live() && !document.hidden && motion.checked && [...state.fans.values()].some((fan) => fan.rpm > 0); }
+function rowDetails(name, limit) {
+  const rows = [...$(`${name}-rows`).children], all = state.details[name];
+  rows.forEach((row, index) => { row.hidden = !all && index >= limit; });
+  put(`${name}-scope`, name === "network"
+    ? `${all ? "All" : `Top ${Math.min(limit, rows.length)}`} of ${rows.length} interfaces by current traffic; rates are kept separate.`
+    : `${all ? "All" : `Top ${Math.min(limit, rows.length)}`} of ${rows.length} processes in the selected order.`);
+}
+function applyDetails() {
+  for (const [name, label] of Object.entries(panelNames)) {
+    const all = state.details[name], button = $(`${name}-toggle`), body = $(`${name}-details`);
+    button.setAttribute("aria-expanded", String(all));
+    button.setAttribute("aria-label", `${all ? "Hide" : "Show"} ${label} details`);
+    button.textContent = all ? "Less" : "Details";
+    body.dataset.expanded = String(all);
+    if (name === "network" || name === "process") {
+      body.setAttribute("aria-label", `${name === "network" ? "Network interfaces" : "Processes"}; ${all ? "scroll to see all" : "expand details to see all"}`);
+      rowDetails(name, name === "network" ? 3 : 5);
+    } else body.hidden = !all;
+  }
+  drawCharts();
+  settle();
+}
+function changeDetails(names, value) {
+  for (const name of names) state.details[name] = value ?? !state.details[name];
+  try { localStorage.setItem(preferenceKey, JSON.stringify(state.details)); } catch { /* Keep this view usable without storage. */ }
+  applyDetails();
+}
 function settle() {
   clearTimeout(staleTimer);
   const status = state.waiting ? "waiting" : state.online === null ? "connecting" : !state.online ? "offline" : live() ? "live" : "stale";
@@ -125,9 +159,10 @@ function drawCharts() {
     context.stroke();
   });
   drawPowerChart();
+  drawTemperatureChart();
 }
 function drawPowerChart() {
-  const values = state.history.flatMap((point) => point.slice(3)).filter(finite);
+  const values = state.history.flatMap((point) => point.slice(3, 5)).filter(finite);
   const peak = Math.max(0, ...values), unit = peak > 0 ? 10 ** Math.floor(Math.log10(peak)) : 1;
   const rounded = [1, 2, 5, 10].map((step) => step * unit).find((value) => value >= peak);
   const maximum = finite(rounded) && rounded > 0 ? rounded : peak || 1;
@@ -157,6 +192,56 @@ function drawPowerChart() {
     context.stroke();
   });
 }
+const temperatureValue = (value) => typeof value === "number" && Number.isFinite(value);
+const celsius = (value) => temperatureValue(value) ? `${value.toFixed(1)} °C` : "Unavailable";
+function drawTemperatureChart() {
+  const values = state.history.flatMap((point) => point.slice(5, 7)).filter(temperatureValue);
+  const low = values.length ? Math.floor(Math.min(...values) / 10) * 10 : 0;
+  const high = values.length ? Math.max(low + 10, Math.ceil(Math.max(...values) / 10) * 10) : 100;
+  put("temperature-range", values.length ? `${low}–${high} °C / latest ${state.history.length} samples` : "Scale unavailable");
+  put("temperature-peaks", ["CPU", "GPU"].map((name, group) => {
+    const readings = state.history.map((point) => point[group + 5]).filter(temperatureValue);
+    return `${name} ${celsius(readings.length ? Math.max(...readings) : null)}`;
+  }).join(" / ") + " / peaks of recorded means, not current sensor hotspots");
+  const canvas = $("temperature-chart"), context = canvas.getContext("2d");
+  const width = canvas.clientWidth, height = canvas.clientHeight, scale = window.devicePixelRatio || 1;
+  if (!context || !width || !height) return;
+  canvas.width = Math.round(width * scale); canvas.height = Math.round(height * scale);
+  context.setTransform(scale, 0, 0, scale, 0, 0);
+  ["--accent", "--power-subtotal"].forEach((color, index) => {
+    context.beginPath(); context.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue(color).trim();
+    context.lineWidth = 1.8; context.setLineDash(index ? [5, 4] : []);
+    let connected = false;
+    state.history.forEach((point, position) => {
+      const value = point[index + 5];
+      if (!temperatureValue(value)) { connected = false; return; }
+      const x = width * (60 - state.history.length + position) / 59, y = height * (1 - (value - low) / (high - low));
+      if (connected) context.lineTo(x, y); else context.moveTo(x, y);
+      connected = true;
+    });
+    context.stroke();
+  });
+}
+function temperatures(sample) {
+  const rows = !sample.metrics.soc?.vm && Array.isArray(sample.temperatures) ? sample.temperatures.filter((item) =>
+    item && typeof item.name === "string" && item.name && ["cpu", "gpu"].includes(item.group)
+      && ["smc", "hid"].includes(item.source) && temperatureValue(item.celsius) && item.celsius > 0 && item.celsius <= 150) : [];
+  rows.sort((a, b) => a.group.localeCompare(b.group) || a.name.localeCompare(b.name) || a.source.localeCompare(b.source));
+  put("temperature-groups", rows.length ? ["cpu", "gpu"].map((group) => {
+    const sensors = rows.filter((item) => item.group === group), values = sensors.map((item) => item.celsius);
+    const hottest = sensors.reduce((best, item) => !best || item.celsius > best.celsius ? item : best, null);
+    return `${group.toUpperCase()}: ${values.length ? `${values.length} sensors / current min ${celsius(Math.min(...values))} / max ${celsius(hottest.celsius)} / hottest ${hottest.name}` : "Unavailable"}`;
+  }).join(" · ") : "Sensor detail unavailable; the backend may not expose individual readings.");
+  $("temperature-table").hidden = !rows.length;
+  $("temperature-rows").replaceChildren(...rows.map((item) => {
+    const row = document.createElement("tr");
+    [item.name, item.group.toUpperCase(), item.source.toUpperCase(), celsius(item.celsius)].forEach((value, index) => {
+      const cell = document.createElement("td"); cell.textContent = value;
+      cell.dataset.label = ["Sensor", "Group", "Source", "°C"][index]; row.append(cell);
+    });
+    return row;
+  }));
+}
 function network(metrics) {
   const rows = Array.isArray(metrics.network) ? metrics.network.filter((item) => item && typeof item.name === "string") : [];
   const traffic = (item) => [item.rx_bytes_per_sec, item.tx_bytes_per_sec].reduce((sum, rate) => sum + (finite(rate) ? rate : 0), 0);
@@ -175,6 +260,7 @@ function network(metrics) {
     });
     return row;
   }));
+  rowDetails("network", 3);
 }
 function cooling(metrics) {
   const next = new Map();
@@ -204,6 +290,7 @@ function cooling(metrics) {
   $("fans").hidden = !next.size;
   $("fan-empty").hidden = !!next.size;
   put("fan-empty", metrics.soc?.vm ? "Fan telemetry unavailable in a virtual machine." : "No fan telemetry reported.");
+  put("fan-summary", next.size ? [...next.values()].map((fan) => `${fan.node.querySelector(".fan-name").textContent} ${number(fan.rpm, 0)} RPM`).join(" / ") : $("fan-empty").textContent);
 }
 function processes() {
   const items = state.sample?.processes;
@@ -225,6 +312,7 @@ function processes() {
     });
     return row;
   }));
+  rowDetails("process", 5);
 }
 function update(sample) {
   const metrics = sample.metrics, vm = metrics.soc?.vm, memory = metrics.memory || {};
@@ -237,18 +325,21 @@ function update(sample) {
   put("ram-value", percent(ram));
   const tiers = vm ? unknown : (Array.isArray(metrics.cpu_tiers) ? metrics.cpu_tiers : []).map((tier) => `${tier.label} ${number(tier.freq_mhz, 0)} MHz`).join(" / ") || unknown;
   for (const name of ["cpu", "gpu"]) {
-    const value = metrics.temp?.[`${name}_temp_avg`];
-    put(`${name}-temp`, typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(1)} \u00b0C` : "Unavailable");
+    const value = vm ? null : metrics.temp?.[`${name}_temp_avg`];
+    put(`${name}-temp`, celsius(value));
+    put(`cooling-${name}-temp`, celsius(value));
   }
   put("cpu-detail", `${watts(vm ? null : metrics.cpu_power)} / ${tiers}`);
   put("gpu-detail", `${watts(vm ? null : metrics.gpu_power)} / ${number(gpuUnavailable ? null : metrics.gpu_freq_mhz, 0)} MHz`);
   put("ram-detail", `${bytes(memory.ram_usage)} used / ${bytes(memory.ram_total)} total / ${bytes(memory.swap_usage)} swap`);
+  put("ram-summary", `${bytes(memory.ram_usage)} / ${bytes(memory.ram_total)}`);
   put("device", [metrics.soc?.chip_name || "Local device", metrics.soc?.mac_model, vm ? "Virtual machine" : ""].filter(Boolean).join(" / "));
   put("sample-time", `Sample ${new Date(sample.sampled_at).toLocaleTimeString("en-US", { hour12: false })}`);
-  state.history.push([metrics.cpu_active_ratio, gpu, ram, ...power(metrics)]);
+  state.history.push([metrics.cpu_active_ratio, gpu, ram, ...power(metrics), ...["cpu", "gpu"].map((name) => vm ? null : metrics.temp?.[`${name}_temp_avg`])]);
   if (state.history.length > 60) state.history.shift();
   network(metrics);
   cooling(metrics);
+  temperatures(sample);
   processes();
   drawCharts();
 }
@@ -301,6 +392,9 @@ async function poll() {
 }
 motion.addEventListener("change", settle);
 $("process-sort").addEventListener("change", processes);
+Object.keys(panelNames).forEach((name) => $(`${name}-toggle`).addEventListener("click", () => changeDetails([name])));
+$("expand-all").addEventListener("click", () => changeDetails(Object.keys(panelNames), true));
+$("collapse-all").addEventListener("click", () => changeDetails(Object.keys(panelNames), false));
 
 $("interval-down").addEventListener("click", () => adjustInterval("decrease"));
 $("interval-up").addEventListener("click", () => adjustInterval("increase"));
@@ -311,4 +405,5 @@ document.addEventListener("visibilitychange", () => {
   settle();
 });
 new ResizeObserver(drawCharts).observe($("cpu-chart").parentElement.parentElement);
+applyDetails();
 poll();
