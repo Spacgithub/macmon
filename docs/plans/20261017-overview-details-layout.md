@@ -35,6 +35,6 @@
 
 - [x] Add meaningful browser CPU/GPU details and honest Network overview semantics.
 - [x] Rebalance browser compact/expanded layout with responsive and persistence coverage.
-- [ ] Add matching Terminal Compute and Network summaries/details with layout regressions.
+- [x] Add matching Terminal Compute and Network summaries/details with layout regressions.
 - [ ] Run focused and full checks, independent reviews, and real browser/private-PTY checks;
   retain all disk functionality and verify the user's installed service and settings.

@@ -13,12 +13,12 @@ use ratatui::widgets::{
   Block, BorderType, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
 };
 
-use super::App;
 use super::layout::{LayoutPlan, Metric};
 use super::proc_view::{ELLIPSIS, head};
 use super::store::{ClusterStore, FreqStore, PowerStore, ratio};
 use super::theme::{self, dim, faint, gradient, heading, text};
 use super::widgets::{Gauge, Graph};
+use super::{App, network};
 use crate::config::{RatioMode, TUI_MAX_MS, ViewType};
 
 /// Bytes in a GiB, the unit of the RAM box title.
@@ -31,21 +31,6 @@ const BORDER_TEXT_MIN: u16 = 8;
 /// Temperature position on the load gradient: 30 °C is cool, 100 °C is hot.
 fn temp_ratio(celsius: f32) -> f64 {
   (f64::from(celsius) - 30.0) / 70.0
-}
-
-fn network_quantity(mut bytes: f64) -> (f64, &'static str) {
-  let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-  let mut unit = 0;
-  while bytes >= 1024.0 && unit < units.len() - 1 {
-    bytes /= 1024.0;
-    unit += 1;
-  }
-  (bytes, units[unit])
-}
-
-fn network_bytes(bytes: f64) -> String {
-  let (bytes, unit) = network_quantity(bytes);
-  format!("{bytes:.1} {unit}")
 }
 
 /// `width` cells as `u16`, the type of screen coordinates; saturating, as no text on screen is
@@ -354,21 +339,85 @@ impl App {
 
   pub(super) fn render_network_page(&self, f: &mut Frame, area: Rect, offset: usize, limit: usize) {
     let metrics = self.network.as_deref().unwrap_or_default();
-    let shown = usize::from(area.height.saturating_sub(3))
-      .min(limit)
-      .min(metrics.len().saturating_sub(offset));
+    let legacy = self.panels_legacy();
+    let detailed = legacy || limit != 3;
+    let narrow = !legacy && detailed && area.width.saturating_sub(2) < 66;
+    let shown = (if legacy {
+      usize::from(area.height.saturating_sub(3))
+    } else {
+      self.network_page_size(area)
+    })
+    .min(limit)
+    .min(metrics.len().saturating_sub(offset));
     let label = if self.panels_legacy() { "Network" } else { "4 Network" };
-    let title =
-      vec![theme::value(label, theme::SECTION), dim(format!(" {shown}/{}", metrics.len()))];
-    let hint_label = if self.panels.fullscreen { "back" } else { "all interfaces" };
-    let inner = draw_box(f, area, Titles::new(title).right(hint("f", hint_label)));
-    if metrics.is_empty() {
-      let status = if self.network.is_none() { "unavailable" } else { "no active interfaces" };
-      f.render_widget(Paragraph::new(dim(status)), inner);
+    let title = vec![
+      theme::value(label, theme::SECTION),
+      dim(if legacy {
+        format!(" {shown}/{}", metrics.len())
+      } else if detailed {
+        if narrow { " · detail".into() } else { format!(" {shown}/{} · detail", metrics.len()) }
+      } else {
+        " · overview".into()
+      }),
+    ];
+    let hint_label = if self.panels.fullscreen { "back" } else { "full" };
+    let mut overview = self.network_overview(usize::from(area.width.saturating_sub(2)));
+    let mut titles = Titles::new(title.clone()).right(hint("f", hint_label));
+    if legacy && !metrics.is_empty() {
+      let counts = overview.remove(0);
+      let interface = overview.remove(0);
+      let (active, pending) = network::counts(metrics);
+      let mut status_title = title;
+      status_title.push(dim(format!(" · {}", self.network_status())));
+      titles = fit_titles(
+        area.width,
+        vec![
+          Titles::new(status_title.clone())
+            .left(interface.clone())
+            .left(counts)
+            .right(hint("f", hint_label)),
+          Titles::new(status_title.clone())
+            .left(interface.clone())
+            .left(dim(format!("N{} A{active} P{pending}", metrics.len())))
+            .right(hint("f", hint_label)),
+          Titles::new(status_title).left(interface).right(hint("f", hint_label)),
+          Titles::new(vec![theme::value(label, theme::SECTION)]).right(hint("f", hint_label)),
+        ],
+      );
+      overview.clear();
+    }
+    if narrow && !metrics.is_empty() {
+      overview = vec![overview[0].clone(), overview.last().unwrap().clone()];
+    }
+    let mut inner = draw_box(f, area, titles);
+    f.render_widget(Paragraph::new(overview.clone()), inner);
+    if !detailed || metrics.is_empty() {
+      if !detailed && inner.height as usize > overview.len() {
+        let note = if inner.width >= 42 {
+          "One named interface; VPN/bridge rates stay separate"
+        } else {
+          "Per-interface · no combined total"
+        };
+        f.render_widget(
+          Paragraph::new(dim(note)),
+          Rect { y: inner.y + overview.len() as u16, height: 1, ..inner },
+        );
+      }
+      return;
+    }
+    let heading_height = (overview.len() as u16).min(inner.height);
+    inner.y += heading_height;
+    inner.height -= heading_height;
+    if narrow {
+      f.render_widget(
+        Paragraph::new(self.network_detail_lines(inner.width as usize))
+          .scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        inner,
+      );
       return;
     }
     let mut widths = if !self.panels_legacy() && inner.width < 44 {
-      [8u16, 11, 11, 11, 11]
+      [8u16, 12, 12, 11, 11]
     } else {
       [15u16, 12, 12, 11, 11]
     };
@@ -381,19 +430,22 @@ impl App {
     let table = if inner.width >= needed + 2 { inner.inner(Margin::new(1, 0)) } else { inner };
     widths[0] += table.width.saturating_sub(needed);
     let rate = |v: Option<f64>, color| {
-      let line = match v {
-        Some(v) if v > 0.0 => {
-          let (value, unit) = network_quantity(v);
-          Line::from(vec![theme::value(format!("{value:.1}"), color), dim(format!(" {unit}/s"))])
+      let line = match network::rate(v) {
+        Some(v) => {
+          let formatted = network::bytes(v);
+          let (number, unit) = formatted.split_once(' ').unwrap();
+          Line::from(vec![theme::value(number.to_owned(), color), dim(format!(" {unit}/s"))])
         }
-        v => Line::from(dim(v.map_or_else(|| "—".into(), |v| format!("{}/s", network_bytes(v))))),
+        None => Line::from(dim("—")),
       };
       Cell::from(line.right_aligned())
     };
     let rows = metrics.iter().skip(offset).take(shown).map(|m| {
       let values = [
         Cell::from(
-          if m.rx_bytes_per_sec.unwrap_or(0.0) + m.tx_bytes_per_sec.unwrap_or(0.0) > 0.0 {
+          if network::rate(m.rx_bytes_per_sec).unwrap_or(0.0) > 0.0
+            || network::rate(m.tx_bytes_per_sec).unwrap_or(0.0) > 0.0
+          {
             heading(m.name.clone())
           } else {
             text(m.name.clone())
@@ -401,8 +453,8 @@ impl App {
         ),
         rate(m.rx_bytes_per_sec, theme::DOWNLOAD),
         rate(m.tx_bytes_per_sec, theme::UPLOAD),
-        Cell::from(Line::from(dim(network_bytes(m.rx_bytes as f64))).right_aligned()),
-        Cell::from(Line::from(dim(network_bytes(m.tx_bytes as f64))).right_aligned()),
+        Cell::from(Line::from(dim(network::bytes(m.rx_bytes as f64))).right_aligned()),
+        Cell::from(Line::from(dim(network::bytes(m.tx_bytes as f64))).right_aligned()),
       ];
       Row::new(values.into_iter().take(columns))
     });
@@ -463,7 +515,14 @@ impl App {
 
     if let Some(compute) = plan.compute {
       let mode = if self.cfg.view_type == ViewType::Gauge { "gauge" } else { "history" };
-      draw_box(f, compute, Titles::new(theme::value("Compute", theme::CPU)).right(dim(mode)));
+      let overall = self.compute_overall_title();
+      draw_box(
+        f,
+        compute,
+        Titles::new(theme::value("Compute", theme::CPU))
+          .left(overall)
+          .right(dim(format!("{mode} · f full"))),
+      );
     }
 
     for &(kind, r) in &plan.boxes {
@@ -632,9 +691,9 @@ impl App {
           1 => "CPU".to_string(),
           _ => format!("{}-CPU", cluster.label),
         };
-        self.freq_box(label, &cluster.freq)
+        self.freq_box(label, &cluster.freq, Some(i))
       }
-      Metric::Gpu => self.freq_box("GPU".to_string(), &self.igpu_freq),
+      Metric::Gpu => self.freq_box("GPU".to_string(), &self.igpu_freq, None),
       Metric::Ram => self.ram_box(),
       Metric::CpuPower => self.power_box("CPU", &self.cpu_power, self.cpu_temp.last(), width),
       Metric::GpuPower => self.power_box("GPU", &self.gpu_power, self.gpu_temp.last(), width),
@@ -645,17 +704,33 @@ impl App {
 
   /// `E-CPU 42% @ 1800 MHz` (the percent colored by load), or `E-CPU 42%` when the frequency
   /// doesn't fit or is 0 (none read), over the usage history scaled to 100 %, or a gauge.
-  fn freq_box<'a>(&self, label: String, freq: &'a FreqStore) -> MetricBox<'a> {
-    let series = freq.ratio(self.cfg.ratio_mode);
-    let short = vec![heading(label), text(" "), self.percent(series.ratio, 0)];
+  fn freq_box<'a>(
+    &self,
+    label: String,
+    freq: &'a FreqStore,
+    cluster: Option<usize>,
+  ) -> MetricBox<'a> {
+    let requested = self.cfg.ratio_mode;
+    let mode = if self.compute_legacy_value(cluster, requested).is_some() {
+      requested
+    } else {
+      RatioMode::Active
+    };
+    let value = self.compute_legacy_value(cluster, mode);
+    let series = freq.ratio(mode);
+    let mut short = vec![heading(label), text(" ")];
+    if requested != mode && value.is_some() {
+      short.push(dim("Active "));
+    }
+    short.push(value.map_or_else(|| dim("Unavailable"), |value| self.percent(f64::from(value), 0)));
     let mut full = short.clone();
-    if freq.freq_mhz > 0 {
+    if self.compute_legacy_frequency(cluster) && freq.freq_mhz > 0 {
       full.push(dim(format!(" @ {} MHz", freq.freq_mhz)));
     }
 
     MetricBox {
       titles: vec![Titles::new(full), Titles::new(short)],
-      data: &series.items,
+      data: if value.is_some() { &series.items } else { &[] },
       scale: Scale::Load { max: 100, load: series.ratio },
     }
   }

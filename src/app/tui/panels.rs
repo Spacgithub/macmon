@@ -430,15 +430,14 @@ impl App {
   pub(super) fn handle_panel_mouse(&mut self, mouse: MouseEvent) -> bool {
     let point = Position::new(mouse.column, mouse.row);
     if self.panels_legacy()
-      && self
-        .panels
-        .targets
-        .iter()
-        .any(|(panel, area)| *panel == Panel::Processes && area.contains(point))
+      && self.panels.targets.iter().any(|(panel, area)| {
+        matches!(panel, Panel::Compute | Panel::Network | Panel::Processes) && area.contains(point)
+      })
     {
-      // A compact advanced summary has no table targets; its header selects without folding.
+      // Advanced details and compact process summaries select without changing density/layout.
       if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-        self.panels.focus = Panel::Processes;
+        self.panels.focus =
+          self.panels.targets.iter().find(|(_, area)| area.contains(point)).unwrap().0;
         self.proc_view.end_typing();
       }
       return true;
@@ -477,38 +476,7 @@ impl App {
 
   fn panel_lines(&self, panel: Panel, detailed: bool, width: usize) -> Vec<Line<'static>> {
     match panel {
-      Panel::Compute => {
-        let mut lines = Vec::new();
-        let mode = if self.soc.vm { crate::config::RatioMode::Active } else { self.cfg.ratio_mode };
-        let frequency =
-          |mhz| if mhz > 0 { format!(" · {mhz} MHz") } else { " · frequency unavailable".into() };
-        for cluster in &self.clusters.items {
-          let freq = &cluster.freq;
-          let ratio = freq.ratio(mode);
-          let label =
-            if cluster.label == "_" { "CPU".into() } else { format!("{} CPU", cluster.label) };
-          lines.push(Line::from(vec![
-            theme::value(format!("{label} "), theme::CPU),
-            text(format!("{:.1}%{}", ratio.ratio * 100.0, frequency(freq.freq_mhz))),
-          ]));
-          if detailed {
-            lines.push(history(&ratio.items, 100, width, theme::CPU));
-          }
-        }
-        if self.soc.vm {
-          lines.push(Line::from(dim("GPU unavailable in a VM")));
-          return lines;
-        }
-        let gpu = self.igpu_freq.ratio(self.cfg.ratio_mode);
-        lines.push(Line::from(vec![
-          theme::value("GPU ", theme::GPU),
-          text(format!("{:.1}%{}", gpu.ratio * 100.0, frequency(self.igpu_freq.freq_mhz))),
-        ]));
-        if detailed {
-          lines.push(history(&gpu.items, 100, width, theme::GPU));
-        }
-        lines
-      }
+      Panel::Compute => self.compute_lines(detailed, width),
       Panel::Memory => {
         let gib = |value| format!("{:.2} GiB", value as f64 / (1u64 << 30) as f64);
         let mut lines = vec![Line::from(text(format!(
@@ -638,8 +606,8 @@ impl App {
         continue;
       }
       if panel == Panel::Network {
-        let total = self.network.as_ref().map_or(0, Vec::len);
-        let page = usize::from(rect.height.saturating_sub(3));
+        let total = self.network_detail_count(rect);
+        let page = self.network_page_size(rect);
         let offset = if detailed {
           self.panels.offsets[panel as usize].min(total.saturating_sub(page))
         } else {
@@ -649,7 +617,15 @@ impl App {
         self.panels.pages[panel as usize] = page;
         self.render_network_page(frame, rect, offset, if detailed { usize::MAX } else { 3 });
         if detailed {
-          draw_scrollbar(frame, rect, rect.inner(Margin::new(1, 1)), total, offset);
+          let inner = rect.inner(Margin::new(1, 1));
+          let rows = page.min(inner.height as usize) as u16;
+          draw_scrollbar(
+            frame,
+            rect,
+            Rect { y: inner.bottom() - rows, height: rows, ..inner },
+            total,
+            offset,
+          );
         }
         continue;
       }
@@ -932,6 +908,7 @@ mod tests {
     };
     let mut app = App::from_parts(soc, Config::default());
     app.update_metrics(macmon::Metrics {
+      cpu_active_ratio: 0.63,
       cpu_tiers: vec![macmon::CpuTierMetrics {
         label: "_".into(),
         cores: Vec::new(),
@@ -947,12 +924,13 @@ mod tests {
       app.panels.fullscreen = full;
       let view = render(&mut app, 80, 24);
       assert!(
-        view.contains("CPU 63.0%")
-          && view.contains("frequency unavailable")
-          && view.contains("GPU unavailable"),
+        view.contains("CPU Active 63.0%") && view.contains("GPU Active (reported) Unavailable"),
         "{view}"
       );
       assert!(!view.contains("0 MHz") && !view.contains("GPU 0.0%"));
+      if full {
+        assert!(view.contains("CPU frequency/weighted unavailable"));
+      }
     }
     app.panels.focus = Panel::Cooling;
     let view = render(&mut app, 80, 24);

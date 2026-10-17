@@ -81,16 +81,30 @@ Options:
 ### Interactive mode
 
 Run `macmon` without a subcommand to open seven compact panels: Compute, Memory, Power,
-Network, Cooling, Processes and Disk. At 80×24 their live summaries keep the three busiest named
-interfaces, five sorted processes, current CPU/GPU temperatures, fan RPM and the busiest physical
-disk visible. Disk keeps read/write rates separate; IOPS appears when the whole field fits.
+Network, Cooling, Processes and Disk. At 80×24 their live summaries keep one named automatic
+Network observation, five sorted processes, current CPU/GPU temperatures, fan RPM and the
+busiest physical disk visible. Disk keeps read/write rates separate; IOPS appears when the
+whole field fits.
 
 Use `1`–`7` to toggle a panel, `Tab` / `Shift-Tab` to select one, and `Enter` to toggle the
 selected panel. `d` expands all panels or returns them to summaries. `f` opens the selected
 panel in a full-screen detail view; `f` / `Esc` returns. Use arrows, Page Up/Down or Home/End
-to scroll complete interface and sensor lists. Process arrows retain their selection behavior
+to scroll complete core, interface and sensor lists. Process arrows retain their selection behavior
 and open the full list when needed. Filtering, sorting and selected processes survive detail
 changes and resizing; `p` separately hides the process panel and stops its sampling.
+
+Expanded Compute adds the original overall CPU activity, reported/installed core counts,
+core-type summaries and every reported die/core. GPU details add reported activity, supported
+frequency range, core count, power and history. `r` retains the chosen Active/Weighted mode;
+missing weighted measurements are labelled unavailable with reported activity kept separate.
+Core/GPU MHz describe active-time means; CPU tier aggregates include a minimum-frequency
+floor. Tick fallbacks, incomplete coverage and VM readings do not establish weighted frequency
+measurements, and a zero GPU report does not prove idle. Use `1` then `f` for the full analysis.
+
+Network summaries show the selected Auto interface, separate receive/transmit rates and
+observed/traffic-active/rates-pending counts. At narrow widths these counts are abbreviated
+N/A/P. Traffic and pending counts can overlap. Expanded Network adds every interface's
+rates and cumulative bytes; narrow cards wrap complete fields and scroll through the list.
 
 Expanded Cooling shows each group's current sensor count/range, the current hotspot's raw
 name, a 60-sample mean-temperature trend with gaps for missing readings, historical mean
@@ -111,8 +125,9 @@ critical-warning bit field.
 When all panels are expanded, the advanced chart layout remains available. At least 100
 columns and 30 rows show Compute on the left, Memory and a Power/Temperature ledger on the
 right, and full-width Network and Processes below. Smaller windows and VMs use the adaptive
-metric grid. This overview keeps Network concise; select it or Cooling and press `f` for the
-complete interface or named-sensor detail view. Disk has its own full-width strip. When a small
+metric grid. This overview keeps three Network rows when room permits; select Compute,
+Network or Cooling and press `f` for full core, interface or named-sensor details. Disk has its
+own full-width strip. When a small
 advanced window needs space for complete fans and Disk, Processes shows a concise entry;
 `6` then `f` still opens the full process list without changing the sampling preference.
 
@@ -461,7 +476,10 @@ Both the CLI and the Rust library use known CLPC counters automatically, and `Sa
 ### Network monitoring
 
 The TUI shows receive and transmit rates and cumulative byte counters for each network
-interface that is up, excluding loopback. The compact panel shows the busiest interfaces;
+interface that is up, excluding loopback. The compact panel automatically observes one named
+interface, preferring available rates then known traffic, with stable name tie breaks. Its
+global state distinguishes collecting, unavailable, empty, rates pending, observed traffic
+and measured zero. This describes sampling, not Internet connectivity. Expand for all interfaces;
 `pipe`, HTTP `/json`, and Prometheus export every sampled interface. Rates use the measured
 time between snapshots, including time between calls to the Rust sampler.
 
