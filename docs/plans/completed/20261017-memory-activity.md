@@ -1,3 +1,5 @@
+Done: 2026-10-17, PR #22
+
 # Memory pressure and swap activity
 
 ## Behavior and decisions
@@ -20,4 +22,11 @@
 - [x] Add rootless pressure/counter sources, safe rate sampling and focused regression tests.
 - [x] Publish compatible library and HTTP snapshots and verify failure/freshness semantics.
 - [x] Add terminal and browser summaries/details with missing-data and layout coverage.
-- [ ] Run full checks, independent review and real rootless comparison with system counters.
+- [x] Run full checks, independent review and real rootless comparison with system counters.
+
+## Result
+
+Added same-sample OS memory pressure and safe independent swap-in/out page-equivalent rates,
+with compatible library/HTTP accessors and terminal/browser summaries and details. Focused
+regressions cover missing sources, counter/time resets and compact two-fan layouts. Full
+checks, independent review and rootless M2 Max runtime comparisons passed.
