@@ -1,3 +1,5 @@
+Done: 2026-10-17, PR #19
+
 # Detailed temperature readings
 
 ## Behavior and decisions
@@ -17,4 +19,10 @@
 
 - [x] Retain named temperature readings with source and group, with focused tests.
 - [x] Publish same-sample temperature details without breaking existing outputs.
-- [ ] Verify real rootless readings, compatibility, checks and independent review.
+- [x] Verify real rootless readings, compatibility, checks and independent review.
+
+## Result
+
+Named CPU/GPU readings are retained and exposed without additional hardware reads or changes
+to existing metric structs and legacy outputs. Real rootless M2 Max / macOS 15.6.1 sampling,
+compatibility tests, full checks and independent review passed.

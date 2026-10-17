@@ -169,9 +169,9 @@ what we need.
       Plan: [docs/plans/completed/20261016-web-cli.md](plans/completed/20261016-web-cli.md).
       Existing executable aliases: [compatibility plan](plans/completed/20261016-web-cli-alias-compatibility.md).
 
-- [ ] **29. Retain detailed temperature readings.** Publish same-sample named CPU/GPU
+- [x] **29. Retain detailed temperature readings.** Publish same-sample named CPU/GPU
       sensor readings without changing existing metric structs or legacy outputs.
-      Plan: [docs/plans/20261017-temperature-details.md](plans/20261017-temperature-details.md).
+      Plan: [docs/plans/completed/20261017-temperature-details.md](plans/completed/20261017-temperature-details.md).
 
 - [ ] **30. Add browser overview/detail controls.** Per-panel and global expansion,
       temperature history and named sensors, with concise live summaries.
