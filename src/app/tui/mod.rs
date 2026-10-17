@@ -868,6 +868,7 @@ impl App {
     self.cooling.render(f, &self.placements);
     if let Some(r) = plan.proc {
       if r.height < 6 {
+        self.panels.targets.push((Panel::Processes, r));
         self.render_proc_summary(f, r);
       } else {
         self.render_proc_box(f, r);
@@ -2093,6 +2094,62 @@ mod tests {
     render_buffer(&mut app, 200, 50);
     click(&mut app, mem.0, mem.1);
     assert_eq!(app.cfg.proc_sort, ProcSort::Mem);
+  }
+
+  #[test]
+  fn compact_advanced_process_summary_click_restores_focus_without_toggling_preferences() {
+    use super::fan_protocol::Capabilities;
+
+    for native in [false, true] {
+      let mut app = test_app_with(|metrics| {
+        metrics.fans = ["fan0", "fan1"]
+          .map(|name| FanMetric { name: name.into(), rpm: 1800, max_rpm: None })
+          .into();
+      });
+      app.cell_pixels = Some((9, 18));
+      app.capabilities = native.then_some(Capabilities {
+        foreground: [230; 3],
+        background: [20; 3],
+        accent: None,
+        cell_pixels: (9, 18),
+      });
+      let mut app = with_procs(app, varied_procs());
+      assert!(press(&mut app, KeyCode::Down).is_continue());
+      for disk_row in [0, 1] {
+        for process_row in [0, 1, 2] {
+          let buf = render_buffer(&mut app, 80, 24);
+          assert_eq!(app.placements.len(), 2);
+          let process = app.layout(buf.area).proc.unwrap();
+          assert_eq!(process, Rect::new(0, 21, 80, 3));
+          let disk = app.legacy_layout(buf.area).2.unwrap();
+          assert_eq!(disk, Rect::new(0, 18, 80, 3));
+          click(&mut app, disk.x + 2, disk.y + disk_row);
+          assert_eq!(app.panels.focus, super::Panel::Disk);
+          assert!(app.panels_legacy());
+          let choices = (app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs);
+          let showing = app.procs_shown.showing();
+          let selected = app.proc_view.selected_pid();
+          assert!(showing.is_some());
+          render_buffer(&mut app, 80, 24);
+          click(&mut app, process.x + 2, process.y + process_row);
+          assert_eq!(app.panels.focus, super::Panel::Processes);
+          assert!(app.panels_legacy());
+          assert_eq!((app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs), choices);
+          assert_eq!(app.procs_shown.showing(), showing);
+          assert_eq!(app.proc_view.selected_pid(), selected);
+          assert!(press(&mut app, KeyCode::Char('f')).is_continue());
+          let full = render_buffer(&mut app, 80, 24);
+          assert!(app.panels.fullscreen && app.panels.focus == super::Panel::Processes);
+          assert!(screen_text(&full).contains("WindowServer"));
+          assert!(app.placements.is_empty());
+          assert_eq!((app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs), choices);
+          assert_eq!(app.procs_shown.showing(), showing);
+          assert!(press(&mut app, KeyCode::Esc).is_continue());
+          render_buffer(&mut app, 80, 24);
+          assert_eq!(app.placements.len(), 2);
+        }
+      }
+    }
   }
 
   #[test]

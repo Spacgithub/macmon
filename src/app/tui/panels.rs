@@ -430,6 +430,20 @@ impl App {
   pub(super) fn handle_panel_mouse(&mut self, mouse: MouseEvent) -> bool {
     let point = Position::new(mouse.column, mouse.row);
     if self.panels_legacy()
+      && self
+        .panels
+        .targets
+        .iter()
+        .any(|(panel, area)| *panel == Panel::Processes && area.contains(point))
+    {
+      // A compact advanced summary has no table targets; its header selects without folding.
+      if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+        self.panels.focus = Panel::Processes;
+        self.proc_view.end_typing();
+      }
+      return true;
+    }
+    if self.panels_legacy()
       && !self
         .panels
         .targets
