@@ -23,6 +23,16 @@ pub(super) const MEMORY: Color = Color::Blue;
 pub(super) const POWER: Color = Color::Green;
 pub(super) const DOWNLOAD: Color = CPU;
 pub(super) const UPLOAD: Color = GPU;
+
+/// Operating-system pressure levels are separate from the RAM utilization gradient.
+pub(super) fn memory_pressure(pressure: Option<macmon::MemoryPressure>) -> Color {
+  match pressure {
+    Some(macmon::MemoryPressure::Normal) => Color::Green,
+    Some(macmon::MemoryPressure::Warning) => Color::Yellow,
+    Some(macmon::MemoryPressure::Critical) => Color::Red,
+    None => DIM,
+  }
+}
 /// Selected process row: reverse video over the default colors, so the row reads as one bar
 /// instead of reversing each load color in it.
 pub(super) const SELECTED: Style = Style::new().fg(TEXT).add_modifier(Modifier::REVERSED);

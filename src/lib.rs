@@ -75,6 +75,7 @@ mod clpc;
 #[cfg(feature = "app")]
 #[doc(hidden)]
 pub mod diagnostics;
+mod memory_activity;
 #[doc(hidden)]
 pub mod metrics;
 mod network;
@@ -83,6 +84,8 @@ pub mod sources;
 mod temperature;
 
 // Re-export the commonly used types.
+#[doc(inline)]
+pub use memory_activity::{MemoryActivity, MemoryPressure};
 #[doc(inline)]
 pub use metrics::{
   CpuCoreMetrics, CpuTierMetrics, FanMetric, MemMetrics, Metrics, Sampler, TempMetrics,

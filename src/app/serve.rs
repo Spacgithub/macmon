@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use macmon::{Metrics, SocInfo, TemperatureReading};
+use macmon::{MemoryActivity, Metrics, SocInfo, TemperatureReading};
 
 use crate::config::{TUI_MAX_MS, TUI_MIN_MS};
 use crate::metrics_to_json_value;
@@ -47,9 +47,21 @@ impl Cadence {
   }
 }
 
+#[derive(Default)]
+pub(crate) struct SampleDetails {
+  pub temperatures: Vec<TemperatureReading>,
+  pub memory_activity: MemoryActivity,
+}
+
+impl From<Vec<TemperatureReading>> for SampleDetails {
+  fn from(temperatures: Vec<TemperatureReading>) -> Self {
+    Self { temperatures, ..Self::default() }
+  }
+}
+
 pub struct Sample {
   metrics: Metrics,
-  temperatures: Vec<TemperatureReading>,
+  details: SampleDetails,
   sequence: u64,
   sampled_at: String,
   sampled: Instant,
@@ -62,10 +74,10 @@ pub fn sample_time() -> (Instant, String) {
   (Instant::now(), chrono::Utc::now().to_rfc3339())
 }
 
-pub fn publish_sample(
+pub(crate) fn publish_sample(
   shared: &SharedMetrics,
   metrics: Metrics,
-  temperatures: Vec<TemperatureReading>,
+  details: impl Into<SampleDetails>,
   interval_ms: u32,
   processes: Option<ProcessSnapshot>,
   time: (Instant, String),
@@ -73,8 +85,15 @@ pub fn publish_sample(
   let (sampled, sampled_at) = time;
   let mut latest = shared.write().unwrap();
   let sequence = latest.as_ref().map_or(1, |sample| sample.sequence.saturating_add(1));
-  *latest =
-    Some(Sample { metrics, temperatures, sequence, sampled_at, sampled, interval_ms, processes });
+  *latest = Some(Sample {
+    metrics,
+    details: details.into(),
+    sequence,
+    sampled_at,
+    sampled,
+    interval_ms,
+    processes,
+  });
 }
 
 fn escape_label_value(value: &str) -> String {
@@ -228,7 +247,8 @@ fn to_sample(sample: &Sample, soc: &SocInfo, local: bool, cadence: &Cadence) -> 
     "interval_ms": sample.interval_ms,
     "cadence": cadence.value(),
     "metrics": json_value(&sample.metrics, soc, &sample.sampled_at),
-    "temperatures": sample.temperatures,
+    "temperatures": sample.details.temperatures,
+    "memory_activity": sample.details.memory_activity,
     "processes": processes.map(|snapshot| &snapshot.rows),
     "processes_age_ms": processes.map(|snapshot| snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
   })
@@ -699,6 +719,31 @@ mod tests {
     assert_eq!(response["sequence"], 3);
     assert_eq!(response["temperatures"], serde_json::json!([]));
     assert!(response["metrics"]["temp"]["cpu_temp_avg"].is_null());
+  }
+
+  #[test]
+  fn memory_activity_is_sample_scoped_and_leaves_legacy_outputs_unchanged() {
+    let shared = Arc::new(RwLock::new(None));
+    let expected_prometheus = to_prometheus(&Metrics::default(), &SocInfo::default());
+    let activity = macmon::MemoryActivity {
+      pressure: Some(macmon::MemoryPressure::Warning),
+      swap_in_bytes_per_sec: Some(16384.0),
+      swap_out_bytes_per_sec: Some(0.0),
+    };
+    for (index, activity) in [activity, macmon::MemoryActivity::default()].into_iter().enumerate() {
+      let details = super::SampleDetails { memory_activity: activity, ..Default::default() };
+      publish_sample(&shared, Metrics::default(), details, 1000, None, super::sample_time());
+      let response: serde_json::Value =
+        serde_json::from_str(body(&get(&shared, "/api/sample"))).unwrap();
+      assert_eq!(response["sequence"], index + 1);
+      assert_eq!(response["memory_activity"], serde_json::to_value(activity).unwrap());
+      assert!(response["metrics"].get("memory_activity").is_none());
+      let legacy: serde_json::Value = serde_json::from_str(body(&get(&shared, "/json"))).unwrap();
+      assert!(legacy.get("memory_activity").is_none());
+      assert_eq!(legacy["memory"], response["metrics"]["memory"]);
+      assert_eq!(legacy["memory"].as_object().unwrap().len(), 4);
+      assert_eq!(body(&get(&shared, "/metrics")), expected_prometheus);
+    }
   }
 
   #[test]

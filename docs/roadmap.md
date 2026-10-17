@@ -180,3 +180,8 @@ what we need.
 - [x] **31. Add terminal overview/detail controls.** Keyboard-accessible per-panel and
       global expansion, full lists and temperature details with compatible preferences.
       Plan: [docs/plans/completed/20261017-terminal-panel-details.md](plans/completed/20261017-terminal-panel-details.md).
+
+- [x] **32. Show memory pressure and swap activity.** Read the operating system's pressure
+      level and independent swap-in/out page-equivalent rates, with compatible snapshots and
+      concise terminal/browser summaries and details.
+      Plan: [docs/plans/completed/20261017-memory-activity.md](plans/completed/20261017-memory-activity.md).

@@ -195,7 +195,7 @@ mod fan_preview {
     let _ = app.apply_event(Event::Key(key('a')), &interval).unwrap();
     assert!(!app.fan_frames_active());
     for event in
-      [Event::FocusLost, Event::FocusGained, Event::Update(Box::new(preview_metrics("two")), Vec::new())]
+      [Event::FocusLost, Event::FocusGained, Event::Update(Box::new(preview_metrics("two")), Vec::new(), Default::default())]
     {
       let _ = app.apply_event(event, &interval).unwrap();
       render_buffer(&mut app, 120, 40);
@@ -220,18 +220,18 @@ mod fan_preview {
     assert!(angles[1] > angles[0] && angles[0] > 0.0);
     let mut metrics = preview_metrics("two");
     metrics.fans.reverse();
-    let _ = app.apply_event(Event::Update(Box::new(metrics), Vec::new()), &interval).unwrap();
+    let _ = app.apply_event(Event::Update(Box::new(metrics), Vec::new(), Default::default()), &interval).unwrap();
     assert_eq!(app.cooling.items()[0].name, "fan1");
     assert_eq!(app.cooling.items()[0].rotor.angle, angles[1]);
     assert_eq!(app.cooling.items()[1].rotor.angle, angles[0]);
-    let _ = app.apply_event(Event::Update(Box::new(preview_metrics("zero")), Vec::new()), &interval).unwrap();
+    let _ = app.apply_event(Event::Update(Box::new(preview_metrics("zero")), Vec::new(), Default::default()), &interval).unwrap();
     render_buffer(&mut app, 120, 40);
     assert!(!app.fan_frames_active());
     assert!(app.cooling.items().iter().all(|fan| fan.rpm == 0 && fan.rotor.velocity == 0.0));
     let stopped: Vec<_> = app.cooling.items().iter().map(|fan| fan.rotor.angle).collect();
     app.cooling.frame(Duration::from_secs(1));
     assert_eq!(app.cooling.items().iter().map(|fan| fan.rotor.angle).collect::<Vec<_>>(), stopped);
-    let _ = app.apply_event(Event::Update(Box::new(preview_metrics("missing")), Vec::new()), &interval).unwrap();
+    let _ = app.apply_event(Event::Update(Box::new(preview_metrics("missing")), Vec::new(), Default::default()), &interval).unwrap();
     let screen = render_to_string(&mut app, 120, 40);
     assert!(app.cooling.items().is_empty() && app.placements.is_empty());
     assert!(!app.fan_frames_active() && !screen.contains("Cooling"));
@@ -339,7 +339,7 @@ mod fan_preview {
             break;
           }
           if now >= next_sample {
-            if tx.send(Event::Update(Box::new(preview_metrics(&mode)), Vec::new())).is_err() {
+            if tx.send(Event::Update(Box::new(preview_metrics(&mode)), Vec::new(), Default::default())).is_err() {
               break;
             }
             updates.fetch_add(1, Ordering::SeqCst);

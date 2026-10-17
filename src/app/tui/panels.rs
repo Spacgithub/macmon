@@ -10,7 +10,7 @@ use ratatui::widgets::Paragraph;
 use super::boxes::{Titles, draw_box, draw_scrollbar, hint};
 use super::cooling::Placement;
 use super::theme::{self, dim, text};
-use super::{App, cooling_layout, help};
+use super::{App, cooling_layout, help, memory};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -189,6 +189,7 @@ fn areas(
           } else {
             match panel {
               Panel::Network => 6,
+              Panel::Memory => 6,
               Panel::Processes => 8,
               _ => 5,
             }
@@ -415,19 +416,19 @@ impl App {
       }
       Panel::Memory => {
         let gib = |value| format!("{:.2} GiB", value as f64 / (1u64 << 30) as f64);
-        let mut lines = vec![
-          Line::from(text(format!(
-            "RAM {} / {}",
-            gib(self.mem.ram_usage),
-            gib(self.mem.ram_total)
-          ))),
-          Line::from(dim(format!(
+        let mut lines = vec![Line::from(text(format!(
+          "RAM {} / {}",
+          gib(self.mem.ram_usage),
+          gib(self.mem.ram_total)
+        )))];
+        lines.extend(memory::activity_lines(&self.memory_activity));
+        if detailed {
+          lines.push(Line::from(dim(format!(
             "Swap {} / {}",
             gib(self.mem.swap_usage),
             gib(self.mem.swap_total)
-          ))),
-        ];
-        if detailed {
+          ))));
+          lines.push(Line::from(dim("Logical paging, not SSD I/O")));
           lines.push(Line::from(dim("RAM history · latest 60 samples")));
           lines.push(history(&self.mem.items, self.mem.ram_total, width, theme::MEMORY));
         }

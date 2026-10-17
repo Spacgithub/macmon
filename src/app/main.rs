@@ -309,8 +309,10 @@ fn main() -> Result<(), Box<dyn Error>> {
           Ok(m) => {
             let time = serve::sample_time();
             let temperatures = sampler.temperature_details().to_vec();
+            let details =
+              serve::SampleDetails { temperatures, memory_activity: *sampler.memory_activity() };
             let processes = processes.sample_dashboard();
-            serve::publish_sample(&shared, m, temperatures, window, Some(processes), time);
+            serve::publish_sample(&shared, m, details, window, Some(processes), time);
           }
           Err(e) => eprintln!("sampling error: {e}"),
         }

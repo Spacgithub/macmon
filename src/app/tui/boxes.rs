@@ -483,6 +483,28 @@ impl App {
       } else {
         fit_titles(r.width, metric.titles)
       };
+      let titles = if overview {
+        let short = vec![
+          theme::value("Memory", theme::MEMORY),
+          text(" "),
+          self.percent(ratio(self.mem.ram_usage as f64, self.mem.ram_total as f64), 0),
+        ];
+        let badge = || super::memory::pressure_badge(self.memory_activity.pressure);
+        fit_titles(
+          r.width,
+          vec![
+            titles.right(badge()),
+            Titles::new(short).right(badge()),
+            Titles::new(theme::value("Memory", theme::MEMORY)).right(badge()),
+            Titles::new(theme::value("RAM", theme::MEMORY)).right(badge()),
+            Titles::new(theme::value("Memory", theme::MEMORY)),
+          ],
+        )
+      } else if kind == Metric::Ram {
+        titles.right(super::memory::pressure_badge(self.memory_activity.pressure))
+      } else {
+        titles
+      };
       let mut inner = draw_box(f, r, titles);
       if overview && inner.height > 1 {
         let quantity = vec![
@@ -513,6 +535,12 @@ impl App {
         }
         Scale::Load { max, .. } => f.render_widget(graph.accent(accent).max(max), graph_area),
         Scale::Power => f.render_widget(graph, graph_area),
+      }
+      if kind == Metric::Ram
+        && let Some(rates) =
+          super::memory::fitted_rates(&self.memory_activity, usize::from(r.width.saturating_sub(6)))
+      {
+        render_bottom_border(f, r, Vec::new(), |_| rates.spans);
       }
     }
 

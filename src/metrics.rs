@@ -6,6 +6,7 @@ use std::time::Duration;
 use core_foundation::dictionary::CFDictionaryRef;
 use serde::Serialize;
 
+use crate::memory_activity::{MemoryActivity, MemoryActivitySampler};
 use crate::network::{NetworkMetric, NetworkSampler};
 use crate::shared::{
   ioreport_channels_filter, is_clpc_energy_channel, is_pmp_ane_channel, zero_div,
@@ -593,6 +594,7 @@ pub struct Sampler {
   /// CPU ticks at the end of the last sample; the first sample takes its own baseline.
   cpu_ticks: Option<Vec<[u32; 4]>>,
   network: NetworkSampler,
+  memory_activity: MemoryActivitySampler,
   hid: IOHIDSensors,
   smc: Option<SMC>,
   smc_cpu_keys: Vec<String>,
@@ -619,6 +621,7 @@ impl Sampler {
       use_cpu_ticks,
       cpu_ticks: None,
       network: NetworkSampler::default(),
+      memory_activity: MemoryActivitySampler::default(),
       hid,
       smc: smc_sensors.smc,
       smc_cpu_keys: smc_sensors.cpu_keys,
@@ -770,6 +773,9 @@ impl Sampler {
   /// `duration` is the requested polling interval in milliseconds.
   pub fn get_metrics(&mut self, duration: u32) -> WithError<Metrics> {
     self.temperature_details.clear();
+    // Until this acquisition completes successfully, the public getter and baseline stay empty.
+    // Any early error drops the previous interval, rather than averaging across failed samples.
+    let mut memory_activity = std::mem::take(&mut self.memory_activity);
     // CPU Stats channel naming by chip family (see: https://github.com/vladkens/macmon/issues/47)
     //   M1-M4:  ECPU* = efficiency cores (lower tier)
     //           PCPU* = performance cores (top tier)
@@ -817,6 +823,9 @@ impl Sampler {
       Err(_) => 0.0,
     };
 
+    memory_activity.sample();
+    self.memory_activity = memory_activity;
+
     Ok(rs)
   }
 
@@ -832,6 +841,15 @@ impl Sampler {
   /// This does not read hardware or add fields to [`Metrics`] or [`TempMetrics`].
   pub fn temperature_details(&self) -> &[TemperatureReading] {
     &self.temperature_details
+  }
+
+  /// OS pressure and swap activity from the last successful [`Self::get_metrics`] acquisition.
+  ///
+  /// All fields are `None` before the first acquisition and after a failed acquisition. The
+  /// first successful swap-counter read establishes a baseline; rates need a second valid read.
+  /// This getter does not read hardware or add fields to [`Metrics`] or [`MemMetrics`].
+  pub fn memory_activity(&self) -> &MemoryActivity {
+    self.memory_activity.latest()
   }
 }
 
@@ -926,6 +944,7 @@ mod tests {
       use_cpu_ticks: true,
       cpu_ticks: None,
       network: Default::default(),
+      memory_activity: Default::default(),
       hid: IOHIDSensors::new().unwrap(),
       smc: None,
       smc_cpu_keys: vec![],
@@ -1123,6 +1142,25 @@ mod tests {
     // Forced CLPC without IOReport fails before temperatures are acquired.
     assert!(sampler.get_metrics(0).is_err());
     assert!(sampler.temperature_details().is_empty());
+  }
+
+  #[test]
+  fn failed_acquisitions_clear_memory_activity_and_preserve_legacy_memory_shape() {
+    let mut sampler = sampler_without_sources(4, true);
+    assert_eq!(sampler.memory_activity(), &crate::MemoryActivity::default());
+    let previous = crate::MemoryActivity {
+      pressure: Some(crate::MemoryPressure::Critical),
+      swap_in_bytes_per_sec: Some(4096.0),
+      swap_out_bytes_per_sec: Some(8192.0),
+    };
+    sampler.memory_activity = crate::memory_activity::MemoryActivitySampler::fixture(previous);
+    assert_eq!(*sampler.memory_activity(), previous);
+    assert!(sampler.get_metrics(0).is_err());
+    assert_eq!(sampler.memory_activity(), &crate::MemoryActivity::default());
+    let value = serde_json::to_value(Metrics::default()).unwrap();
+    assert!(value.get("memory_activity").is_none());
+    assert_eq!(value["memory"].as_object().unwrap().len(), 4);
+    assert!(value["memory"].get("pressure").is_none());
   }
 
   fn core(
