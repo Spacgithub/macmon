@@ -32,6 +32,6 @@
 - [x] Add bounded native NVMe health collection, freshness, identity mapping and failure fallbacks.
 - [x] Publish compatible library/API disk snapshots with precision and legacy-output tests.
 - [x] Add Terminal summary/details, controls and narrow/compact/expanded layout coverage.
-- [ ] Add browser card/history/details with persisted expansion and missing/stale-data coverage.
+- [x] Add browser card/history/details with persisted expansion and missing/stale-data coverage.
 - [ ] Run full checks and independent reviews, and compare rootless hardware readings with
   independent I/O and SMART probes; verify Terminal/Web behavior without changing user settings.

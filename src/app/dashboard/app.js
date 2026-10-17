@@ -5,14 +5,14 @@ const finite = (value) => typeof value === "number" && Number.isFinite(value) &&
 const number = (value, digits = 1) => finite(value) ? value.toFixed(digits) : unknown;
 const percent = (value) => finite(value) ? `${(Math.min(value, 1) * 100).toFixed(1)}%` : unknown;
 const put = (id, value) => { $(id).textContent = value; };
-const panelNames = { cpu: "CPU", gpu: "GPU", ram: "memory", power: "power", network: "network", cooling: "temperature and cooling", process: "process" };
+const panelNames = { cpu: "CPU", gpu: "GPU", ram: "memory", power: "power", disk: "disk", network: "network", cooling: "temperature and cooling", process: "process" };
 const preferenceKey = "macmon.panel-details.v1";
 function loadDetails() {
   let saved;
   try { saved = JSON.parse(localStorage.getItem(preferenceKey)); } catch { /* Browser storage is optional. */ }
   return Object.fromEntries(Object.keys(panelNames).map((name) => [name, saved?.[name] === true]));
 }
-const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], frame: 0, last: 0, cadence: null, changing: false, intervalError: false, details: loadDetails() };
+const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], disks: new Map(), diskHistory: new Map(), diskSelected: null, frame: 0, last: 0, cadence: null, changing: false, intervalError: false, details: loadDetails() };
 const motion = $("motion");
 const reduced = matchMedia("(prefers-reduced-motion: reduce)");
 motion.checked = !reduced.matches;
@@ -35,6 +35,155 @@ function memoryActivity(sample) {
   put("memory-pressure", level === "unavailable" ? "Unavailable" : level[0].toUpperCase() + level.slice(1));
   put("swap-in-rate", finite(activity?.swap_in_bytes_per_sec) ? `${bytes(activity.swap_in_bytes_per_sec)}/s` : "Unavailable");
   put("swap-out-rate", finite(activity?.swap_out_bytes_per_sec) ? `${bytes(activity.swap_out_bytes_per_sec)}/s` : "Unavailable");
+}
+const diskInteger = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+const diskByte = (value, maximum = 255) => diskInteger(value) !== null && value <= maximum ? value : null;
+const diskText = (value, maximum = 160) => typeof value === "string" && value.trim() && value.length <= maximum && !/[\u0000-\u001f\u007f-\u009f]/.test(value) ? value : null;
+const u128Max = (1n << 128n) - 1n;
+function diskU128(value) {
+  if (typeof value !== "string" || value.length > 39 || !/^(0|[1-9][0-9]{0,38})$/.test(value)) return null;
+  const integer = BigInt(value);
+  return integer <= u128Max ? integer : null;
+}
+function diskLifetime(value) {
+  const units = diskU128(value);
+  if (units === null || units > u128Max / 512000n) return "Unavailable";
+  const total = units * 512000n, names = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"];
+  let scale = 0, divisor = 1n;
+  while (scale < names.length - 1 && total >= divisor * 1024n) { divisor *= 1024n; scale++; }
+  return `${(total / divisor).toLocaleString("en-US")}${scale ? `.${total % divisor * 10n / divisor}` : ""} ${names[scale]}`;
+}
+function diskBytes(value) {
+  if (!finite(value)) return "Unavailable";
+  if (value === 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+  let scale = 0;
+  while (scale < units.length - 1 && value >= 1024) { value /= 1024; scale++; }
+  return `${value >= 10000 ? value.toExponential(2) : value.toLocaleString("en-US", { maximumSignificantDigits: 3 })} ${units[scale]}`;
+}
+const diskRate = (value) => finite(value) ? `${diskBytes(value)}/s` : "Unavailable";
+const diskCount = (value) => diskInteger(value) === null ? "Unavailable" : value === 0 ? "0" : value.toLocaleString("en-US");
+const diskIOPS = (value) => finite(value) ? `${value === 0 ? "0" : value >= 10000 ? value.toExponential(2) : value.toLocaleString("en-US", { maximumSignificantDigits: 3 })} IOPS` : "Unavailable";
+const diskUsed = (value) => value === 255 ? ">254% (raw 255)" : value === null ? "Unavailable" : `${value}%`;
+function diskHealth(raw) {
+  const status = ["available", "unsupported", "unavailable"].includes(raw?.state) ? raw.state : "unavailable";
+  const value = status === "available" && raw?.nvme && typeof raw.nvme === "object" && !Array.isArray(raw.nvme) ? raw.nvme : null;
+  return { status, age: diskInteger(raw?.age_ms), value };
+}
+function diskHealthView(health) {
+  const elapsed = performance.now() - state.received;
+  const age = health.age === null ? Infinity : health.age + (state.sample?.age_ms ?? Infinity) + elapsed;
+  const knownAge = Number.isFinite(age) && age >= 0 && age <= Number.MAX_SAFE_INTEGER;
+  const warning = diskByte(health.value?.critical_warning), used = diskByte(health.value?.percentage_used);
+  const mode = health.status !== "available" || !health.value ? health.status === "unsupported" ? "unsupported" : "unavailable"
+    : !knownAge || warning === null ? "unavailable" : age > 120000 ? "stale" : !live() ? "retained" : "current";
+  const label = mode === "unsupported" ? "Unsupported" : mode === "unavailable" ? "Unavailable"
+    : `${mode === "current" ? "" : `${mode === "stale" ? "Stale" : "Retained"} / `}${warning === null ? "Warning unavailable" : warning ? `Warning 0x${warning.toString(16).padStart(2, "0")}` : "No NVMe warning"}`;
+  return { mode, age, label: `${label}${health.value && used !== null ? ` / used ${diskUsed(used)}` : ""}`,
+    ageLabel: knownAge ? `${Math.floor(age / 1000)}s old / ${mode}` : "Age unavailable", warning };
+}
+function diskField(parent, label) {
+  const group = document.createElement("div"), term = document.createElement("dt"), value = document.createElement("dd");
+  term.textContent = label; group.append(term, value); parent.append(group); return value;
+}
+function diskNode() {
+  const summary = document.createElement("article"), detail = document.createElement("article");
+  const option = document.createElement("option");
+  summary.className = "disk-summary-card"; detail.className = "disk-device";
+  const title = document.createElement("h3"), detailTitle = document.createElement("h3"), badge = document.createElement("p"), detailBadge = document.createElement("p");
+  badge.className = detailBadge.className = "disk-health";
+  const rates = document.createElement("dl"), detailRates = document.createElement("dl"), data = document.createElement("dl");
+  rates.className = detailRates.className = "disk-rates"; data.className = "disk-data";
+  summary.append(title, badge, rates); detail.append(detailTitle, detailBadge, detailRates, data);
+  const compact = [rates, detailRates].map((parent) => ["Read", "Write", "Read IOPS", "Write IOPS"].map((label) => diskField(parent, label)));
+  const labels = ["Device", "Driver read", "Driver write", "Read operations", "Write operations", "Health age", "Critical warning", "Endurance used", "Available spare", "Spare threshold", "Temperature", "Lifetime host read", "Lifetime host write", "Power cycles", "Power-on hours", "Unsafe shutdowns", "Media errors", "Error log entries"];
+  return { summary, detail, option, title, detailTitle, badge, detailBadge, compact, fields: labels.map((label) => diskField(data, label)) };
+}
+function diskChildren(parent, children) {
+  if (parent.children.length === children.length && [...parent.children].every((child, index) => child === children[index])) return false;
+  parent.replaceChildren(...children);
+  return true;
+}
+function diskScope() {
+  const all = state.details.disk, count = state.disks.size;
+  $("disk-summary").hidden = all;
+  [...$("disk-summary").children].forEach((row, index) => { row.hidden = index >= 3; });
+  put("disk-scope", state.diskAvailable ? `${all ? "All" : `Top ${Math.min(3, count)}`} of ${count} physical ${count === 1 ? "device" : "devices"} by current I/O; each disk stays separate.` : "Physical disk readings unavailable.");
+}
+function refreshDiskHealth() {
+  let next = Infinity;
+  for (const view of state.disks.values()) {
+    const health = diskHealthView(view.health), raw = view.health.value;
+    for (const badge of [view.badge, view.detailBadge]) { badge.textContent = health.label; badge.dataset.state = health.mode; badge.dataset.warning = String(health.warning !== null && health.warning > 0); }
+    const percentValue = (value) => value === null ? "Unavailable" : `${value}%`;
+    const integer = (value) => { const parsed = diskU128(value); return parsed === null ? "Unavailable" : parsed.toLocaleString("en-US"); };
+    const temperature = raw?.temperature_celsius;
+    const warning = health.warning === null ? "Unavailable" : `0x${health.warning.toString(16).padStart(2, "0")}${health.warning ? " / reported warning" : " / none reported"}`;
+    const values = [health.ageLabel, warning, diskUsed(diskByte(raw?.percentage_used)), percentValue(diskByte(raw?.available_spare_percent, 100)), percentValue(diskByte(raw?.spare_threshold_percent, 100)),
+      typeof temperature === "number" && Number.isFinite(temperature) && temperature >= -273.15 && temperature <= 65261.85 ? `${temperature.toFixed(1)} °C` : "Unavailable",
+      diskLifetime(raw?.data_units_read), diskLifetime(raw?.data_units_written), ...["power_cycles", "power_on_hours", "unsafe_shutdowns", "media_errors", "error_log_entries"].map((key) => integer(raw?.[key]))];
+    values.forEach((value, index) => { view.fields[index + 5].textContent = value; });
+    if (health.mode === "current" || health.mode === "retained") next = Math.min(next, Math.max(1, 120001 - health.age));
+  }
+  return next;
+}
+function disks(sample) {
+  const available = Array.isArray(sample.disks), next = new Map();
+  const rows = available ? sample.disks.filter((item) => item && typeof item.id === "string" && /^[A-Za-z0-9:._/-]{1,128}$/.test(item.id) && diskText(item.name)) : [];
+  const traffic = (item) => (finite(item.read_bytes_per_sec) ? item.read_bytes_per_sec / 2 : 0) + (finite(item.write_bytes_per_sec) ? item.write_bytes_per_sec / 2 : 0);
+  rows.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+  for (const item of rows) {
+    if (next.has(item.id)) continue;
+    const view = state.disks.get(item.id) || diskNode();
+    view.health = diskHealth(item.health); view.name = item.name; view.traffic = traffic(item);
+    if (view.option.value !== item.id) view.option.value = item.id;
+    if (view.option.textContent !== item.name) view.option.textContent = item.name;
+    view.title.textContent = view.detailTitle.textContent = item.name;
+    [diskRate(item.read_bytes_per_sec), diskRate(item.write_bytes_per_sec), diskIOPS(item.read_iops), diskIOPS(item.write_iops)].forEach((value, index) => { view.compact.forEach((group) => { group[index].textContent = value; }); });
+    const metadata = [diskText(item.model), typeof item.internal === "boolean" ? item.internal ? "Internal" : "External" : null,
+      diskInteger(item.size_bytes) === null ? null : diskBytes(item.size_bytes)].filter((value) => value !== null).join(" / ") || "Unavailable";
+    [metadata, diskBytes(diskInteger(item.read_bytes)), diskBytes(diskInteger(item.write_bytes)), diskCount(item.read_operations), diskCount(item.write_operations)].forEach((value, index) => { view.fields[index].textContent = value; });
+    const history = state.diskHistory.get(item.id) || [];
+    history.push([item.read_bytes_per_sec, item.write_bytes_per_sec].map((value) => finite(value) ? value : null));
+    if (history.length > 60) history.shift();
+    state.diskHistory.set(item.id, history); next.set(item.id, view);
+  }
+  state.disks = next;
+  state.diskAvailable = available && (!sample.disks.length || next.size > 0);
+  for (const id of state.diskHistory.keys()) if (!next.has(id)) state.diskHistory.delete(id);
+  if (!next.has(state.diskSelected)) state.diskSelected = next.keys().next().value ?? null;
+  const select = $("disk-select");
+  diskChildren(select, [...next.values()].map((view) => view.option));
+  if (select.value !== (state.diskSelected || "")) select.value = state.diskSelected || "";
+  if (select.disabled !== !next.size) select.disabled = !next.size;
+  const ranked = [...next.values()].sort((a, b) => b.traffic - a.traffic || a.name.localeCompare(b.name));
+  diskChildren($("disk-summary"), ranked.map((view) => view.summary));
+  const scroll = $("disk-scroll"), top = scroll.scrollTop;
+  if (diskChildren($("disk-rows"), [...next.values()].map((view) => view.detail))) scroll.scrollTop = top;
+  put("disk-count", state.diskAvailable ? `${next.size} PHYSICAL ${next.size === 1 ? "DEVICE" : "DEVICES"}` : "DISK TELEMETRY UNAVAILABLE");
+  $("disk-empty").hidden = !!next.size;
+  put("disk-empty", available && !sample.disks.length ? "No physical disks reported." : "Disk telemetry unavailable.");
+  diskScope(); refreshDiskHealth();
+}
+function drawDiskChart() {
+  const history = state.diskHistory.get(state.diskSelected) || [], name = state.disks.get(state.diskSelected)?.name;
+  const values = history.flat().filter(finite), maximum = Math.max(1, ...values);
+  put("disk-history-label", name ? `${name} / latest ${history.length} samples / separate read and write lines` : "Select a reported disk");
+  put("disk-range", values.length ? `0–${diskRate(maximum)}` : "Scale unavailable");
+  const canvas = $("disk-chart"), context = canvas.getContext("2d"), width = canvas.clientWidth, height = canvas.clientHeight, scale = window.devicePixelRatio || 1;
+  if (!context || !width || !height) return;
+  canvas.width = Math.round(width * scale); canvas.height = Math.round(height * scale); context.setTransform(scale, 0, 0, scale, 0, 0);
+  ["--accent", "--power-subtotal"].forEach((color, index) => {
+    context.beginPath(); context.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue(color).trim(); context.lineWidth = 1.8; context.setLineDash(index ? [5, 4] : []);
+    let connected = false;
+    history.forEach((point, position) => {
+      const value = point[index];
+      if (!finite(value)) { connected = false; return; }
+      const x = width * (60 - history.length + position) / 59, y = height * (1 - value / maximum);
+      if (connected) context.lineTo(x, y); else context.moveTo(x, y);
+      connected = true;
+    }); context.stroke();
+  });
 }
 function power(metrics) {
   const read = (key) => !metrics.soc?.vm && finite(metrics[key]) ? metrics[key] : null;
@@ -101,6 +250,7 @@ function applyDetails() {
       rowDetails(name, name === "network" ? 3 : 5);
     } else body.hidden = !all;
   }
+  diskScope();
   drawCharts();
   settle();
 }
@@ -117,7 +267,11 @@ function settle() {
   const processAge = finite(state.sample?.processes_age_ms) ? state.sample.processes_age_ms + performance.now() - state.received : Infinity;
   const processState = state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : processAge > limit() ? "STALE / " : "";
   put("process-status", Array.isArray(state.sample?.processes) ? `${processState}${finite(processAge) ? `${Math.floor(processAge / 1000)}s old` : "Age unavailable"} / CPU 100% = one core` : "Unavailable for this request");
-  if (live() && !document.hidden) staleTimer = setTimeout(settle, Math.max(1, limit() - age() + 1));
+  const diskDelay = refreshDiskHealth();
+  if (!document.hidden) {
+    const delay = Math.min(live() ? Math.max(1, limit() - age() + 1) : Infinity, diskDelay);
+    if (Number.isFinite(delay)) staleTimer = setTimeout(settle, delay);
+  }
   if (moving()) {
     if (!state.frame) state.frame = requestAnimationFrame(animate);
   } else {
@@ -168,6 +322,7 @@ function drawCharts() {
   });
   drawPowerChart();
   drawTemperatureChart();
+  drawDiskChart();
 }
 function drawPowerChart() {
   const values = state.history.flatMap((point) => point.slice(3, 5)).filter(finite);
@@ -350,6 +505,7 @@ function update(sample) {
   state.history.push([metrics.cpu_active_ratio, gpu, ram, ...power(metrics), ...["cpu", "gpu"].map((name) => vm ? null : metrics.temp?.[`${name}_temp_avg`])]);
   if (state.history.length > 60) state.history.shift();
   network(metrics);
+  disks(sample);
   cooling(metrics);
   temperatures(sample);
   processes();
@@ -404,6 +560,7 @@ async function poll() {
 }
 motion.addEventListener("change", settle);
 $("process-sort").addEventListener("change", processes);
+$("disk-select").addEventListener("change", () => { state.diskSelected = state.disks.has($("disk-select").value) ? $("disk-select").value : null; drawDiskChart(); });
 Object.keys(panelNames).forEach((name) => $(`${name}-toggle`).addEventListener("click", () => changeDetails([name])));
 $("expand-all").addEventListener("click", () => changeDetails(Object.keys(panelNames), true));
 $("collapse-all").addEventListener("click", () => changeDetails(Object.keys(panelNames), false));

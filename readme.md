@@ -195,7 +195,7 @@ Available endpoints:
 | -------------- | ---------- | ------------------------------------------------------------------------------------------------- |
 | `GET /json`    | JSON       | Current metrics snapshot (same format as `pipe --soc-info`)                                       |
 | `GET /metrics` | Prometheus | Metrics in [Prometheus text format](https://prometheus.io/docs/instrumenting/exposition_formats/) |
-| `GET /dashboard/` | HTML | Local browser dashboard with CPU/GPU activity and temperature, memory, Network, cooling and Processes |
+| `GET /dashboard/` | HTML | Local browser dashboard with CPU/GPU activity and temperature, memory, Disk, Network, cooling and Processes |
 | `GET /api/sample` | JSON | Successful-sample sequence, timestamp, age, interval, service cadence, metrics and named temperature readings; local-only process snapshot |
 | `POST /api/interval` | JSON | Adjust real service sampling with `{"adjustment":"increase"}` or `"decrease"`; local same-origin requests only |
 
@@ -208,7 +208,7 @@ It follows the service sampling interval and retains 60 distinct samples. CPU/GP
 active residency ratios. Each panel starts with a compact summary; use its **Details** / **Less**
 button or **Expand all** / **Collapse all** to choose how much to show. These choices are saved
 locally in the browser and remain usable when browser storage is blocked. Summaries keep the
-three busiest interfaces and five processes in the selected sort order; expand to scroll
+three busiest physical disks and interfaces, and five processes in the selected sort order; expand to scroll
 through all rows. Folding a panel keeps live sampling and summaries running.
 
 The Power panel separates the system estimate from the CPU + GPU + ANE subtotal and plots
@@ -218,6 +218,19 @@ of the system sensor reading and the CPU + GPU + ANE subtotal; it is not wall-so
 Memory readings are separate and should not be added to either total. Missing, invalid and
 virtual-machine power stays unavailable; system zero is unavailable. Component zero remains
 a reported value because unsupported counters can also report zero.
+
+The Disk card shows separate read/write throughput and IOPS for each physical device. Expand
+for every disk, driver cumulative bytes and operations, optional device information, and
+reported NVMe health. The selected disk has its own 60-sample read/write history; reconnecting
+with a new registry identity starts a new history. Health age includes the cached reading,
+sample age and time in the browser; data over 120 seconds old is marked stale, and offline
+or stale samples are retained rather than presented as current health. Unsupported health
+does not mean healthy. Endurance used can exceed 100%; raw 255 means more than 254%, and no
+remaining life or lifetime guarantee is inferred. NVMe lifetime host read/write totals use
+512,000 bytes per data unit and stay separate from driver totals and physical NAND writes.
+The browser validates the lossless 128-bit decimal counters with bounded `BigInt` conversion;
+overflowing byte totals and driver integers beyond JavaScript's exact range stay unavailable.
+Older backends without `disks` remain usable and show disk telemetry as unavailable.
 
 Named CPU and GPU temperature readings show Celsius or `Unavailable`. The Processes table
 includes names/PIDs, CPU, GPU and memory, sortable by usage; CPU 100% means one busy core.
