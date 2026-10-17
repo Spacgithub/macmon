@@ -191,7 +191,7 @@ what we need.
       state from individual sensor thresholds or changing legacy outputs.
       Plan: [docs/plans/completed/20261017-system-thermal-state.md](plans/completed/20261017-system-thermal-state.md).
 
-- [ ] **34. Show physical disk activity and supported SSD health.** Add per-device read/write
+- [x] **34. Show physical disk activity and supported SSD health.** Add per-device read/write
       rates and IOPS, native NVMe wear/health data with freshness and honest fallbacks, and
       compact Terminal/browser summaries with independently expandable details.
-      Plan: [docs/plans/20261017-disk-monitoring.md](plans/20261017-disk-monitoring.md).
+      Plan: [docs/plans/completed/20261017-disk-monitoring.md](plans/completed/20261017-disk-monitoring.md).
