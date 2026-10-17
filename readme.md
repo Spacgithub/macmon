@@ -232,6 +232,8 @@ These commands use the same controller as the desktop entry below, bundled into 
 so this checkout is not required. Without a compatible login agent, the service listens only
 on `http://127.0.0.1:19090/dashboard/` for the current login session. Existing login startup
 preferences and separate terminal monitors are preserved.
+An existing executable alias is reused when it points to the same file; its configured
+path and service plist are preserved.
 
 #### Desktop control
 

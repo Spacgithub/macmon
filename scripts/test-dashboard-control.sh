@@ -287,6 +287,84 @@ if [ "$#" -gt 0 ]; then
   no_job
   printf 'PASS native web commands, embedded controller, repeated starts and help\n'
 
+  alias="$fixture/legacy alias's & executable"
+  ln -s "$binary" "$alias"
+  for source in session login; do
+    reset
+    sh "$root/scripts/dashboard-control.sh" start "$alias" >/dev/null
+    if [ "$source" = login ]; then
+      sh "$root/scripts/dashboard-control.sh" stop "$alias" >/dev/null
+      mv "$MACMON_CONTROL_STATE_DIR/com.macmon.plist" "$MACMON_CONTROL_AGENT_PLIST"
+      plutil -insert Program -string "$alias" "$MACMON_CONTROL_AGENT_PLIST"
+      sh "$root/scripts/dashboard-control.sh" start "$alias" >/dev/null
+      preserved="$MACMON_CONTROL_AGENT_PLIST"
+    else preserved="$MACMON_CONTROL_STATE_DIR/com.macmon.plist"; fi
+    cp "$preserved" "$fixture/alias-before.plist"
+    first_pid=$(cat "$fixture/listener")
+    bootstraps=$(grep -c '^bootstrap ' "$fixture/commands")
+    "$binary" web status | grep -q '^Running'
+    "$binary" web start >/dev/null
+    "$binary" web >/dev/null
+    [ "$(cat "$fixture/listener")" = "$first_pid" ]
+    [ "$(grep -c '^bootstrap ' "$fixture/commands")" = "$bootstraps" ]
+    grep -q '^http://127.0.0.1:19090/dashboard/$' "$fixture/opened"
+    cmp "$fixture/alias-before.plist" "$preserved"
+    "$binary" web stop >/dev/null
+    no_job
+    "$binary" web status | grep -q '^Stopped'
+    "$binary" web start >/dev/null
+    [ "$(cat "$fixture/listener")" != "$first_pid" ]
+    "$binary" web stop >/dev/null
+    no_job
+    cmp "$fixture/alias-before.plist" "$preserved"
+  done
+  printf 'PASS native controls reuse alias-first session and login services without rewriting plists\n'
+
+  reset
+  sh "$root/scripts/dashboard-control.sh" start "$alias" >/dev/null
+  alias_plist="$MACMON_CONTROL_STATE_DIR/com.macmon.plist"
+  cp "$alias_plist" "$fixture/alias-template.plist"
+  cp "$fixture/job" "$fixture/alias-template.job"
+  cp "$binary" "$fixture/different-executable"
+  ln -s "$fixture/missing-executable" "$fixture/dangling-alias"
+  newline_alias="$fixture/alias
+with newline"
+  trailing_newline_alias="$binary
+"
+  ln -s "$binary" "$newline_alias"
+  ln -s "$binary" "$trailing_newline_alias"
+  cp "$fixture/commands" "$fixture/alias-before.commands"
+  for path in "$fixture/different-executable" "$fixture/dangling-alias" "./$(basename "$binary")" "$newline_alias" "$trailing_newline_alias"; do
+    cp "$fixture/alias-template.plist" "$alias_plist"
+    plutil -replace ProgramArguments.0 -string "$path" "$alias_plist"
+    cp "$alias_plist" "$fixture/rejected-alias.plist"
+    for action in status start stop; do
+      (cd "$(dirname "$binary")" && reject "$binary" web "$action")
+    done
+    cmp "$fixture/alias-before.commands" "$fixture/commands"
+    cmp "$fixture/rejected-alias.plist" "$alias_plist"
+    cmp "$fixture/alias-template.job" "$fixture/job"
+    ! grep -q '^bootout ' "$fixture/commands"
+  done
+  cp "$fixture/alias-template.plist" "$alias_plist"
+  plutil -insert Program -string "$binary" "$alias_plist"
+  reject "$binary" web stop
+  cmp "$fixture/alias-before.commands" "$fixture/commands"
+  plutil -remove Program "$alias_plist"
+  for field in program path arguments; do
+    case "$field" in
+      program) sed 's@program = .*@program = /foreign/executable@' "$fixture/alias-template.job";;
+      path) sed 's@path = .*@path = /foreign/source.plist@' "$fixture/alias-template.job";;
+      arguments) sed 's@127.0.0.1@0.0.0.0@' "$fixture/alias-template.job";;
+    esac > "$fixture/job"
+    reject "$binary" web stop
+    ! grep -q '^bootout ' "$fixture/commands"
+  done
+  cp "$fixture/alias-template.job" "$fixture/job"
+  "$binary" web stop >/dev/null
+  no_job
+  printf 'PASS alias recognition retains executable, Program, source and argument ownership guards\n'
+
   reset
   (MOCK_HTTP_FAIL=1 reject "$binary" web)
   no_job
