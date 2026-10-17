@@ -3,6 +3,7 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 fixture=$(mktemp -d "${TMPDIR:-/private/tmp}/macmon-control-test.XXXXXX")
+fixture=$(CDPATH= cd -- "$fixture" && pwd -P)
 trap 'rm -rf "$fixture"' EXIT
 trap 'exit 130' HUP INT TERM
 mkdir "$fixture/tools" "$fixture/Installed tools"
@@ -258,3 +259,145 @@ grep -q '^foreign sentinel$' "$race_app/sentinel"
 [ "$(find "$race_app" -type f | wc -l | tr -d ' ')" = 1 ]
 [ -z "$(find "$fixture" -name '.macmon-control.*' -print)" ]
 printf 'PASS standalone app resources, quoted paths and non-overwriting installer\n'
+
+if [ "$#" -gt 0 ]; then
+  reset
+  cp "$1" "$binary"
+  "$binary" -h | grep -q 'web'
+  "$binary" web -h | grep -q 'stop the backend'
+  [ ! -e "$fixture/commands" ] && [ ! -e "$fixture/opened" ]
+  "$binary" web status | grep -q '^Stopped'
+  [ ! -e "$MACMON_CONTROL_STATE_DIR" ]
+  "$binary" web start >/dev/null
+  [ ! -e "$fixture/opened" ]
+  first_pid=$(cat "$fixture/listener")
+  "$binary" web >/dev/null
+  ln -s "$binary" "$fixture/macmon-link"
+  "$fixture/macmon-link" web start >/dev/null
+  [ "$(cat "$fixture/listener")" = "$first_pid" ]
+  [ "$(grep -c '^bootstrap ' "$fixture/commands")" = 1 ]
+  grep -q '^http://127.0.0.1:19090/dashboard/$' "$fixture/opened"
+  "$binary" web status | grep -q '^Running'
+  "$binary" web stop >/dev/null
+  "$binary" web stop >/dev/null
+  no_job
+  "$binary" web status | grep -q '^Stopped'
+  "$binary" web start >/dev/null
+  [ "$(cat "$fixture/listener")" != "$first_pid" ]
+  "$binary" web stop >/dev/null
+  no_job
+  printf 'PASS native web commands, embedded controller, repeated starts and help\n'
+
+  alias="$fixture/legacy alias's & executable"
+  ln -s "$binary" "$alias"
+  legacy_control="$root/tests/fixtures/dashboard-control-before-web-cli.sh"
+  for invocation in absolute relative path; do
+    reset
+    case "$invocation" in
+      absolute) "$alias" web start >/dev/null;;
+      relative) (cd "$fixture" && "./$(basename "$alias")" web start >/dev/null);;
+      path) PATH="$fixture:$PATH" "$(basename "$alias")" web start >/dev/null;;
+    esac
+    preserved="$MACMON_CONTROL_STATE_DIR/com.macmon.plist"
+    [ "$(plutil -extract ProgramArguments.0 raw "$preserved")" = "$alias" ]
+    cp "$preserved" "$fixture/native-first.plist"
+    first_pid=$(cat "$fixture/listener")
+    sh "$legacy_control" status "$alias" | grep -q '^Running'
+    sh "$legacy_control" start "$alias" >/dev/null
+    sh "$legacy_control" open "$alias" >/dev/null
+    [ "$(cat "$fixture/listener")" = "$first_pid" ]
+    [ "$(grep -c '^bootstrap ' "$fixture/commands")" = 1 ]
+    sh "$legacy_control" stop "$alias" >/dev/null
+    no_job
+    cmp "$fixture/native-first.plist" "$preserved"
+  done
+  printf 'PASS native-first absolute, relative and PATH aliases work with the frozen desktop controller\n'
+
+  for source in session login; do
+    reset
+    sh "$legacy_control" start "$alias" >/dev/null
+    if [ "$source" = login ]; then
+      sh "$legacy_control" stop "$alias" >/dev/null
+      mv "$MACMON_CONTROL_STATE_DIR/com.macmon.plist" "$MACMON_CONTROL_AGENT_PLIST"
+      plutil -insert Program -string "$alias" "$MACMON_CONTROL_AGENT_PLIST"
+      sh "$legacy_control" start "$alias" >/dev/null
+      preserved="$MACMON_CONTROL_AGENT_PLIST"
+    else preserved="$MACMON_CONTROL_STATE_DIR/com.macmon.plist"; fi
+    cp "$preserved" "$fixture/alias-before.plist"
+    first_pid=$(cat "$fixture/listener")
+    bootstraps=$(grep -c '^bootstrap ' "$fixture/commands")
+    "$binary" web status | grep -q '^Running'
+    "$binary" web start >/dev/null
+    "$binary" web >/dev/null
+    [ "$(cat "$fixture/listener")" = "$first_pid" ]
+    [ "$(grep -c '^bootstrap ' "$fixture/commands")" = "$bootstraps" ]
+    grep -q '^http://127.0.0.1:19090/dashboard/$' "$fixture/opened"
+    cmp "$fixture/alias-before.plist" "$preserved"
+    "$binary" web stop >/dev/null
+    no_job
+    "$binary" web status | grep -q '^Stopped'
+    "$binary" web start >/dev/null
+    [ "$(cat "$fixture/listener")" != "$first_pid" ]
+    "$binary" web stop >/dev/null
+    no_job
+    cmp "$fixture/alias-before.plist" "$preserved"
+  done
+  printf 'PASS native controls reuse alias-first session and login services without rewriting plists\n'
+
+  reset
+  sh "$root/scripts/dashboard-control.sh" start "$alias" >/dev/null
+  alias_plist="$MACMON_CONTROL_STATE_DIR/com.macmon.plist"
+  cp "$alias_plist" "$fixture/alias-template.plist"
+  cp "$fixture/job" "$fixture/alias-template.job"
+  cp "$binary" "$fixture/different-executable"
+  ln -s "$fixture/missing-executable" "$fixture/dangling-alias"
+  newline_alias="$fixture/alias
+with newline"
+  trailing_newline_alias="$binary
+"
+  ln -s "$binary" "$newline_alias"
+  ln -s "$binary" "$trailing_newline_alias"
+  cp "$fixture/commands" "$fixture/alias-before.commands"
+  for path in "$fixture/different-executable" "$fixture/dangling-alias" "./$(basename "$binary")" "$newline_alias" "$trailing_newline_alias"; do
+    cp "$fixture/alias-template.plist" "$alias_plist"
+    plutil -replace ProgramArguments.0 -string "$path" "$alias_plist"
+    cp "$alias_plist" "$fixture/rejected-alias.plist"
+    for action in status start stop; do
+      (cd "$(dirname "$binary")" && reject "$binary" web "$action")
+    done
+    cmp "$fixture/alias-before.commands" "$fixture/commands"
+    cmp "$fixture/rejected-alias.plist" "$alias_plist"
+    cmp "$fixture/alias-template.job" "$fixture/job"
+    ! grep -q '^bootout ' "$fixture/commands"
+  done
+  cp "$fixture/alias-template.plist" "$alias_plist"
+  plutil -insert Program -string "$binary" "$alias_plist"
+  reject "$binary" web stop
+  cmp "$fixture/alias-before.commands" "$fixture/commands"
+  plutil -remove Program "$alias_plist"
+  for field in program path arguments; do
+    case "$field" in
+      program) sed 's@program = .*@program = /foreign/executable@' "$fixture/alias-template.job";;
+      path) sed 's@path = .*@path = /foreign/source.plist@' "$fixture/alias-template.job";;
+      arguments) sed 's@127.0.0.1@0.0.0.0@' "$fixture/alias-template.job";;
+    esac > "$fixture/job"
+    reject "$binary" web stop
+    ! grep -q '^bootout ' "$fixture/commands"
+  done
+  cp "$fixture/alias-template.job" "$fixture/job"
+  "$binary" web stop >/dev/null
+  no_job
+  printf 'PASS alias recognition retains executable, Program, source and argument ownership guards\n'
+
+  reset
+  (MOCK_HTTP_FAIL=1 reject "$binary" web)
+  no_job
+  [ ! -e "$fixture/opened" ]
+  "$binary" web start >/dev/null
+  sed 's@program = .*@program = /foreign/executable@' "$fixture/job" > "$fixture/foreign"
+  mv "$fixture/foreign" "$fixture/job"
+  reject "$binary" web stop
+  ! grep -q '^bootout ' "$fixture/commands"
+  reset
+  printf 'PASS native web failures propagate and foreign jobs remain untouched\n'
+fi

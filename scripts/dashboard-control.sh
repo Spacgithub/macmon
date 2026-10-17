@@ -50,7 +50,15 @@ if [ -e "$plist" ] || [ -L "$plist" ]; then
   [ -f "$plist" ] && [ ! -L "$plist" ] && [ "$(stat -f %u "$plist")" = "$uid" ] || fail 'Unowned agent plist'
   [ "$(value Label)" = "$label" ] && [ "$(value ProgramArguments)" = 6 ] || fail 'Incompatible agent plist'
   host=$(value ProgramArguments.3); port=$(value ProgramArguments.5)
-  [ "$(value ProgramArguments.0)" = "$binary" ] && [ "$(value ProgramArguments.1)" = serve ] &&
+  configured_binary=$(plutil -extract ProgramArguments.0 raw -n -o - "$plist" && printf '.') || fail 'Invalid agent executable'
+  configured_binary=${configured_binary%.}
+  case "$configured_binary" in /*) ;; *) fail 'Agent executable must have an absolute path';; esac
+  case "$configured_binary" in *'
+'*) fail 'Newlines in paths are unsupported';; esac
+  [ "$configured_binary" = "$binary" ] || [ "$configured_binary" -ef "$binary" ] || fail 'Foreign agent executable or arguments'
+  # Keep the original alias for the exact Program and loaded-job checks below.
+  binary=$configured_binary
+  [ "$(value ProgramArguments.1)" = serve ] &&
     [ "$(value ProgramArguments.2)" = --host ] && [ "$(value ProgramArguments.4)" = --port ] || fail 'Foreign agent executable or arguments'
   if program_type=$(plutil -type Program "$plist" 2>/dev/null); then
     [ "$program_type" = string ] && [ "$(value Program)" = "$binary" ] || fail 'Foreign agent Program override'
