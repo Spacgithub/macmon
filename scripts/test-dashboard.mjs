@@ -225,8 +225,8 @@ function metrics(overrides = {}) {
     network: [{ name: 'en0', rx_bytes_per_sec: 1000, tx_bytes_per_sec: 500, rx_bytes: 4096, tx_bytes: 2048 }],
     fans: [{ name: 'fan0', rpm: 1800, max_rpm: 6800 }, { name: 'fan1', rpm: 2400 }], ...overrides };
 }
-function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, temperatures } = {}) {
-  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, temperatures };
+function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, temperatures, memory_activity } = {}) {
+  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, temperatures, memory_activity };
 }
 const cadence = (requested_ms = 1000, effective_ms = requested_ms) => ({ requested_ms, effective_ms, pending: requested_ms !== effective_ms });
 async function nextPoll(harness) {
@@ -774,6 +774,56 @@ await check('temperature charts redraw after expansion, break gaps and keep a bo
   await h.click('cooling-toggle'); assert.equal(canvas.width, 340);
   assert.equal(h.state().history.length, 60); assert.match(h.text('temperature-peaks'), /CPU 30.0 °C \/ GPU 31.0 °C/);
   assert.equal(canvas.context.paths[0].points.length, 60);
+});
+
+await check('memory pressure is OS-reported, independently validated and never inferred from RAM use', async () => {
+  const h = boot(); await h.answer(sample());
+  assert.equal(h.text('memory-pressure'), 'Unavailable');
+  assert.equal(h.text('swap-in-rate'), 'Unavailable'); assert.equal(h.text('swap-out-rate'), 'Unavailable');
+  for (const [index, pressure] of ['normal', 'warning', 'critical'].entries()) {
+    await nextPoll(h); await h.answer(sample({ sequence: index + 2, memory_activity: { pressure, swap_in_bytes_per_sec: null, swap_out_bytes_per_sec: null } }));
+    assert.equal(h.elements.get('memory-pressure').dataset.level, pressure);
+    assert.equal(h.text('memory-pressure'), pressure[0].toUpperCase() + pressure.slice(1));
+    assert.equal(h.text('ram-value'), '25.0%', 'Pressure never reuses or changes the RAM ratio');
+    assert.equal(h.text('swap-in-rate'), 'Unavailable');
+  }
+  for (const [index, pressure] of ['__proto__', 'constructor', 'toString', 'NORMAL', 1, null, undefined, {}].entries()) {
+    await nextPoll(h); await h.answer(sample({ sequence: index + 5, memory_activity: { pressure } }));
+    assert.equal(h.text('memory-pressure'), 'Unavailable');
+    assert.equal(h.elements.get('memory-pressure').dataset.level, 'unavailable');
+  }
+});
+
+await check('logical swap rates keep first-sample unknown, real zero and invalid values distinct', async () => {
+  const h = boot(); await h.answer(sample({ memory_activity: { pressure: 'normal', swap_in_bytes_per_sec: null, swap_out_bytes_per_sec: null } }));
+  assert.equal(h.text('swap-in-rate'), 'Unavailable'); assert.equal(h.text('swap-out-rate'), 'Unavailable');
+  await nextPoll(h); await h.answer(sample({ sequence: 2, memory_activity: { pressure: 'normal', swap_in_bytes_per_sec: 0, swap_out_bytes_per_sec: 1024 } }));
+  assert.equal(h.text('swap-in-rate'), '0 B/s'); assert.equal(h.text('swap-out-rate'), '1 KiB/s');
+  for (const [index, invalid] of [-1, NaN, Infinity, '1', null, undefined].entries()) {
+    await nextPoll(h); await h.answer(sample({ sequence: index + 3, memory_activity: { swap_in_bytes_per_sec: invalid, swap_out_bytes_per_sec: invalid } }));
+    assert.equal(h.text('swap-in-rate'), 'Unavailable'); assert.equal(h.text('swap-out-rate'), 'Unavailable');
+  }
+  await nextPoll(h); await h.answer(sample({ sequence: 10 }));
+  assert.equal(h.text('memory-pressure'), 'Unavailable'); assert.equal(h.text('swap-in-rate'), 'Unavailable');
+  assert.match(html, /logical page-equivalent bytes, not physical SSD I\/O or wear/);
+});
+
+await check('memory activity refreshes in a collapsed card without changing detail choices, focus or used swap totals', async () => {
+  const h = boot(); await h.answer(sample({ memory_activity: { pressure: 'warning', swap_in_bytes_per_sec: 8192, swap_out_bytes_per_sec: 16384 } }));
+  const button = h.elements.get('ram-toggle'); button.focus();
+  assert.equal(h.elements.get('ram-details').hidden, true); assert.equal(h.elements.get('memory-pressure').visible, true);
+  await nextPoll(h); await h.answer(sample({ sequence: 2,
+    data: metrics({ memory: { ram_usage: 8 * 1024 ** 3, ram_total: 32 * 1024 ** 3, swap_usage: 1024 ** 3, swap_total: 2 * 1024 ** 3 } }),
+    memory_activity: { pressure: 'critical', swap_in_bytes_per_sec: 0, swap_out_bytes_per_sec: 0 } }));
+  assert.equal(h.elements.get('ram-toggle'), button); assert.equal(h.document.activeElement, button);
+  assert.equal(h.elements.get('ram-details').hidden, true); assert.equal(h.text('memory-pressure'), 'Critical');
+  assert.equal(h.text('swap-in-rate'), '0 B/s'); await h.click('ram-toggle');
+  assert.match(h.text('ram-detail'), /Swap 1 GiB used \/ 2 GiB allocated/);
+  await nextPoll(h); await h.fail(); assert.equal(h.status(), 'offline');
+  assert.equal(h.text('memory-pressure'), 'Critical'); assert.equal(h.state().details.ram, true);
+  await nextPoll(h); await h.answer(sample({ sequence: 3, memory_activity: null }));
+  assert.equal(h.status(), 'live'); assert.equal(h.text('memory-pressure'), 'Unavailable');
+  assert.equal(h.state().details.ram, true); assert.equal(h.document.activeElement, button);
 });
 
 console.log(`${tests.length} dashboard checks passed.`);

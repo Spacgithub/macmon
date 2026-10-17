@@ -26,6 +26,15 @@ h1 { font-size: clamp(26px, 4vw, 36px); font-weight: 580; letter-spacing: -1px; 
 h2 { font-size: 17px; font-weight: 550; }
 h3 { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
 .muted, .detail { color: var(--muted); font-size: 12px; }
+.memory-activity { display: grid; gap: 8px; margin: 18px 0 0; font-variant-numeric: tabular-nums; }
+.memory-activity > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.memory-activity dt { color: var(--muted); font-size: 11px; }
+.memory-activity dd { margin: 0; overflow-wrap: anywhere; }
+#memory-pressure[data-level="normal"] { color: var(--accent); }
+#memory-pressure[data-level="warning"] { color: #edb77b; }
+#memory-pressure[data-level="critical"] { color: #f28a94; }
+#memory-pressure[data-level="unavailable"] { color: var(--muted); }
+.memory-note { margin-top: 12px; line-height: 1.7; }
 .detail-controls, .panel-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .detail-controls { justify-content: flex-end; margin-top: 24px; }
 .detail-controls button, .detail-toggle { padding: 7px 12px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: #132231; font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap; }

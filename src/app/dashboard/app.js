@@ -28,6 +28,14 @@ function watts(value) {
   const small = value > 0 && value < 1;
   return `${(small ? value * 1000 : value).toLocaleString("en-US", { maximumSignificantDigits: 4 })} ${small ? "mW" : "W"}`;
 }
+function memoryActivity(sample) {
+  const activity = sample.memory_activity;
+  const level = ["normal", "warning", "critical"].includes(activity?.pressure) ? activity.pressure : "unavailable";
+  $("memory-pressure").dataset.level = level;
+  put("memory-pressure", level === "unavailable" ? "Unavailable" : level[0].toUpperCase() + level.slice(1));
+  put("swap-in-rate", finite(activity?.swap_in_bytes_per_sec) ? `${bytes(activity.swap_in_bytes_per_sec)}/s` : "Unavailable");
+  put("swap-out-rate", finite(activity?.swap_out_bytes_per_sec) ? `${bytes(activity.swap_out_bytes_per_sec)}/s` : "Unavailable");
+}
 function power(metrics) {
   const read = (key) => !metrics.soc?.vm && finite(metrics[key]) ? metrics[key] : null;
   for (const name of ["cpu", "gpu", "ane", "ram", "gpu_ram"]) put(`${name}-power`, watts(read(`${name}_power`)));
@@ -331,8 +339,9 @@ function update(sample) {
   }
   put("cpu-detail", `${watts(vm ? null : metrics.cpu_power)} / ${tiers}`);
   put("gpu-detail", `${watts(vm ? null : metrics.gpu_power)} / ${number(gpuUnavailable ? null : metrics.gpu_freq_mhz, 0)} MHz`);
-  put("ram-detail", `${bytes(memory.ram_usage)} used / ${bytes(memory.ram_total)} total / ${bytes(memory.swap_usage)} swap`);
+  put("ram-detail", `${bytes(memory.ram_usage)} used / ${bytes(memory.ram_total)} total / Swap ${bytes(memory.swap_usage)} used / ${bytes(memory.swap_total)} allocated`);
   put("ram-summary", `${bytes(memory.ram_usage)} / ${bytes(memory.ram_total)}`);
+  memoryActivity(sample);
   put("device", [metrics.soc?.chip_name || "Local device", metrics.soc?.mac_model, vm ? "Virtual machine" : ""].filter(Boolean).join(" / "));
   put("sample-time", `Sample ${new Date(sample.sampled_at).toLocaleTimeString("en-US", { hour12: false })}`);
   state.history.push([metrics.cpu_active_ratio, gpu, ram, ...power(metrics), ...["cpu", "gpu"].map((name) => vm ? null : metrics.temp?.[`${name}_temp_avg`])]);

@@ -483,6 +483,11 @@ impl App {
       } else {
         fit_titles(r.width, metric.titles)
       };
+      let titles = if kind == Metric::Ram {
+        titles.right(super::memory::pressure_badge(self.memory_activity.pressure))
+      } else {
+        titles
+      };
       let mut inner = draw_box(f, r, titles);
       if overview && inner.height > 1 {
         let quantity = vec![
@@ -513,6 +518,12 @@ impl App {
         }
         Scale::Load { max, .. } => f.render_widget(graph.accent(accent).max(max), graph_area),
         Scale::Power => f.render_widget(graph, graph_area),
+      }
+      if kind == Metric::Ram {
+        let rates = super::memory::rates_line(&self.memory_activity);
+        if rates.width() + 6 <= usize::from(r.width) {
+          render_bottom_border(f, r, Vec::new(), |_| rates.spans);
+        }
       }
     }
 

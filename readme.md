@@ -20,7 +20,7 @@
 - 🚫 Runs without sudo
 - ⚡ Real-time CPU / GPU / ANE power usage
 - 📊 CPU frequency-scaled and active ratios per cluster
-- 💾 RAM / Swap usage
+- 💾 RAM / Swap usage, system memory pressure and swap-in/out rates
 - 🌐 Per-interface network receive/transmit rates and cumulative traffic
 - 📈 Historical charts with average and max values
 - 🌡️ Average CPU / GPU temperature
@@ -223,6 +223,23 @@ locations. Only finite readings above 0 and at most 150 °C are retained; missin
 empty array. Library callers can use `Sampler::temperature_details()` after `get_metrics()`;
 the accessor performs no hardware reads and is empty before sampling or after a failed sample.
 Existing `Metrics`/`TempMetrics` structs, `pipe`, `/json` and Prometheus formats are unchanged.
+
+Memory summaries also show the operating system's **Normal / Warning / Critical** memory
+pressure and independent **Swap in / Swap out** rates. Pressure is a system assessment,
+separate from RAM percentage. Expand Memory for used/total swap and the complete rates.
+These rates use cumulative VM swap-page counters, the actual page size and monotonic time:
+they are page-equivalent bytes per second, not SSD physical I/O or wear. A first sample,
+missing source, counter reset or invalid interval shows `Unavailable`; a valid idle interval
+shows `0 B/s`. Unsupported pressure levels stay unavailable. See Apple’s
+[memory-pressure guide](https://support.apple.com/en-asia/guide/activity-monitor/actmntr1004/mac)
+for how macOS uses memory pressure alongside usage and swap.
+
+Library callers can read `Sampler::memory_activity()` after a successful `get_metrics()`;
+`/api/sample` exposes the same snapshot as a top-level `memory_activity` object with
+`pressure` (`normal`, `warning`, `critical` or `null`), `swap_in_bytes_per_sec` and
+`swap_out_bytes_per_sec` (numbers or `null`). The accessor performs no new hardware reads
+and clears on acquisition failure. Existing `Metrics` / `MemMetrics`, `pipe`, `/json`,
+Prometheus and saved configuration formats remain compatible.
 
 Expand **Temperature & cooling** for each group's current sensor count, minimum, maximum
 and hottest raw sensor name, the full source-labelled sensor list, and a 60-sample CPU/GPU

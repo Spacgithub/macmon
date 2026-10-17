@@ -39,8 +39,10 @@
       <article class="metric">
         <div class="metric-top"><h2>Unified memory</h2><button id="ram-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="ram-details" aria-label="Show memory details">Details</button></div>
         <p class="reading" id="ram-value">&mdash;</p><p class="muted" id="ram-summary">Waiting for a sample</p>
+        <dl class="memory-activity"><div><dt>OS pressure</dt><dd id="memory-pressure" data-level="unavailable">Unavailable</dd></div><div><dt>Swap in</dt><dd id="swap-in-rate">Unavailable</dd></div><div><dt>Swap out</dt><dd id="swap-out-rate">Unavailable</dd></div></dl>
         <div id="ram-details" hidden><canvas id="ram-chart" role="img" aria-label="Memory usage history, up to 60 samples"></canvas>
         <p class="detail" id="ram-detail">Waiting for a sample</p>
+        <p class="muted memory-note">OS pressure is reported independently of RAM use. Swap rates describe logical page-equivalent bytes, not physical SSD I/O or wear. The first valid rate needs two samples.</p>
         </div>
       </article>
     </section>
