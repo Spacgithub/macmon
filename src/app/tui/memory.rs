@@ -121,7 +121,14 @@ mod tests {
     assert!(
       app
         .handle_event(
-          Event::Update(Box::new(metrics), Vec::new(), activity, None),
+          Event::Update(
+            Box::new(metrics),
+            Vec::new(),
+            activity,
+            None,
+            None,
+            std::time::Instant::now()
+          ),
           &RwLock::new(1000)
         )
         .is_continue()

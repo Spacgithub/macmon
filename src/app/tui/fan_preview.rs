@@ -4,6 +4,7 @@ mod fan_preview {
   use std::time::Instant;
 
   use super::super::fan_protocol::Capabilities;
+  use super::super::Panel;
   use super::*;
 
   const SAMPLE_MSEC: u32 = 5000;
@@ -87,6 +88,56 @@ mod fan_preview {
         assert!(place.card.intersection(network).is_empty());
       }
       assert_saved_intent(&app, &RwLock::new(SAMPLE_MSEC), true);
+    }
+  }
+
+  #[test]
+  fn disk_strip_keeps_dual_fans_and_network_with_the_same_preflight_plan() {
+    for native in [false, true] {
+      for width in [80, 120, 140] {
+        let height = if width == 80 { 24 } else { 40 };
+        let mut app = if native { graphical_app("two", true) } else { preview_app("two", true) };
+        app.cell_pixels = Some((9, 18));
+        app.disks = Some(vec![macmon::DiskMetric {
+          id: "physical-0".into(), name: "disk0".into(), read_bytes_per_sec: Some(12.3 * 1024.0 * 1024.0),
+          write_bytes_per_sec: Some(456.0 * 1024.0), ..Default::default()
+        }]);
+        let buffer = render_buffer(&mut app, width, height);
+        let text = screen_text(&buffer);
+        assert_eq!(app.placements.len(), 2, "{width} native {native}: {text}");
+        assert_eq!(app.next_fan_placements(buffer.area), app.placements);
+        assert!(text.contains("7 Disk") && text.contains("disk0") && text.contains("Network"));
+        let (_, _, disk) = app.legacy_layout(buffer.area);
+        let disk = disk.unwrap();
+        for place in &app.placements {
+          assert!(place.card.intersection(disk).is_empty());
+        }
+        let showing = app.procs_shown.showing();
+        assert!(showing.is_some() && app.cfg.show_procs);
+        if width == 80 {
+          assert!(text.contains("6 Processes"), "{text}");
+        } else {
+          assert!(app.layout(buffer.area).proc.unwrap().height >= 6);
+        }
+        assert!(app.handle_key(key('d')).is_continue());
+        assert!(app.cfg.disk_details && app.cfg.panel_details.iter().all(|detail| *detail));
+        render_buffer(&mut app, width, height);
+        assert_eq!(app.placements.len(), 2);
+        assert!(app.handle_key(key('7')).is_continue());
+        assert!(app.handle_key(key('f')).is_continue());
+        render_buffer(&mut app, width, height);
+        assert!(app.placements.is_empty() && app.next_fan_placements(buffer.area).is_empty());
+        assert!(app.handle_key(key('f')).is_continue());
+        render_buffer(&mut app, width, height);
+        assert_eq!(app.placements.len(), 2);
+        assert_eq!(app.next_fan_placements(buffer.area), app.placements);
+        assert!(app.handle_key(key('6')).is_continue());
+        assert!(app.handle_key(key('f')).is_continue());
+        render_buffer(&mut app, width, height);
+        assert!(app.panels.fullscreen && app.panels.focus == Panel::Processes);
+        assert_eq!(app.procs_shown.showing(), showing);
+        assert!(app.cfg.show_procs);
+      }
     }
   }
 
@@ -195,7 +246,7 @@ mod fan_preview {
     let _ = app.apply_event(Event::Key(key('a')), &interval).unwrap();
     assert!(!app.fan_frames_active());
     for event in
-      [Event::FocusLost, Event::FocusGained, Event::Update(Box::new(preview_metrics("two")), Vec::new(), Default::default(), None)]
+      [Event::FocusLost, Event::FocusGained, Event::Update(Box::new(preview_metrics("two")), Vec::new(), Default::default(), None, None, Instant::now())]
     {
       let _ = app.apply_event(event, &interval).unwrap();
       render_buffer(&mut app, 120, 40);
@@ -220,18 +271,18 @@ mod fan_preview {
     assert!(angles[1] > angles[0] && angles[0] > 0.0);
     let mut metrics = preview_metrics("two");
     metrics.fans.reverse();
-    let _ = app.apply_event(Event::Update(Box::new(metrics), Vec::new(), Default::default(), None), &interval).unwrap();
+    let _ = app.apply_event(Event::Update(Box::new(metrics), Vec::new(), Default::default(), None, None, Instant::now()), &interval).unwrap();
     assert_eq!(app.cooling.items()[0].name, "fan1");
     assert_eq!(app.cooling.items()[0].rotor.angle, angles[1]);
     assert_eq!(app.cooling.items()[1].rotor.angle, angles[0]);
-    let _ = app.apply_event(Event::Update(Box::new(preview_metrics("zero")), Vec::new(), Default::default(), None), &interval).unwrap();
+    let _ = app.apply_event(Event::Update(Box::new(preview_metrics("zero")), Vec::new(), Default::default(), None, None, Instant::now()), &interval).unwrap();
     render_buffer(&mut app, 120, 40);
     assert!(!app.fan_frames_active());
     assert!(app.cooling.items().iter().all(|fan| fan.rpm == 0 && fan.rotor.velocity == 0.0));
     let stopped: Vec<_> = app.cooling.items().iter().map(|fan| fan.rotor.angle).collect();
     app.cooling.frame(Duration::from_secs(1));
     assert_eq!(app.cooling.items().iter().map(|fan| fan.rotor.angle).collect::<Vec<_>>(), stopped);
-    let _ = app.apply_event(Event::Update(Box::new(preview_metrics("missing")), Vec::new(), Default::default(), None), &interval).unwrap();
+    let _ = app.apply_event(Event::Update(Box::new(preview_metrics("missing")), Vec::new(), Default::default(), None, None, Instant::now()), &interval).unwrap();
     let screen = render_to_string(&mut app, 120, 40);
     assert!(app.cooling.items().is_empty() && app.placements.is_empty());
     assert!(!app.fan_frames_active() && !screen.contains("Cooling"));
@@ -339,7 +390,7 @@ mod fan_preview {
             break;
           }
           if now >= next_sample {
-            if tx.send(Event::Update(Box::new(preview_metrics(&mode)), Vec::new(), Default::default(), None)).is_err() {
+            if tx.send(Event::Update(Box::new(preview_metrics(&mode)), Vec::new(), Default::default(), None, None, Instant::now())).is_err() {
               break;
             }
             updates.fetch_add(1, Ordering::SeqCst);

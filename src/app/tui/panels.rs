@@ -10,7 +10,7 @@ use ratatui::widgets::Paragraph;
 use super::boxes::{Titles, draw_box, draw_scrollbar, hint};
 use super::cooling::Placement;
 use super::theme::{self, dim, text};
-use super::{App, cooling_layout, help, memory};
+use super::{App, cooling_layout, disk, help, memory};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -22,11 +22,19 @@ pub(super) enum Panel {
   Cooling,
   #[default]
   Processes,
+  Disk,
 }
 
 impl Panel {
-  pub(super) const ALL: [Self; 6] =
-    [Self::Compute, Self::Memory, Self::Power, Self::Network, Self::Cooling, Self::Processes];
+  pub(super) const ALL: [Self; 7] = [
+    Self::Compute,
+    Self::Memory,
+    Self::Power,
+    Self::Network,
+    Self::Cooling,
+    Self::Processes,
+    Self::Disk,
+  ];
   pub(super) fn name(self) -> &'static str {
     match self {
       Self::Compute => "Compute",
@@ -35,6 +43,7 @@ impl Panel {
       Self::Network => "Network",
       Self::Cooling => "Cooling",
       Self::Processes => "Processes",
+      Self::Disk => "Disk",
     }
   }
 }
@@ -43,8 +52,8 @@ impl Panel {
 pub(super) struct PanelState {
   pub(super) focus: Panel,
   pub(super) fullscreen: bool,
-  offsets: [usize; 6],
-  pages: [usize; 6],
+  offsets: [usize; 7],
+  pages: [usize; 7],
   pub(super) targets: Vec<(Panel, Rect)>,
 }
 
@@ -154,10 +163,11 @@ fn history(values: &[u64], max: u64, width: usize, color: Color) -> Line<'static
   Line::from(theme::value(values, color))
 }
 
-/// Six summaries fit at 80×24. Expansion borrows spare rows; focused view always has full lists.
+/// Seven summaries fit at 80×24. Expansion borrows spare rows; focused view has full lists.
 fn areas(
   area: Rect,
   details: [bool; 6],
+  disk_details: bool,
   show_procs: bool,
   focus: Panel,
   fullscreen: bool,
@@ -174,10 +184,11 @@ fn areas(
   let panels: Vec<_> =
     order.into_iter().filter(|panel| show_procs || *panel != Panel::Processes).collect();
   let rows = panels.len().div_ceil(columns);
-  if usize::from(area.height) < rows * 3 {
+  if usize::from(area.height) < rows * 3 + 3 {
     return vec![(focus, area)];
   }
   let mut heights = vec![3usize; rows];
+  let mut disk_height = 3usize;
   let desired: Vec<_> = panels
     .chunks(columns)
     .map(|row| {
@@ -200,10 +211,14 @@ fn areas(
     })
     .collect();
   // Prefer room for all five process-summary rows in the normal two-column overview.
-  if columns == 2 && area.height >= 18 && show_procs {
+  if columns == 2 && area.height >= 22 {
+    // RAM has four live lines, Cooling three, and Network/Processes keep their Top 3/5.
+    heights = vec![6, 5, if show_procs { 8 } else { 6 }];
+  } else if columns == 2 && area.height >= 21 && show_procs {
     heights[rows - 1] = 8;
   }
-  let mut spare = usize::from(area.height).saturating_sub(heights.iter().sum());
+  let mut spare =
+    usize::from(area.height).saturating_sub(heights.iter().sum::<usize>() + disk_height);
   while spare > 0 {
     let mut used = false;
     for (height, wanted) in heights.iter_mut().zip(&desired) {
@@ -213,13 +228,18 @@ fn areas(
         used = true;
       }
     }
+    if spare > 0 && disk_details && disk_height < 12 {
+      disk_height += 1;
+      spare -= 1;
+      used = true;
+    }
     if !used {
       break;
     }
   }
   let mut result = Vec::new();
   let mut y = area.y;
-  for (row, height) in panels.chunks(columns).zip(heights) {
+  for (index, (row, height)) in panels.chunks(columns).zip(heights).enumerate() {
     let height = (height as u16).min(area.bottom().saturating_sub(y));
     let width = area.width / columns as u16;
     for (column, panel) in row.iter().enumerate() {
@@ -231,11 +251,51 @@ fn areas(
       }
     }
     y = y.saturating_add(height);
+    if columns == 2 && index == 1 {
+      result.push((Panel::Disk, Rect::new(area.x, y, area.width, disk_height as u16)));
+      y += disk_height as u16;
+    }
+  }
+  if columns == 1 {
+    result.push((Panel::Disk, Rect::new(area.x, y, area.width, disk_height as u16)));
   }
   result
 }
 
 impl App {
+  fn disk_age(&self) -> u64 {
+    self
+      .disk_sampled
+      .map_or(0, |sampled| sampled.elapsed().as_millis().min(u64::MAX as u128) as u64)
+  }
+
+  /// The advanced renderer and image preflight must agree on the space above the Disk strip.
+  pub(super) fn legacy_layout(
+    &self,
+    area: Rect,
+  ) -> (super::LayoutPlan, Vec<Placement>, Option<Rect>) {
+    let (mut original, original_fans) = self.cooling_layout(area, self.cfg.show_procs);
+    if area.width < 76 || area.height < 24 {
+      return (original, original_fans, None);
+    }
+    let metrics = Rect { height: area.height - 3, ..area };
+    if let Some(procs) = original.proc {
+      // Borrow process space, preserving the metric/fan geometry and six rows for a normal table.
+      // At 80×24 its summary keeps the request/selection and a visible 6/f route to the whole list.
+      let height =
+        if self.cfg.disk_details { procs.height.saturating_sub(6).clamp(3, 12) } else { 3 };
+      original.proc = (procs.height > height).then_some(Rect {
+        y: procs.y + height,
+        height: procs.height.saturating_sub(height),
+        ..procs
+      });
+      let disk = Some(Rect { y: procs.y, height, ..procs });
+      return (original, original_fans, disk);
+    }
+    let (plan, fans) = self.cooling_layout(metrics, self.cfg.show_procs);
+    (plan, fans, Some(Rect { y: metrics.bottom(), height: 3, ..area }))
+  }
+
   pub(super) fn thermal_label(&self) -> String {
     self
       .thermal_state
@@ -260,7 +320,14 @@ impl App {
     } else {
       self.panels.focus
     };
-    areas(body, self.cfg.panel_details, self.cfg.show_procs, focus, self.panels.fullscreen)
+    areas(
+      body,
+      self.cfg.panel_details,
+      self.cfg.disk_details,
+      self.cfg.show_procs,
+      focus,
+      self.panels.fullscreen,
+    )
   }
 
   pub(super) fn next_fan_placements(&self, area: Rect) -> Vec<Placement> {
@@ -269,7 +336,7 @@ impl App {
       return Vec::new();
     }
     if self.panels_legacy() {
-      return self.cooling_layout(area, self.cfg.show_procs).1;
+      return self.legacy_layout(area).1;
     }
     self
       .panel_areas(area)
@@ -296,14 +363,15 @@ impl App {
     let index = self.panels.focus as usize;
     match key.code {
       KeyCode::Tab | KeyCode::BackTab => {
-        let step = if key.code == KeyCode::BackTab { 5 } else { 1 };
-        let mut next = (index + step) % 6;
+        let count = Panel::ALL.len();
+        let step = if key.code == KeyCode::BackTab { count - 1 } else { 1 };
+        let mut next = (index + step) % count;
         if !self.cfg.show_procs && next == Panel::Processes as usize {
-          next = (next + step) % 6;
+          next = (next + step) % count;
         }
         self.panels.focus = Panel::ALL[next];
       }
-      KeyCode::Char('1'..='6') => {
+      KeyCode::Char('1'..='7') => {
         let KeyCode::Char(digit) = key.code else { unreachable!() };
         let panel = Panel::ALL[(digit as u8 - b'1') as usize];
         if panel != Panel::Processes || self.cfg.show_procs {
@@ -339,7 +407,7 @@ impl App {
           }
           return false;
         }
-        if !self.cfg.panel_details[index] && !self.panels.fullscreen {
+        if !self.cfg.panel_detailed(index) && !self.panels.fullscreen {
           return false;
         }
         let offset = &mut self.panels.offsets[index];
@@ -360,13 +428,19 @@ impl App {
   }
 
   pub(super) fn handle_panel_mouse(&mut self, mouse: MouseEvent) -> bool {
-    if self.panels_legacy() {
+    let point = Position::new(mouse.column, mouse.row);
+    if self.panels_legacy()
+      && !self
+        .panels
+        .targets
+        .iter()
+        .any(|(panel, area)| *panel == Panel::Disk && area.contains(point))
+    {
       if self.procs_visible() && self.proc_view.contains_mouse(mouse) {
         self.panels.focus = Panel::Processes;
       }
       return false;
     }
-    let point = Position::new(mouse.column, mouse.row);
     let Some(&(panel, area)) = self.panels.targets.iter().find(|(_, area)| area.contains(point))
     else {
       return true;
@@ -506,6 +580,7 @@ impl App {
         }
         lines
       }
+      Panel::Disk => disk::lines(self.disks.as_deref(), detailed, width, self.disk_age()),
       _ => Vec::new(),
     }
   }
@@ -529,13 +604,17 @@ impl App {
       } else if self.panels.fullscreen {
         " f / Esc back · ↑↓ PgUp/PgDn Home/End scroll · Tab switch · ? help"
       } else {
-        " 1–6 toggle · Tab select · Enter detail · d all · f full · p procs · ? help"
+        " 1–7 toggle · Tab select · Enter detail · d all · f full · p procs · ? help"
       };
       frame
         .render_widget(Line::from(dim(footer)), Rect { y: area.bottom() - 1, height: 1, ..area });
     }
     for (panel, rect) in self.panels.targets.clone() {
-      let detailed = self.cfg.panel_details[panel as usize] || self.panels.fullscreen;
+      let detailed = self.cfg.panel_detailed(panel as usize) || self.panels.fullscreen;
+      if panel == Panel::Disk {
+        self.render_disk_panel(frame, rect);
+        continue;
+      }
       if panel == Panel::Processes {
         if detailed {
           self.render_proc_box(frame, rect);
@@ -623,6 +702,33 @@ impl App {
       self.paint_text_fans(frame.buffer_mut());
     }
   }
+
+  pub(super) fn render_disk_panel(&mut self, frame: &mut Frame, rect: Rect) {
+    let index = Panel::Disk as usize;
+    let detailed = self.cfg.disk_details || self.panels.fullscreen;
+    let focus = if self.panels.focus == Panel::Disk { "●" } else { "○" };
+    let total = self.disks.as_ref().map_or(0, Vec::len);
+    let state = if detailed { "detail" } else { "summary" };
+    let titles = Titles::new(theme::value(
+      format!("{focus} 7 Disk · {total} devices · {state}"),
+      theme::SECTION,
+    ))
+    .right(hint("f", if self.panels.fullscreen { "back" } else { "all disks" }));
+    let inner = draw_box(frame, rect, titles);
+    let lines = disk::lines(self.disks.as_deref(), detailed, inner.width as usize, self.disk_age());
+    let shown = inner.height as usize;
+    let offset =
+      if detailed { self.panels.offsets[index].min(lines.len().saturating_sub(shown)) } else { 0 };
+    self.panels.offsets[index] = offset;
+    self.panels.pages[index] = shown;
+    frame.render_widget(
+      Paragraph::new(lines.clone()).scroll((offset.min(u16::MAX as usize) as u16, 0)),
+      inner,
+    );
+    if detailed {
+      draw_scrollbar(frame, rect, inner, lines.len(), offset);
+    }
+  }
 }
 
 #[cfg(test)]
@@ -678,7 +784,14 @@ mod tests {
       assert!(
         app
           .handle_event(
-            Event::Update(Box::new(metrics), Vec::new(), Default::default(), state),
+            Event::Update(
+              Box::new(metrics),
+              Vec::new(),
+              Default::default(),
+              state,
+              None,
+              std::time::Instant::now()
+            ),
             &interval,
           )
           .is_continue()
@@ -711,14 +824,15 @@ mod tests {
 
   #[test]
   fn all_combinations_and_tiny_resizes_keep_rectangles_inside_and_disjoint() {
-    for mask in 0..64 {
+    for mask in 0..128 {
       let details = std::array::from_fn(|i| mask & (1 << i) != 0);
+      let disk_details = mask & (1 << 6) != 0;
       for (width, height) in
         [(0, 0), (1, 1), (5, 3), (28, 12), (60, 18), (80, 24), (120, 40), (200, 50)]
       {
         for show in [false, true] {
           let area = Rect::new(3, 2, width, height);
-          let plan = areas(area, details, show, Panel::Cooling, false);
+          let plan = areas(area, details, disk_details, show, Panel::Cooling, false);
           for (i, (_, rect)) in plan.iter().enumerate() {
             assert_eq!(rect.intersection(area), *rect, "{mask} {area:?} {rect:?}");
             for (_, other) in &plan[..i] {
@@ -727,6 +841,7 @@ mod tests {
           }
           let mut app = app();
           app.cfg.panel_details = details;
+          app.cfg.disk_details = disk_details;
           app.cfg.show_procs = show;
           render(&mut app, width, height);
         }
@@ -760,12 +875,12 @@ mod tests {
     );
     assert!(summary.contains("top 5 / 12"));
     press(&mut app, KeyCode::Char('/'));
-    for key in "worker16df".chars() {
+    for key in "worker167df".chars() {
       press(&mut app, KeyCode::Char(key));
     }
-    assert_eq!(app.proc_view.filter(), "worker16df");
+    assert_eq!(app.proc_view.filter(), "worker167df");
     let typing = render(&mut app, 80, 24);
-    assert!(typing.contains("worker16df") && typing.contains("Enter keep filter"));
+    assert!(typing.contains("worker167df") && typing.contains("Enter keep filter"));
     assert_eq!(app.cfg.panel_details, [false; 6]);
     press(&mut app, KeyCode::Esc);
     press(&mut app, KeyCode::Down);
@@ -773,7 +888,7 @@ mod tests {
     assert!(selected.is_some());
     press(&mut app, KeyCode::Char('f'));
     let sort = (app.proc_view.sort, app.proc_view.sort_desc);
-    for digit in '1'..='6' {
+    for digit in '1'..='7' {
       press(&mut app, KeyCode::Char(digit));
       render(&mut app, 80, 24);
       assert_eq!(app.procs_shown.showing(), Some(showing));
@@ -781,8 +896,10 @@ mod tests {
       assert_eq!((app.proc_view.sort, app.proc_view.sort_desc), sort);
     }
     assert_eq!(app.cfg.panel_details, [true; 6]);
+    assert!(app.cfg.disk_details);
     press(&mut app, KeyCode::Char('d'));
     assert_eq!(app.cfg.panel_details, [false; 6]);
+    assert!(!app.cfg.disk_details);
     assert_eq!(app.proc_view.selected_pid(), selected);
     assert_eq!(app.procs_shown.showing(), Some(showing));
     for (width, height) in [(0, 0), (5, 3), (80, 24)] {
@@ -854,7 +971,7 @@ mod tests {
         .collect(),
     );
     press(&mut app, KeyCode::Tab);
-    assert_eq!(app.panels.focus, Panel::Compute);
+    assert_eq!(app.panels.focus, Panel::Disk);
     press(&mut app, KeyCode::Char('d'));
     render(&mut app, 200, 50);
     let rect = app.layout(Rect::new(0, 0, 200, 50)).proc.unwrap();
