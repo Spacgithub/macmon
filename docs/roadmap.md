@@ -167,3 +167,4 @@ what we need.
       start-only, stop and status commands with discoverable help, reusing the managed
       service without changing login preferences or separate terminal monitors.
       Plan: [docs/plans/completed/20261016-web-cli.md](plans/completed/20261016-web-cli.md).
+      Existing executable aliases: [compatibility plan](plans/completed/20261016-web-cli-alias-compatibility.md).

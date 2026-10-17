@@ -1,3 +1,5 @@
+Done: 2026-10-16, PR #18
+
 # Existing executable aliases in web controls
 
 ## Behavior and decisions
@@ -13,4 +15,10 @@
 
 - [x] Add alias-first lifecycle and foreign-path regression coverage.
 - [x] Reconcile verified aliases in the shared controller.
-- [ ] Run complete checks, package verification and independent review for PR #18.
+- [x] Run complete checks, package verification and independent review for PR #18.
+
+## Result
+
+The shared controller accepts verified aliases of the same executable and preserves the
+configured path for strict job checks. Alias-first session and login lifecycle regressions,
+unsafe-path rejection, complete checks, package compilation and independent review passed.
