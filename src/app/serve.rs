@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use macmon::{Metrics, SocInfo};
+use macmon::{Metrics, SocInfo, TemperatureReading};
 
 use crate::config::{TUI_MAX_MS, TUI_MIN_MS};
 use crate::metrics_to_json_value;
@@ -49,6 +49,7 @@ impl Cadence {
 
 pub struct Sample {
   metrics: Metrics,
+  temperatures: Vec<TemperatureReading>,
   sequence: u64,
   sampled_at: String,
   sampled: Instant,
@@ -64,6 +65,7 @@ pub fn sample_time() -> (Instant, String) {
 pub fn publish_sample(
   shared: &SharedMetrics,
   metrics: Metrics,
+  temperatures: Vec<TemperatureReading>,
   interval_ms: u32,
   processes: Option<ProcessSnapshot>,
   time: (Instant, String),
@@ -71,7 +73,8 @@ pub fn publish_sample(
   let (sampled, sampled_at) = time;
   let mut latest = shared.write().unwrap();
   let sequence = latest.as_ref().map_or(1, |sample| sample.sequence.saturating_add(1));
-  *latest = Some(Sample { metrics, sequence, sampled_at, sampled, interval_ms, processes });
+  *latest =
+    Some(Sample { metrics, temperatures, sequence, sampled_at, sampled, interval_ms, processes });
 }
 
 fn escape_label_value(value: &str) -> String {
@@ -225,6 +228,7 @@ fn to_sample(sample: &Sample, soc: &SocInfo, local: bool, cadence: &Cadence) -> 
     "interval_ms": sample.interval_ms,
     "cadence": cadence.value(),
     "metrics": json_value(&sample.metrics, soc, &sample.sampled_at),
+    "temperatures": sample.temperatures,
     "processes": processes.map(|snapshot| &snapshot.rows),
     "processes_age_ms": processes.map(|snapshot| snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
   })
@@ -552,7 +556,10 @@ mod tests {
   use std::thread;
   use std::time::{Duration, Instant};
 
-  use macmon::{CpuTierMetrics, Metrics, NetworkMetric, SocInfo};
+  use macmon::{
+    CpuTierMetrics, Metrics, NetworkMetric, SocInfo, TempMetrics, TemperatureGroup,
+    TemperatureReading, TemperatureSource,
+  };
 
   use super::{
     Cadence, SharedCadence, SharedMetrics, escape_label_value, escape_xml, handle_conn,
@@ -650,9 +657,54 @@ mod tests {
   }
 
   #[test]
+  fn named_temperatures_share_the_metrics_sample_and_replace_previous_sources() {
+    let shared = Arc::new(RwLock::new(None));
+    for (sequence, source, name, celsius) in [
+      (1, TemperatureSource::Smc, "Tp01", 45.0),
+      (2, TemperatureSource::Hid, "pACC MTR Temp Sensor0", 50.0),
+    ] {
+      let metrics = Metrics {
+        temp: TempMetrics { cpu_temp_avg: Some(celsius), gpu_temp_avg: None },
+        ..Default::default()
+      };
+      let expected_prometheus = to_prometheus(&metrics, &SocInfo::default());
+      let temperatures = vec![TemperatureReading {
+        name: name.into(),
+        group: TemperatureGroup::Cpu,
+        source,
+        celsius,
+      }];
+      let expected = serde_json::to_value(&temperatures).unwrap();
+      publish_sample(&shared, metrics, temperatures, 1000, None, super::sample_time());
+      let response: serde_json::Value =
+        serde_json::from_str(body(&get(&shared, "/api/sample"))).unwrap();
+      assert_eq!(response["sequence"], sequence);
+      assert_eq!(response["temperatures"], expected);
+      assert_eq!(
+        response["metrics"]["temp"],
+        serde_json::json!({
+          "cpu_temp_avg": celsius, "gpu_temp_avg": null
+        })
+      );
+      assert_eq!(response["metrics"]["timestamp"], response["sampled_at"]);
+      let legacy: serde_json::Value = serde_json::from_str(body(&get(&shared, "/json"))).unwrap();
+      assert_eq!(legacy["temp"], response["metrics"]["temp"]);
+      assert!(legacy.get("temperatures").is_none());
+      assert!(response["metrics"].get("temperatures").is_none());
+      assert_eq!(body(&get(&shared, "/metrics")), expected_prometheus);
+    }
+    publish_sample(&shared, Metrics::default(), Vec::new(), 1000, None, super::sample_time());
+    let response: serde_json::Value =
+      serde_json::from_str(body(&get(&shared, "/api/sample"))).unwrap();
+    assert_eq!(response["sequence"], 3);
+    assert_eq!(response["temperatures"], serde_json::json!([]));
+    assert!(response["metrics"]["temp"]["cpu_temp_avg"].is_null());
+  }
+
+  #[test]
   fn sample_metadata_retains_its_time_and_age_until_a_new_success() {
     let shared = Arc::new(RwLock::new(None));
-    publish_sample(&shared, Metrics::default(), 1500, None, super::sample_time());
+    publish_sample(&shared, Metrics::default(), Vec::new(), 1500, None, super::sample_time());
     shared.write().unwrap().as_mut().unwrap().sampled = Instant::now() - Duration::from_millis(250);
     let read = || {
       let lock = shared.read().unwrap();
@@ -675,7 +727,7 @@ mod tests {
     assert_eq!(retained["interval_ms"], 1500);
     assert_eq!(retained["metrics"]["timestamp"], retained["sampled_at"]);
     chrono::DateTime::parse_from_rfc3339(retained["sampled_at"].as_str().unwrap()).unwrap();
-    publish_sample(&shared, Metrics::default(), 100, None, super::sample_time());
+    publish_sample(&shared, Metrics::default(), Vec::new(), 100, None, super::sample_time());
     let next = read();
     assert_eq!(next["sequence"], 2);
     assert_eq!(next["interval_ms"], 100);
@@ -690,7 +742,7 @@ mod tests {
     let timestamp = time.1.clone();
     thread::sleep(Duration::from_millis(25)); // Stand in for process enumeration.
     let processes = crate::procs::ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() };
-    publish_sample(&shared, Metrics::default(), 1000, Some(processes), time);
+    publish_sample(&shared, Metrics::default(), Vec::new(), 1000, Some(processes), time);
     let lock = shared.read().unwrap();
     let sample = lock.as_ref().unwrap();
     let json: serde_json::Value =
@@ -729,7 +781,14 @@ mod tests {
   fn ipv6_and_available_dual_stack_connections_keep_local_processes() {
     let shared = Arc::new(RwLock::new(None));
     let processes = crate::procs::ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() };
-    publish_sample(&shared, Metrics::default(), 1000, Some(processes), super::sample_time());
+    publish_sample(
+      &shared,
+      Metrics::default(),
+      Vec::new(),
+      1000,
+      Some(processes),
+      super::sample_time(),
+    );
     for (bind, connect, host) in
       [("::1", "::1", "[::1]"), ("::", "127.0.0.1", "[::ffff:127.0.0.1]")]
     {
@@ -787,6 +846,7 @@ mod tests {
     publish_sample(
       &shared,
       Metrics::default(),
+      Vec::new(),
       1000,
       Some(ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() - Duration::from_secs(5) }),
       super::sample_time(),
@@ -851,7 +911,7 @@ mod tests {
   #[test]
   fn fragmented_http_requests_export_the_existing_json_shape() {
     let shared = Arc::new(RwLock::new(None));
-    publish_sample(&shared, Metrics::default(), 1000, None, super::sample_time());
+    publish_sample(&shared, Metrics::default(), Vec::new(), 1000, None, super::sample_time());
     let response = request(
       &shared,
       &[b"GE", b"T /api/sam", b"ple?fresh=1 HTTP/1.1\r\nHost: local", b"host\r\n", b"\r\n"],
@@ -1074,6 +1134,7 @@ mod tests {
         publish_sample(
           &samples,
           Metrics::default(),
+          Vec::new(),
           interval,
           Some(crate::procs::ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() }),
           time,
