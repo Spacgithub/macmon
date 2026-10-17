@@ -22,8 +22,14 @@ class Element extends Target {
   constructor(tag = 'div', className = '') {
     super();
     Object.assign(this, { tagName: tag.toUpperCase(), className, children: [], parentElement: null,
-      style: {}, dataset: {}, hidden: false, checked: false, _text: '', clientWidth: 300, clientHeight: 74 });
+      style: {}, dataset: {}, attributes: new Map(), hidden: false, checked: false, _text: '', _width: 300, _height: 74, scrollTop: 0 });
   }
+  get clientWidth() { return this.visible ? this._width : 0; }
+  get clientHeight() { return this.visible ? this._height : 0; }
+  get visible() { return !this.hidden && (!this.parentElement || this.parentElement.visible); }
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  focus() { this.ownerDocument.activeElement = this; }
   get textContent() { return this._text + this.children.map((child) => child.textContent).join(''); }
   set textContent(value) { this.replaceChildren(); this._text = String(value); }
   set innerHTML(_) { throw new Error('Unsafe innerHTML reached the DOM stub'); }
@@ -94,23 +100,31 @@ function fanTemplate() {
 
 async function drainMicrotasks() { for (let i = 0; i < 12; i++) await Promise.resolve(); }
 
-function boot({ reduced = false } = {}) {
+function boot({ reduced = false, storage = new Map(), storageFailure = false, expanded = false } = {}) {
   let now = 0, nextId = 1, activeFetches = 0, maximumFetches = 0;
   const timers = new Map(), frames = new Map(), requests = [], elements = new Map();
-  for (const match of html.matchAll(/<([a-z][\w-]*)\b([^>]*\bid="([^"]+)"[^>]*)>([^<]*)/gi)) {
-    const element = new Element(match[1], /\bclass="([^"]*)"/.exec(match[2])?.[1] || '');
-    element._text = match[4].replaceAll('&mdash;', '—');
-    element.hidden = /\bhidden\b/.test(match[2]);
-    element.disabled = /\bdisabled\b/.test(match[2]);
-    const section = new Element(), parent = new Element();
-    section.append(parent); parent.append(element);
-    elements.set(match[3], element);
+  const document = new Target();
+  Object.assign(document, { hidden: false, activeElement: null, documentElement: new Element('root'),
+    getElementById(id) { assert.ok(elements.has(id), `Unknown DOM id: ${id}`); return elements.get(id); },
+    createElement(tag) { const element = new Element(tag); element.ownerDocument = document; return element; } });
+  const stack = [document.documentElement];
+  for (const token of html.matchAll(/<\/?([a-z][\w-]*)\b([^>]*?)>|([^<]+)/gi)) {
+    if (token[3]) { stack.at(-1)._text += token[3].replaceAll('&mdash;', '—').replaceAll('&amp;', '&'); continue; }
+    const tag = token[1].toLowerCase();
+    if (token[0].startsWith('</')) { if (stack.at(-1).tagName === tag.toUpperCase()) stack.pop(); continue; }
+    const element = document.createElement(tag);
+    const attributes = new Map([...token[2].matchAll(/([\w-]+)(?:="([^"]*)")?/g)].map((match) => [match[1], match[2] ?? '']));
+    for (const [name, value] of attributes) {
+      element.setAttribute(name, value);
+      if (name.startsWith('data-')) element.dataset[name.slice(5)] = value;
+    }
+    element.className = attributes.get('class') || '';
+    element.hidden = attributes.has('hidden'); element.disabled = attributes.has('disabled');
+    if (attributes.has('id')) elements.set(attributes.get('id'), element);
+    stack.at(-1).append(element);
+    if (!['meta', 'link', 'input', 'br'].includes(tag)) stack.push(element);
   }
   elements.get('fan-template').content = fanTemplate();
-  const document = new Target();
-  Object.assign(document, { hidden: false, documentElement: new Element('html'),
-    getElementById(id) { assert.ok(elements.has(id), `Unknown DOM id: ${id}`); return elements.get(id); },
-    createElement(tag) { return new Element(tag); } });
   const media = new Target(); media.matches = reduced;
   const timer = (callback, delay = 0) => {
     const id = nextId++;
@@ -149,6 +163,8 @@ function boot({ reduced = false } = {}) {
     return request.promise;
   };
   const context = vm.createContext({ document, window: { devicePixelRatio: 2 }, console, AbortController,
+    localStorage: { getItem(key) { if (storageFailure) throw new Error('Storage denied'); return storage.get(key) ?? null; },
+      setItem(key, value) { if (storageFailure) throw new Error('Storage denied'); storage.set(key, value); } },
     performance: { now: () => now }, fetch, matchMedia: () => media,
     getComputedStyle: () => ({ getPropertyValue: (name) => name === '--power-subtotal' ? '#c1a4e8' : '#72d8e8' }),
     ResizeObserver: class { observe() {} },
@@ -156,6 +172,7 @@ function boot({ reduced = false } = {}) {
     requestAnimationFrame(callback) { const id = nextId++; frames.set(id, callback); return id; },
     cancelAnimationFrame: (id) => frames.delete(id) });
   new vm.Script(source, { filename: sourcePath }).runInContext(context, { timeout: 1000 });
+  if (expanded) elements.get('expand-all').emit('click');
   const inspect = (expression) => vm.runInContext(expression, context, { timeout: 1000 });
   const pending = (url = '/api/sample') => requests.find((request) => request.url === url && !request.done);
   const advance = async (milliseconds) => {
@@ -174,7 +191,7 @@ function boot({ reduced = false } = {}) {
     await drainMicrotasks();
   };
   return {
-    elements, document, media, frames, requests, inspect, pending,
+    elements, document, media, frames, requests, inspect, pending, storage,
     state: () => inspect('state'),
     text: (id) => elements.get(id).textContent,
     status: () => elements.get('status').dataset.state,
@@ -208,8 +225,8 @@ function metrics(overrides = {}) {
     network: [{ name: 'en0', rx_bytes_per_sec: 1000, tx_bytes_per_sec: 500, rx_bytes: 4096, tx_bytes: 2048 }],
     fans: [{ name: 'fan0', rpm: 1800, max_rpm: 6800 }, { name: 'fan1', rpm: 2400 }], ...overrides };
 }
-function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null } = {}) {
-  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms };
+function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, temperatures } = {}) {
+  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, temperatures };
 }
 const cadence = (requested_ms = 1000, effective_ms = requested_ms) => ({ requested_ms, effective_ms, pending: requested_ms !== effective_ms });
 async function nextPoll(harness) {
@@ -298,7 +315,7 @@ await check('malicious device/interface/fan names only reach textContent', async
 });
 
 await check('real fan identities retain node and phase through reordering', async () => {
-  const h = boot(); await h.answer(sample()); await animate(h);
+  const h = boot({ expanded: true }); await h.answer(sample()); await animate(h);
   const slow = h.state().fans.get('fan0'), fast = h.state().fans.get('fan1');
   assert.ok(fast.angle > slow.angle && slow.angle > 0);
   assert.equal(slow.rotor.children.length, 7);
@@ -322,7 +339,7 @@ await check('real fan identities retain node and phase through reordering', asyn
 });
 
 await check('same identity does not append history; a restart with the same sequence does', async () => {
-  const h = boot(); await h.answer(sample({ sequence: 4 }));
+  const h = boot({ expanded: true }); await h.answer(sample({ sequence: 4 }));
   await nextPoll(h); await h.answer(sample({ sequence: 4, age_ms: 1000, data: metrics({ sys_power: 1000000 }) }));
   assert.equal(h.state().history.length, 1);
   assert.equal(h.text('system-power'), '20 W');
@@ -341,7 +358,7 @@ await check('same identity does not append history; a restart with the same sequ
 });
 
 await check('503 waiting, offline and stale states recover without erasing the last values', async () => {
-  const h = boot(); await h.answer(null, 503);
+  const h = boot({ expanded: true }); await h.answer(null, 503);
   assert.equal(h.status(), 'waiting'); assert.equal(h.requests[0].jsonCalls, 0);
   assert.equal(h.frames.size, 0); assert.equal(h.state().history.length, 0);
   await nextPoll(h); await h.answer(sample());
@@ -356,7 +373,7 @@ await check('503 waiting, offline and stale states recover without erasing the l
 });
 
 await check('manual and reduced motion stop only fan animation', async () => {
-  const h = boot(); await h.answer(sample()); await animate(h, 10);
+  const h = boot({ expanded: true }); await h.answer(sample()); await animate(h, 10);
   const fan = h.state().fans.get('fan0'), angle = fan.angle;
   await h.motion(false); assert.equal(h.frames.size, 0);
   await animate(h, 10); assert.equal(fan.angle, angle);
@@ -367,12 +384,12 @@ await check('manual and reduced motion stop only fan animation', async () => {
   await h.reduced(true); assert.equal(h.frames.size, 0); assert.equal(h.elements.get('motion').checked, false);
   await nextPoll(h); await h.answer(sample({ sequence: 3 }));
   assert.equal(h.status(), 'live'); assert.equal(h.frames.size, 0);
-  const initial = boot({ reduced: true }); await initial.answer(sample());
+  const initial = boot({ reduced: true, expanded: true }); await initial.answer(sample());
   assert.equal(initial.frames.size, 0); assert.equal(initial.elements.get('motion').checked, false);
 });
 
 await check('hidden tabs cancel animation and polling, then refresh on return', async () => {
-  const h = boot(); await h.answer(sample()); await animate(h, 5);
+  const h = boot({ expanded: true }); await h.answer(sample()); await animate(h, 5);
   const angle = h.state().fans.get('fan0').angle, count = h.requests.length;
   await h.hidden(true); assert.equal(h.frames.size, 0);
   await h.advance(10000); assert.equal(h.requests.length, count);
@@ -467,7 +484,7 @@ await check('power distinguishes reported zeros, invalid readings and VM placeho
 });
 
 await check('power chart uses separate shared watt-scaled lines and breaks across missing samples', async () => {
-  const h = boot(), traces = () => h.elements.get('power-chart').context.paths.slice(-2);
+  const h = boot({ expanded: true }), traces = () => h.elements.get('power-chart').context.paths.slice(-2);
   await h.answer(sample({ data: metrics({ sys_power: 40, all_power: 10 }) }));
   await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ sys_power: 50, all_power: 20 }) }));
   assert.equal(h.text('power-range'), '0–50 W');
@@ -592,7 +609,7 @@ await check('only actual in-flight cadence can extend freshness, never a pending
   assert.equal(stuck.status(), 'stale', 'A sampler that never begins cannot remain LIVE by accepting requests');
   assert.equal(stuck.elements.get('interval-down').disabled, false);
   assert.match(stuck.text('interval-feedback'), /Pending 10000 ms/);
-  const active = boot(); await active.answer(sample({ interval_ms: 250, cadence: cadence(10000, 250) }));
+  const active = boot({ expanded: true }); await active.answer(sample({ interval_ms: 250, cadence: cadence(10000, 250) }));
   await active.advance(250);
   await active.answer(sample({ interval_ms: 250, age_ms: 250, cadence: cadence(10000) }));
   assert.equal(active.state().history.length, 1);
@@ -605,6 +622,158 @@ await check('only actual in-flight cadence can extend freshness, never a pending
   assert.ok(active.state().fans.get('fan0').angle > angle, 'Fan rAF stays independent of 10 s polling');
   await active.advance(25001);
   assert.notEqual(active.status(), 'live', 'An indefinitely stuck long acquisition still expires');
+});
+
+await check('panels start compact and native buttons expose individual and all detail controls', async () => {
+  const h = boot(), names = ['cpu', 'gpu', 'ram', 'power', 'network', 'cooling', 'process'];
+  for (const name of names) {
+    const button = h.elements.get(`${name}-toggle`), body = h.elements.get(`${name}-details`);
+    assert.equal(button.tagName, 'BUTTON'); assert.equal(button.getAttribute('type'), 'button');
+    assert.equal(button.getAttribute('aria-controls'), `${name}-details`);
+    assert.equal(button.getAttribute('aria-expanded'), 'false');
+    if (!['network', 'process'].includes(name)) assert.equal(body.hidden, true);
+  }
+  await h.click('cpu-toggle');
+  assert.equal(h.elements.get('cpu-toggle').getAttribute('aria-expanded'), 'true');
+  assert.equal(h.elements.get('cpu-details').hidden, false);
+  assert.equal(h.elements.get('gpu-details').hidden, true);
+  await h.click('expand-all');
+  for (const name of names) {
+    const button = h.elements.get(`${name}-toggle`);
+    assert.equal(button.getAttribute('aria-expanded'), 'true');
+    assert.ok(button.getAttribute('aria-label').toLowerCase().includes(button.textContent.toLowerCase()), 'The accessible name includes the visible button label');
+  }
+  await h.click('collapse-all');
+  for (const name of names) {
+    const button = h.elements.get(`${name}-toggle`);
+    assert.equal(button.getAttribute('aria-expanded'), 'false');
+    assert.ok(button.getAttribute('aria-label').toLowerCase().includes(button.textContent.toLowerCase()));
+  }
+  assert.equal(h.pending().url, '/api/sample', 'View controls never start additional sampling requests');
+});
+
+await check('detail preferences reload independently and unavailable or corrupt storage stays usable', async () => {
+  const storage = new Map(), first = boot({ storage });
+  await first.click('network-toggle'); await first.click('cooling-toggle');
+  const second = boot({ storage });
+  assert.equal(second.state().details.network, true); assert.equal(second.state().details.cooling, true);
+  assert.equal(second.state().details.process, false);
+  for (const raw of ['invalid JSON', 'null', '42', '[]', '{"cpu":"true","gpu":true,"unexpected":true}']) {
+    const h = boot({ storage: new Map([['macmon.panel-details.v1', raw]]) });
+    assert.equal(h.state().details.cpu, false); assert.equal(h.state().details.gpu, raw.includes('"gpu":true'));
+    await h.click('cpu-toggle'); assert.equal(h.state().details.cpu, true);
+  }
+  const denied = boot({ storageFailure: true }); await denied.click('expand-all');
+  assert.equal(denied.state().details.cooling, true); await denied.answer(sample());
+  assert.equal(denied.status(), 'live'); await denied.click('collapse-all');
+  assert.equal(denied.state().details.cooling, false);
+});
+
+await check('compact tables retain busiest named interfaces and selected-order top processes without losing any rows', async () => {
+  const h = boot(), network = Array.from({ length: 27 }, (_, i) => ({ name: `utun${i}`, rx_bytes_per_sec: i, tx_bytes_per_sec: i * 2 }));
+  const processes = Array.from({ length: 80 }, (_, i) => ({ pid: i + 1, name: `process${i}`, cpu_pct: i, mem_bytes: 100 - i }));
+  await h.answer(sample({ data: metrics({ network }), processes, processes_age_ms: 0 }));
+  const visible = (name) => h.elements.get(`${name}-rows`).children.filter((row) => row.visible);
+  assert.equal(visible('network').length, 3); assert.equal(visible('network')[0].children[0].textContent, 'utun26');
+  assert.equal(visible('process').length, 5); assert.match(visible('process')[0].children[0].textContent, /^process79/);
+  assert.equal(h.text('network-count'), '27 INTERFACES'); assert.equal(h.text('process-count'), '80 PROCESSES');
+  assert.match(h.text('network-scope'), /rates are kept separate/); assert.match(h.text('process-scope'), /Top 5 of 80/);
+  await h.click('network-toggle'); await h.click('process-toggle');
+  assert.equal(visible('network').length, 27); assert.equal(visible('process').length, 80);
+  h.elements.get('process-sort').value = 'mem_bytes'; h.elements.get('process-sort').emit('change');
+  await h.click('collapse-all');
+  assert.match(visible('process')[0].children[0].textContent, /^process0/);
+  assert.equal(visible('network').length, 3); assert.equal(visible('process').length, 5);
+  assert.equal(h.elements.get('network-rows').children.length, 27);
+  assert.equal(h.elements.get('process-rows').children.length, 80);
+});
+
+await check('new samples and offline recovery retain controls, focus, sort, scrolling and detail choices', async () => {
+  const h = boot(); await h.click('expand-all');
+  const button = h.elements.get('network-toggle'), sort = h.elements.get('process-sort'), scroll = h.elements.get('network-details');
+  sort.value = 'mem_bytes'; sort.focus(); scroll.scrollTop = 240;
+  await h.answer(sample({ processes: [{ pid: 1, name: 'first', mem_bytes: 1 }, { pid: 2, name: 'second', mem_bytes: 2 }] }));
+  await nextPoll(h); await h.answer(sample({ sequence: 2 }));
+  assert.equal(h.elements.get('network-toggle'), button); assert.equal(h.elements.get('process-sort'), sort);
+  assert.equal(h.document.activeElement, sort); assert.equal(sort.value, 'mem_bytes'); assert.equal(scroll.scrollTop, 240);
+  await nextPoll(h); await h.fail();
+  assert.equal(h.status(), 'offline'); assert.equal(button.getAttribute('aria-expanded'), 'true');
+  assert.equal(h.document.activeElement, sort); assert.equal(scroll.scrollTop, 240);
+  await h.click('cooling-toggle'); assert.equal(h.state().details.cooling, false);
+  await nextPoll(h); await h.answer(sample({ sequence: 3 }));
+  assert.equal(h.status(), 'live'); assert.equal(h.state().details.network, true); assert.equal(h.state().details.cooling, false);
+  assert.equal(h.frames.size, 0);
+});
+
+await check('collapsed cooling stops animation while RPM and thermal summaries keep sampling, then resumes existing fans', async () => {
+  const h = boot(); await h.answer(sample());
+  assert.equal(h.frames.size, 0); assert.match(h.text('fan-summary'), /fan0 1800 RPM/);
+  assert.equal(h.text('cooling-cpu-temp'), '45.0 °C'); assert.equal(h.elements.get('fans').visible, false);
+  await h.click('cooling-toggle'); await animate(h, 10);
+  const fan = h.state().fans.get('fan0'), angle = fan.angle;
+  assert.ok(angle > 0); await h.click('cooling-toggle');
+  assert.equal(h.frames.size, 0); await animate(h, 10); assert.equal(fan.angle, angle);
+  await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ fans: [{ name: 'fan0', rpm: 3200 }], temp: { cpu_temp_avg: 55, gpu_temp_avg: 48 } }) }));
+  assert.equal(h.state().fans.get('fan0'), fan); assert.equal(fan.angle, angle);
+  assert.equal(h.text('fan-summary'), 'fan0 3200 RPM'); assert.equal(h.text('cooling-cpu-temp'), '55.0 °C');
+  assert.equal(h.frames.size, 0); await h.click('cooling-toggle'); await animate(h, 10);
+  assert.ok(fan.angle > angle); assert.equal(h.elements.get('temperature-chart').width, 600);
+});
+
+await check('raw temperatures show safe names and sources with current grouped ranges separate from historical mean peaks', async () => {
+  const h = boot(), name = '<img src=x onerror="globalThis.pwned=1">';
+  await h.answer(sample({ temperatures: [
+    { name: 'TC0', group: 'cpu', source: 'smc', celsius: 51 },
+    { name, group: 'cpu', source: 'hid', celsius: 61.5 },
+    { name: 'TG0', group: 'gpu', source: 'smc', celsius: 150 },
+    { name: 'bad', group: 'cpu', source: 'unknown', celsius: 90 },
+    { name: 'bad', group: 'battery', source: 'hid', celsius: 90 },
+    { name: 'bad', group: 'cpu', source: 'smc', celsius: NaN },
+    { name: 'zero', group: 'cpu', source: 'smc', celsius: 0 },
+    { name: 'negative', group: 'cpu', source: 'hid', celsius: -5 },
+    { name: 'too hot', group: 'cpu', source: 'smc', celsius: 150.1 },
+    { name: 'infinite', group: 'gpu', source: 'hid', celsius: Infinity },
+  ] }));
+  assert.equal(h.elements.get('temperature-table').visible, false); await h.click('cooling-toggle');
+  const rows = h.elements.get('temperature-rows').children;
+  assert.equal(rows.length, 3); assert.equal(rows[0].children[0].textContent, name);
+  assert.equal(rows[0].children[2].textContent, 'HID'); assert.equal(rows[0].children[3].textContent, '61.5 °C');
+  assert.match(h.text('temperature-groups'), /CPU: 2 sensors \/ current min 51.0 °C \/ max 61.5 °C/);
+  assert.match(h.text('temperature-groups'), /GPU: 1 sensors \/ current min 150.0 °C \/ max 150.0 °C \/ hottest TG0/);
+  assert.ok(h.text('temperature-groups').includes(`hottest ${name}`), 'The current hotspot keeps its raw safe-text name');
+  assert.match(h.text('temperature-peaks'), /CPU 45.0 °C \/ GPU 43.0 °C/);
+  assert.match(h.text('temperature-peaks'), /not current sensor hotspots/); assert.equal(h.inspect('globalThis.pwned'), undefined);
+  assert.match(html, /SMC grouping is heuristic/);
+});
+
+await check('old backends and missing or VM sensor snapshots retain valid mean temperatures without invented sensor detail', async () => {
+  const h = boot({ expanded: true }); await h.answer(sample());
+  assert.equal(h.text('cooling-cpu-temp'), '45.0 °C'); assert.equal(h.elements.get('temperature-table').hidden, true);
+  assert.match(h.text('temperature-groups'), /unavailable/i);
+  await nextPoll(h); await h.answer(sample({ sequence: 2, temperatures: [], data: metrics({ temp: { cpu_temp_avg: null, gpu_temp_avg: 0 } }) }));
+  assert.equal(h.text('cooling-cpu-temp'), 'Unavailable'); assert.equal(h.text('cooling-gpu-temp'), '0.0 °C');
+  await nextPoll(h); await h.answer(sample({ sequence: 3, data: metrics({ soc: { vm: true } }), temperatures: [{ name: 'fake', group: 'cpu', source: 'smc', celsius: 70 }] }));
+  assert.equal(h.text('cooling-cpu-temp'), 'Unavailable'); assert.equal(h.elements.get('temperature-table').hidden, true);
+  assert.equal(h.elements.get('temperature-rows').children.length, 0); assert.equal(h.frames.size, 0);
+});
+
+await check('temperature charts redraw after expansion, break gaps and keep a bounded history of mean peaks', async () => {
+  const h = boot(), canvas = h.elements.get('temperature-chart');
+  await h.answer(sample()); assert.equal(canvas.width, undefined, 'A hidden chart must not receive a fake size');
+  await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ temp: { cpu_temp_avg: 50, gpu_temp_avg: 48 } }) }));
+  await nextPoll(h); await h.answer(sample({ sequence: 3, data: metrics({ temp: { cpu_temp_avg: null, gpu_temp_avg: null } }) }));
+  await nextPoll(h); await h.answer(sample({ sequence: 4, data: metrics({ temp: { cpu_temp_avg: 47, gpu_temp_avg: 49 } }) }));
+  await h.click('cooling-toggle'); assert.equal(canvas.width, 600);
+  for (const trace of canvas.context.paths) assert.deepEqual(trace.points.map((point) => point[0]), ['moveTo', 'lineTo', 'moveTo']);
+  assert.match(h.text('temperature-range'), /40–50 °C/); assert.match(h.text('temperature-peaks'), /CPU 50.0 °C \/ GPU 49.0 °C/);
+  assert.equal(h.text('power-range'), '0–20 W', 'Temperature values never scale the power chart');
+  await h.click('cooling-toggle'); canvas._width = 170;
+  for (let sequence = 5; sequence < 68; sequence++) {
+    await nextPoll(h); await h.answer(sample({ sequence, data: metrics({ temp: { cpu_temp_avg: 30, gpu_temp_avg: 31 } }) }));
+  }
+  await h.click('cooling-toggle'); assert.equal(canvas.width, 340);
+  assert.equal(h.state().history.length, 60); assert.match(h.text('temperature-peaks'), /CPU 30.0 °C \/ GPU 31.0 °C/);
+  assert.equal(canvas.context.paths[0].points.length, 60);
 });
 
 console.log(`${tests.length} dashboard checks passed.`);

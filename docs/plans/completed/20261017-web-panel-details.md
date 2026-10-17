@@ -1,3 +1,5 @@
+Done: 2026-10-17, PR #20
+
 # Browser overview and detail controls
 
 ## Behavior and decisions
@@ -16,7 +18,14 @@
 
 ## Tasks
 
-- [ ] Add accessible per-panel and global overview/detail controls with persistence.
-- [ ] Add temperature summaries, trends and real sensor details.
-- [ ] Verify lifecycle, missing/stale data, storage fallback and responsive browser layouts.
-- [ ] Run checks, tests and independent review.
+- [x] Add accessible per-panel and global overview/detail controls with persistence.
+- [x] Add temperature summaries, trends and real sensor details.
+- [x] Verify lifecycle, missing/stale data, storage fallback and responsive browser layouts.
+- [x] Run checks, tests and independent review.
+
+## Result
+
+All seven panels support independent and global detail controls with browser-local
+preferences. Real sensor ranges, hotspots and mean-temperature history are available in
+Cooling. Rootless browser checks on M2 Max / macOS 15.6.1, responsive layouts, live-scroll
+retention, full checks and independent review passed.

@@ -173,9 +173,9 @@ what we need.
       sensor readings without changing existing metric structs or legacy outputs.
       Plan: [docs/plans/completed/20261017-temperature-details.md](plans/completed/20261017-temperature-details.md).
 
-- [ ] **30. Add browser overview/detail controls.** Per-panel and global expansion,
+- [x] **30. Add browser overview/detail controls.** Per-panel and global expansion,
       temperature history and named sensors, with concise live summaries.
-      Plan: [docs/plans/20261017-web-panel-details.md](plans/20261017-web-panel-details.md).
+      Plan: [docs/plans/completed/20261017-web-panel-details.md](plans/completed/20261017-web-panel-details.md).
 
 - [ ] **31. Add terminal overview/detail controls.** Keyboard-accessible per-panel and
       global expansion, full lists and temperature details with compatible preferences.
