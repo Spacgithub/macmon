@@ -31,7 +31,8 @@ fn controller_command(action: Option<Action>, binary: &Path) -> Command {
 }
 
 pub fn run(action: Option<Action>) -> io::Result<()> {
-  let binary = std::env::current_exe()?.canonicalize()?;
+  // Older desktop entries retain this alias and compare their configured path exactly.
+  let binary = std::env::current_exe()?;
   let status = controller_command(action, &binary).status()?;
   if !status.success() {
     return Err(io::Error::other(format!("dashboard control failed ({status})")));

@@ -3,6 +3,7 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 fixture=$(mktemp -d "${TMPDIR:-/private/tmp}/macmon-control-test.XXXXXX")
+fixture=$(CDPATH= cd -- "$fixture" && pwd -P)
 trap 'rm -rf "$fixture"' EXIT
 trap 'exit 130' HUP INT TERM
 mkdir "$fixture/tools" "$fixture/Installed tools"
@@ -289,14 +290,37 @@ if [ "$#" -gt 0 ]; then
 
   alias="$fixture/legacy alias's & executable"
   ln -s "$binary" "$alias"
+  legacy_control="$root/tests/fixtures/dashboard-control-before-web-cli.sh"
+  for invocation in absolute relative path; do
+    reset
+    case "$invocation" in
+      absolute) "$alias" web start >/dev/null;;
+      relative) (cd "$fixture" && "./$(basename "$alias")" web start >/dev/null);;
+      path) PATH="$fixture:$PATH" "$(basename "$alias")" web start >/dev/null;;
+    esac
+    preserved="$MACMON_CONTROL_STATE_DIR/com.macmon.plist"
+    [ "$(plutil -extract ProgramArguments.0 raw "$preserved")" = "$alias" ]
+    cp "$preserved" "$fixture/native-first.plist"
+    first_pid=$(cat "$fixture/listener")
+    sh "$legacy_control" status "$alias" | grep -q '^Running'
+    sh "$legacy_control" start "$alias" >/dev/null
+    sh "$legacy_control" open "$alias" >/dev/null
+    [ "$(cat "$fixture/listener")" = "$first_pid" ]
+    [ "$(grep -c '^bootstrap ' "$fixture/commands")" = 1 ]
+    sh "$legacy_control" stop "$alias" >/dev/null
+    no_job
+    cmp "$fixture/native-first.plist" "$preserved"
+  done
+  printf 'PASS native-first absolute, relative and PATH aliases work with the frozen desktop controller\n'
+
   for source in session login; do
     reset
-    sh "$root/scripts/dashboard-control.sh" start "$alias" >/dev/null
+    sh "$legacy_control" start "$alias" >/dev/null
     if [ "$source" = login ]; then
-      sh "$root/scripts/dashboard-control.sh" stop "$alias" >/dev/null
+      sh "$legacy_control" stop "$alias" >/dev/null
       mv "$MACMON_CONTROL_STATE_DIR/com.macmon.plist" "$MACMON_CONTROL_AGENT_PLIST"
       plutil -insert Program -string "$alias" "$MACMON_CONTROL_AGENT_PLIST"
-      sh "$root/scripts/dashboard-control.sh" start "$alias" >/dev/null
+      sh "$legacy_control" start "$alias" >/dev/null
       preserved="$MACMON_CONTROL_AGENT_PLIST"
     else preserved="$MACMON_CONTROL_STATE_DIR/com.macmon.plist"; fi
     cp "$preserved" "$fixture/alias-before.plist"

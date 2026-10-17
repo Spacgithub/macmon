@@ -22,3 +22,5 @@ Done: 2026-10-16, PR #18
 The shared controller accepts verified aliases of the same executable and preserves the
 configured path for strict job checks. Alias-first session and login lifecycle regressions,
 unsafe-path rejection, complete checks, package compilation and independent review passed.
+Native-first absolute, relative and PATH alias invocations also retain the macOS-reported
+executable path and interoperate with a frozen pre-PR desktop controller.

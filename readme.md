@@ -234,6 +234,8 @@ on `http://127.0.0.1:19090/dashboard/` for the current login session. Existing l
 preferences and separate terminal monitors are preserved.
 An existing executable alias is reused when it points to the same file; its configured
 path and service plist are preserved.
+New services keep the executable path reported by macOS, preserving compatibility with
+older desktop entries when starting through the same alias.
 
 #### Desktop control
 
