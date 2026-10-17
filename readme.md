@@ -230,7 +230,8 @@ separate from RAM percentage. Expand Memory for used/total swap and the complete
 These rates use cumulative VM swap-page counters, the actual page size and monotonic time:
 they are page-equivalent bytes per second, not SSD physical I/O or wear. A first sample,
 missing source, counter reset or invalid interval shows `Unavailable`; a valid idle interval
-shows `0 B/s`. Unsupported pressure levels stay unavailable. See Apple’s
+shows `0 B/s`. Unsupported pressure levels stay unavailable. In the terminal’s expanded
+overview, `I` and `O` mean swap-in and swap-out; press `f` for the full labels. See Apple’s
 [memory-pressure guide](https://support.apple.com/en-asia/guide/activity-monitor/actmntr1004/mac)
 for how macOS uses memory pressure alongside usage and swap.
 

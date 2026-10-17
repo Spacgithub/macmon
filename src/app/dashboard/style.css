@@ -62,6 +62,7 @@ h3 { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
 #status[data-state="offline"], #status[data-state="stale"] { color: #edb77b; }
 .overview {
   display: grid;
+  align-items: start;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 18px;
   margin: 32px 0 18px;

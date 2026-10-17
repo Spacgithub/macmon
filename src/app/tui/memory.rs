@@ -19,6 +19,10 @@ pub(super) fn pressure_badge(value: Option<MemoryPressure>) -> Span<'static> {
 }
 
 pub(super) fn rate(value: Option<f64>) -> String {
+  format_rate(value, false)
+}
+
+fn format_rate(value: Option<f64>, compact: bool) -> String {
   let Some(mut value) = value.filter(|value| value.is_finite() && *value >= 0.0) else {
     return "Unavailable".into();
   };
@@ -32,10 +36,13 @@ pub(super) fn rate(value: Option<f64>) -> String {
     "0".into()
   } else if value >= 10_000.0 {
     format!("{value:.1e}")
+  } else if compact && value >= 10.0 {
+    format!("{value:.0}")
   } else {
     format!("{value:.1}")
   };
-  format!("{number} {}/s", units[index])
+  let separator = if compact { "" } else { " " };
+  format!("{number}{separator}{}/s", units[index])
 }
 
 pub(super) fn activity_lines(activity: &MemoryActivity) -> Vec<Line<'static>> {
@@ -55,6 +62,25 @@ pub(super) fn rates_line(activity: &MemoryActivity) -> Line<'static> {
     rate(activity.swap_in_bytes_per_sec),
     rate(activity.swap_out_bytes_per_sec)
   )))
+}
+
+fn compact_rates_line(activity: &MemoryActivity) -> Line<'static> {
+  let compact = |value| {
+    let value = format_rate(value, true);
+    if value == "Unavailable" { "—".into() } else { value }
+  };
+  Line::from(theme::dim(format!(
+    "Swap I {} O {}",
+    compact(activity.swap_in_bytes_per_sec),
+    compact(activity.swap_out_bytes_per_sec)
+  )))
+}
+
+/// Prefer spaced quantities, then complete compact units; never clip a rate to the border.
+pub(super) fn fitted_rates(activity: &MemoryActivity, width: usize) -> Option<Line<'static>> {
+  [rates_line(activity), compact_rates_line(activity)]
+    .into_iter()
+    .find(|line| line.width() <= width)
 }
 
 #[cfg(test)]
@@ -173,7 +199,7 @@ mod tests {
     let advanced = render(&mut app, 200, 50);
     assert!(advanced.contains("Pressure Warning") && advanced.contains("Swap I 1.0 KiB/s"));
     assert!(advanced.contains("O 2.0 KiB/s"));
-    let rates = rates_line(&app.memory_activity);
+    let rates = compact_rates_line(&app.memory_activity);
     let width = rates.width() as u16;
     // Two outer border cells precede the even GPU/RAM split; verify the actual box widths.
     for (padding, fits) in [(5, false), (6, true)] {
@@ -185,7 +211,82 @@ mod tests {
       assert_eq!(ram.width, width + padding);
       assert_eq!(view.contains("Swap I"), fits, "A whole rate line yields before cutting its unit");
       if fits {
-        assert!(view.contains("Swap I 1.0 KiB/s · O 2.0 KiB/s"));
+        assert!(view.contains("Swap I 1.0KiB/s O 2.0KiB/s"));
+      }
+    }
+    let longest = rates_line(&app.memory_activity).width() as u16;
+    for (padding, expected) in
+      [(5, "Swap I 1.0KiB/s O 2.0KiB/s"), (6, "Swap I 1.0 KiB/s · O 2.0 KiB/s")]
+    {
+      assert!(render(&mut app, (longest + padding) * 2 + 2, 24).contains(expected));
+    }
+  }
+
+  #[test]
+  fn dual_fans_keep_pressure_and_separate_complete_swap_units_in_normal_advanced_windows() {
+    use macmon::{CpuTierInfo, FanMetric};
+
+    use crate::tui::fan_protocol::Capabilities;
+
+    for native in [false, true] {
+      let mut app = App::from_parts(
+        SocInfo {
+          cpu_tiers: ["E", "P"]
+            .map(|label| CpuTierInfo { label: label.into(), cores: 6, freqs: Vec::new() })
+            .into(),
+          ..Default::default()
+        },
+        Config::default(),
+      );
+      app.cfg.panel_details = [true; 6];
+      app.cell_pixels = Some((9, 18));
+      app.capabilities = native.then_some(Capabilities {
+        foreground: [230; 3],
+        background: [20; 3],
+        accent: None,
+        cell_pixels: (9, 18),
+      });
+      for pressure in [
+        Some(MemoryPressure::Normal),
+        Some(MemoryPressure::Warning),
+        Some(MemoryPressure::Critical),
+        None,
+      ] {
+        update(
+          &mut app,
+          MemoryActivity {
+            pressure,
+            swap_in_bytes_per_sec: Some(1024.0),
+            swap_out_bytes_per_sec: Some(2048.0),
+          },
+        );
+        // Updating metrics without a fan sample clears them; restore the two real placements.
+        app.cooling.sync(&[
+          FanMetric { name: "fan0".into(), rpm: 1800, max_rpm: None },
+          FanMetric { name: "fan1".into(), rpm: 2200, max_rpm: None },
+        ]);
+        for columns in [120, 140] {
+          let view = render(&mut app, columns, 40);
+          assert_eq!(app.placements.len(), 2, "{columns} columns, native {native}");
+          let plan = app.layout(Rect::new(0, 0, columns, 40));
+          let ram =
+            plan.boxes.iter().find(|(kind, _)| *kind == crate::tui::layout::Metric::Ram).unwrap().1;
+          assert!((34..=35).contains(&ram.width), "actual dual-fan Memory width {}", ram.width);
+          assert!(view.contains(&format!("Pressure {}", pressure_name(pressure))), "{view}");
+          assert!(view.contains("Swap I 1.0KiB/s O 2.0KiB/s"), "{view}");
+        }
+        for (incoming, outgoing, expected) in [
+          (1023.9 * 1024.0, 900.0 * 1024.0 * 1024.0, "Swap I 1024KiB/s O 900MiB/s"),
+          (0.0, 0.0, "Swap I 0 B/s · O 0 B/s"),
+        ] {
+          app.memory_activity.swap_in_bytes_per_sec = Some(incoming);
+          app.memory_activity.swap_out_bytes_per_sec = Some(outgoing);
+          for columns in [120, 140] {
+            let view = render(&mut app, columns, 40);
+            assert!(view.contains(&format!("Pressure {}", pressure_name(pressure))), "{view}");
+            assert!(view.contains(expected), "{view}");
+          }
+        }
       }
     }
   }
