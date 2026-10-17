@@ -213,6 +213,26 @@ and animation. WAITING, LIVE, STALE and OFFLINE describe connection/sample state
 the last available values visible. `/api/sample` adds freshness metadata; `/json`, `/metrics`,
 the root JSON response and existing server defaults retain their formats.
 
+#### Terminal web control
+
+```sh
+macmon web          # start background monitoring and open the dashboard
+macmon web start    # start in the background without opening a browser
+macmon web status   # show service state and dashboard address
+macmon web stop     # stop the background job, sampling and listener
+
+macmon -h           # list all commands
+macmon web -h       # explain web controls and default behavior
+macmon web stop -h  # help for an individual action (--help also works)
+```
+
+Repeated starts reuse the running service. Closing a browser tab keeps monitoring active;
+use `macmon web stop` to end it. An existing tab stays open and reports OFFLINE after stopping.
+These commands use the same controller as the desktop entry below, bundled into the binary
+so this checkout is not required. Without a compatible login agent, the service listens only
+on `http://127.0.0.1:19090/dashboard/` for the current login session. Existing login startup
+preferences and separate terminal monitors are preserved.
+
 #### Desktop control
 
 Create a small macOS app once, using an absolute path to the installed executable:

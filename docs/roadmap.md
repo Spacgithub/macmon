@@ -162,3 +162,8 @@ what we need.
 - [x] **27. Show detailed browser power readings.** Distinguish the CPU+GPU+ANE subtotal
       from the system estimate, show component watts and retain a scaled 60-sample history.
       Plan: [docs/plans/completed/20261016-dashboard-power-details.md](plans/completed/20261016-dashboard-power-details.md).
+
+- [ ] **28. Control the browser dashboard from the terminal.** Add native start/open,
+      start-only, stop and status commands with discoverable help, reusing the managed
+      service without changing login preferences or separate terminal monitors.
+      Plan: [docs/plans/20261016-web-cli.md](plans/20261016-web-cli.md).

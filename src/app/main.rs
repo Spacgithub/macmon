@@ -16,6 +16,7 @@ mod procs;
 mod serve;
 mod stress;
 mod tui;
+mod web;
 
 use macmon::diagnostics::print_debug;
 use macmon::{Metrics, Sampler};
@@ -88,6 +89,15 @@ enum Commands {
     /// Uninstall the launchd service
     #[arg(long, default_value_t = false)]
     uninstall: bool,
+  },
+
+  /// Control the browser dashboard (starts and opens by default)
+  #[command(
+    after_help = "Without a subcommand, starts background monitoring and opens the dashboard.\nClosing the browser tab keeps monitoring active; use 'macmon web stop' to stop the backend.\nA separate terminal monitor and login startup preferences are preserved."
+  )]
+  Web {
+    #[command(subcommand)]
+    action: Option<web::Action>,
   },
 
   /// Print debug information
@@ -305,6 +315,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
       }
     }
+    Some(Commands::Web { action }) => web::run(*action)?,
     Some(Commands::Debug) => print_debug()?,
     Some(Commands::FindClpc { powermetrics }) => find_clpc::run(*powermetrics)?,
     Some(Commands::Stress { mode, workers, duration, pulse }) => {
@@ -329,6 +340,44 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn web_defaults_to_open_and_parses_explicit_controls() {
+    for (args, expected) in [
+      (vec!["macmon", "web"], None),
+      (vec!["macmon", "web", "start"], Some(web::Action::Start)),
+      (vec!["macmon", "web", "stop"], Some(web::Action::Stop)),
+      (vec!["macmon", "web", "status"], Some(web::Action::Status)),
+    ] {
+      let cli = Cli::try_parse_from(args).unwrap();
+      let Some(Commands::Web { action }) = cli.command else { panic!("expected web") };
+      assert_eq!(action, expected);
+    }
+    assert!(Cli::try_parse_from(["macmon", "web", "unknown"]).is_err());
+    assert!(Cli::try_parse_from(["macmon"]).unwrap().command.is_none());
+  }
+
+  #[test]
+  fn web_controls_and_default_behavior_are_discoverable_in_help() {
+    for flag in ["-h", "--help"] {
+      for (args, expected) in [
+        (vec!["macmon", flag], vec!["web"]),
+        (
+          vec!["macmon", "web", flag],
+          vec!["start", "stop", "status", "opens the dashboard", "stop the backend"],
+        ),
+        (vec!["macmon", "web", "start", flag], vec!["without opening the browser"]),
+        (vec!["macmon", "web", "stop", flag], vec!["release its port"]),
+        (vec!["macmon", "web", "status", flag], vec!["service state"]),
+      ] {
+        let help = Cli::try_parse_from(args).unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        for text in expected {
+          assert!(help.to_string().contains(text), "missing {text} in {help}");
+        }
+      }
+    }
+  }
 
   #[test]
   fn serve_keeps_its_default_listener_and_explicit_loopback_option() {

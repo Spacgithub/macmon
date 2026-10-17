@@ -258,3 +258,44 @@ grep -q '^foreign sentinel$' "$race_app/sentinel"
 [ "$(find "$race_app" -type f | wc -l | tr -d ' ')" = 1 ]
 [ -z "$(find "$fixture" -name '.macmon-control.*' -print)" ]
 printf 'PASS standalone app resources, quoted paths and non-overwriting installer\n'
+
+if [ "$#" -gt 0 ]; then
+  reset
+  cp "$1" "$binary"
+  "$binary" -h | grep -q 'web'
+  "$binary" web -h | grep -q 'stop the backend'
+  [ ! -e "$fixture/commands" ] && [ ! -e "$fixture/opened" ]
+  "$binary" web status | grep -q '^Stopped'
+  [ ! -e "$MACMON_CONTROL_STATE_DIR" ]
+  "$binary" web start >/dev/null
+  [ ! -e "$fixture/opened" ]
+  first_pid=$(cat "$fixture/listener")
+  "$binary" web >/dev/null
+  ln -s "$binary" "$fixture/macmon-link"
+  "$fixture/macmon-link" web start >/dev/null
+  [ "$(cat "$fixture/listener")" = "$first_pid" ]
+  [ "$(grep -c '^bootstrap ' "$fixture/commands")" = 1 ]
+  grep -q '^http://127.0.0.1:19090/dashboard/$' "$fixture/opened"
+  "$binary" web status | grep -q '^Running'
+  "$binary" web stop >/dev/null
+  "$binary" web stop >/dev/null
+  no_job
+  "$binary" web status | grep -q '^Stopped'
+  "$binary" web start >/dev/null
+  [ "$(cat "$fixture/listener")" != "$first_pid" ]
+  "$binary" web stop >/dev/null
+  no_job
+  printf 'PASS native web commands, embedded controller, repeated starts and help\n'
+
+  reset
+  (MOCK_HTTP_FAIL=1 reject "$binary" web)
+  no_job
+  [ ! -e "$fixture/opened" ]
+  "$binary" web start >/dev/null
+  sed 's@program = .*@program = /foreign/executable@' "$fixture/job" > "$fixture/foreign"
+  mv "$fixture/foreign" "$fixture/job"
+  reject "$binary" web stop
+  ! grep -q '^bootout ' "$fixture/commands"
+  reset
+  printf 'PASS native web failures propagate and foreign jobs remain untouched\n'
+fi
