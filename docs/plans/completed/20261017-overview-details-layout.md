@@ -1,3 +1,5 @@
+Done: 2026-10-17, PR #28
+
 # Core summaries, useful details and dashboard layout
 
 ## Behavior and decisions
@@ -36,5 +38,15 @@
 - [x] Add meaningful browser CPU/GPU details and honest Network overview semantics.
 - [x] Rebalance browser compact/expanded layout with responsive and persistence coverage.
 - [x] Add matching Terminal Compute and Network summaries/details with layout regressions.
-- [ ] Run focused and full checks, independent reviews, and real browser/private-PTY checks;
+- [x] Run focused and full checks, independent reviews, and real browser/private-PTY checks;
   retain all disk functionality and verify the user's installed service and settings.
+
+## Result
+
+PR #27 adds balanced Web summaries, independent compute analysis and a single-interface
+Network overview. PR #28 adds matching Terminal detail views, complete narrow Network
+counters and reliable focus controls. Disk, thermal, memory, power, fans, process controls
+and released preferences remain compatible; no public metric or configuration format changed.
+
+Full checks and independent reviews passed, with real rootless M2 Max browser and private-PTY
+validation. The installed program, formal service and user settings remain on merged main.

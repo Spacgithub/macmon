@@ -196,7 +196,7 @@ what we need.
       compact Terminal/browser summaries with independently expandable details.
       Plan: [docs/plans/completed/20261017-disk-monitoring.md](plans/completed/20261017-disk-monitoring.md).
 
-- [ ] **35. Make compact summaries and expanded details useful.** Add real CPU tier/core
+- [x] **35. Make compact summaries and expanded details useful.** Add real CPU tier/core
       breakdowns and GPU details, a named Network observation overview, and responsive
       Terminal/browser layouts that preserve all disk and existing monitoring features.
-      Plan: [docs/plans/20261017-overview-details-layout.md](plans/20261017-overview-details-layout.md).
+      Plan: [docs/plans/completed/20261017-overview-details-layout.md](plans/completed/20261017-overview-details-layout.md).
