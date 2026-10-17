@@ -15,6 +15,6 @@
 
 ## Tasks
 
-- [ ] Retain named temperature readings with source and group, with focused tests.
-- [ ] Publish same-sample temperature details without breaking existing outputs.
+- [x] Retain named temperature readings with source and group, with focused tests.
+- [x] Publish same-sample temperature details without breaking existing outputs.
 - [ ] Verify real rootless readings, compatibility, checks and independent review.
