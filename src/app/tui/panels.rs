@@ -682,14 +682,20 @@ impl App {
       }
       let focus = if self.panels.focus == panel { "●" } else { "○" };
       let state = if detailed { "detail" } else { "summary" };
-      let titles = Titles::new(theme::value(
-        format!("{focus} {} {} · {state}", panel as usize + 1, panel.name()),
-        theme::SECTION,
-      ))
-      .right(hint("f", "full"));
+      let label = if panel == Panel::Cooling && rect.width < 36 {
+        format!("{focus} 5 Cooling")
+      } else {
+        format!("{focus} {} {} · {state}", panel as usize + 1, panel.name())
+      };
+      let titles =
+        Titles::new(theme::value(label, theme::SECTION)).right(if panel == Panel::Cooling {
+          hint("⇧A", format!("{}fps", self.cfg.fan_fps))
+        } else {
+          hint("f", "full")
+        });
       let mut inner = draw_box(frame, rect, titles);
       if panel == Panel::Cooling && !self.placements.is_empty() {
-        self.cooling.render(frame, &self.placements);
+        self.cooling.render(frame, &self.placements, self.cfg.fan_fps);
         let bottom =
           self.placements.iter().map(|place| place.card.bottom()).max().unwrap_or(inner.y);
         inner.height = inner.bottom().saturating_sub(bottom);

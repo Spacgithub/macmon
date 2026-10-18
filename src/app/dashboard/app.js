@@ -10,12 +10,17 @@ const percent = (value) => finite(value) ? `${(Math.min(value, 1) * 100).toFixed
 const put = (id, value) => { $(id).textContent = value; };
 const panelNames = { cpu: "CPU", gpu: "GPU", ram: "memory", power: "power", disk: "disk", network: "network", cooling: "temperature and cooling", process: "process" };
 const preferenceKey = "macmon.panel-details.v1";
+const fanFpsKey = "macmon.fan-fps.v1", fanFpsOptions = [15, 30, 60];
+const validFanFps = (value) => fanFpsOptions.includes(value) ? value : 30;
+function loadFanFps() {
+  try { return validFanFps(Number(localStorage.getItem(fanFpsKey))); } catch { return 30; }
+}
 function loadDetails() {
   let saved;
   try { saved = JSON.parse(localStorage.getItem(preferenceKey)); } catch { /* Browser storage is optional. */ }
   return Object.fromEntries(Object.keys(panelNames).map((name) => [name, saved?.[name] === true]));
 }
-const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], disks: new Map(), diskHistory: new Map(), diskSelected: null, cpuTierRows: new Map(), cpuCoreRows: new Map(), networkRows: new Map(), networkStatus: "Waiting for rates", frame: 0, last: 0, cadence: null, changing: false, intervalError: false, details: loadDetails() };
+const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], disks: new Map(), diskHistory: new Map(), diskSelected: null, cpuTierRows: new Map(), cpuCoreRows: new Map(), networkRows: new Map(), networkStatus: "Waiting for rates", frame: 0, last: null, next: 0, fanFps: loadFanFps(), cadence: null, changing: false, intervalError: false, details: loadDetails() };
 const processViewKey = "macmon.process-view.v1";
 function loadProcessView() {
   try { const value = localStorage.getItem(processViewKey); if (["grouped", "raw"].includes(value)) return value; } catch { /* Storage is optional. */ }
@@ -92,6 +97,7 @@ function refreshProcesses(sample, started, systemIdentity) {
 const motion = $("motion");
 const reduced = matchMedia("(prefers-reduced-motion: reduce)");
 motion.checked = !reduced.matches;
+$("fan-fps").value = String(state.fanFps);
 let pollTimer, staleTimer, controller;
 function bytes(value) {
   if (!finite(value)) return unknown;
@@ -405,17 +411,29 @@ function settle() {
     if (Number.isFinite(delay)) staleTimer = setTimeout(settle, delay);
   }
   if (moving()) {
-    if (!state.frame) state.frame = requestAnimationFrame(animate);
+    scheduleFrame();
   } else {
-    cancelAnimationFrame(state.frame);
-    state.frame = state.last = 0;
+    resetFrameClock();
     state.fans.forEach((fan) => { fan.speed = 0; });
   }
 }
-function animate(now) {
+function resetFrameClock() {
+  clearTimeout(state.frame);
+  state.frame = state.next = 0;
+  state.last = null;
+}
+function scheduleFrame() {
+  if (state.frame || !moving()) return;
+  const now = performance.now();
+  if (!state.next) { state.next = now + 1000 / state.fanFps; state.last = now; }
+  // A single deadline timer avoids a display-rate RAF loop even on high-refresh screens.
+  state.frame = setTimeout(animate, Math.max(1, Math.ceil(state.next - now)));
+}
+function animate() {
   state.frame = 0;
   if (!moving()) { settle(); return; }
-  const delta = state.last ? Math.min((now - state.last) / 1000, 0.05) : 0;
+  const now = performance.now(), period = 1000 / state.fanFps;
+  const delta = state.last === null ? 0 : Math.min((now - state.last) / 1000, 0.1);
   state.last = now;
   state.fans.forEach((fan) => {
     if (!(fan.rpm > 0)) { fan.speed = 0; return; }
@@ -424,7 +442,8 @@ function animate(now) {
     fan.angle = (fan.angle + delta * fan.speed * 360) % 360;
     fan.rotor.style.transform = `rotate(${fan.angle}deg)`;
   });
-  state.frame = requestAnimationFrame(animate);
+  state.next += Math.max(1, Math.floor((now - state.next) / period) + 1) * period;
+  scheduleFrame();
 }
 function drawCharts() {
   ["cpu", "gpu", "ram"].forEach((name, index) => {
@@ -844,6 +863,13 @@ async function poll() {
   }
 }
 motion.addEventListener("change", settle);
+$("fan-fps").addEventListener("change", () => {
+  state.fanFps = validFanFps(Number($("fan-fps").value));
+  $("fan-fps").value = String(state.fanFps);
+  try { localStorage.setItem(fanFpsKey, String(state.fanFps)); } catch { /* Storage is optional. */ }
+  resetFrameClock();
+  settle();
+});
 $("process-view").value = procView.mode;
 $("process-view").addEventListener("change", () => {
   procView.mode = ["grouped", "raw"].includes($("process-view").value) ? $("process-view").value : "grouped";

@@ -81,7 +81,7 @@ impl Cooling {
     true
   }
 
-  pub(super) fn render(&self, frame: &mut Frame, placements: &[Placement]) {
+  pub(super) fn render(&self, frame: &mut Frame, placements: &[Placement], fps: u16) {
     for (image, place) in self.items.iter().zip(placements) {
       let title = Line::from(vec![
         theme::value(" Cooling ", theme::SECTION),
@@ -89,8 +89,13 @@ impl Cooling {
         theme::text(" "),
       ]);
       let block = Block::bordered().border_type(BorderType::Rounded).border_style(theme::BORDER);
-      let label =
-        Line::from(vec![theme::heading(format!(" {}", image.rpm)), theme::dim(" RPM ")]).centered();
+      let label = format!("{} RPM", image.rpm);
+      let rate = format!(" {fps}fps");
+      let mut spans = vec![theme::heading(image.rpm.to_string()), theme::dim(" RPM")];
+      if label.len() + rate.len() <= usize::from(place.card.width.saturating_sub(2)) {
+        spans.push(theme::dim(rate));
+      }
+      let label = Line::from(spans).centered();
       frame.render_widget(block.title(title).title_bottom(label), place.card);
     }
   }

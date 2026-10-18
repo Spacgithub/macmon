@@ -112,7 +112,7 @@ async function drainMicrotasks() { for (let i = 0; i < 24; i++) await Promise.re
 
 function boot({ reduced = false, storage = new Map(), storageFailure = false, expanded = false, managed = false, hostname = 'localhost' } = {}) {
   let now = 0, nextId = 1, activeFetches = 0, maximumFetches = 0;
-  const timers = new Map(), frames = new Map(), requests = [], elements = new Map();
+  const timers = new Map(), frames = new Map(), requests = [], elements = new Map(), animationTimes = [];
   const document = new Target();
   let focused = true;
   Object.assign(document, { hidden: false, hasFocus: () => focused, activeElement: null, documentElement: new Element('root'),
@@ -206,6 +206,7 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
       assert.ok(iterations++ < 1000, 'Runaway synthetic timer loop');
       now = Math.max(now, next[1].at);
       timers.delete(next[0]);
+      if (next[1].callback.name === 'animate') animationTimes.push(now);
       next[1].callback();
       await drainMicrotasks();
     }
@@ -213,7 +214,9 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
     await drainMicrotasks();
   };
   return {
-    elements, document, media, frames, requests, inspect, pending, storage,
+    elements, document, media, frames, requests, inspect, pending, storage, animationTimes,
+    motionTimers: () => Number(timers.has(inspect('state.frame'))),
+    jump: (milliseconds) => { now += milliseconds; },
     state: () => inspect('state'),
     text: (id) => elements.get(id).textContent,
     status: () => elements.get('status').dataset.state,
@@ -225,7 +228,7 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
     async fail() { assert.ok(pending()); pending().fail(); await drainMicrotasks(); },
     async click(id) { const element = elements.get(id); if (!element.disabled) element.emit('click'); await drainMicrotasks(); },
     advance,
-    async frame(milliseconds = 1000 / 60) {
+    async frame(milliseconds = 1000 / inspect('state.fanFps') + 1) {
       await advance(milliseconds);
       const callbacks = [...frames.values()];
       frames.clear();
@@ -233,6 +236,7 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
       await drainMicrotasks();
     },
     async motion(enabled) { elements.get('motion').checked = enabled; elements.get('motion').emit('change'); await drainMicrotasks(); },
+    async fps(value) { elements.get('fan-fps').value = String(value); elements.get('fan-fps').emit('change'); await drainMicrotasks(); },
     async reduced(enabled) { media.matches = enabled; media.emit('change'); await drainMicrotasks(); },
     async hidden(enabled) { document.hidden = enabled; document.emit('visibilitychange'); await drainMicrotasks(); },
     async focused(enabled) { focused = enabled; window.emit(enabled ? 'focus' : 'blur'); await drainMicrotasks(); },
@@ -321,7 +325,7 @@ await check('missing metrics and VM never invent telemetry', async () => {
   assert.equal(h.elements.get('network-table').hidden, true);
   assert.match(h.text('network-empty'), /unavailable/i);
   assert.equal(h.state().fans.size, 0);
-  assert.equal(h.frames.size, 0);
+  assert.equal(h.motionTimers(), 0);
   await nextPoll(h);
   await h.answer(sample({ sequence: 2, data: {} }));
   assert.match(h.text('network-empty'), /unavailable/i, 'An omitted network field must not claim zero interfaces');
@@ -351,7 +355,7 @@ await check('a delayed response cannot label an already expired sample live', as
   await h.advance(2000);
   await h.answer(sample({ age_ms: 2000 }));
   assert.equal(h.status(), 'stale');
-  assert.equal(h.frames.size, 0);
+  assert.equal(h.motionTimers(), 0);
   await nextPoll(h);
   await h.answer(sample({ sequence: 2 }));
   assert.equal(h.status(), 'live');
@@ -389,8 +393,9 @@ await check('real fan identities retain node and phase through reordering', asyn
   const slow = h.state().fans.get('fan0'), fast = h.state().fans.get('fan1');
   assert.ok(fast.angle > slow.angle && slow.angle > 0);
   assert.equal(slow.rotor.children.length, 7);
-  const angle = slow.angle, fastAngle = fast.angle, slowNode = slow.node;
+  const slowNode = slow.node;
   await nextPoll(h);
+  const angle = slow.angle, fastAngle = fast.angle;
   await h.answer(sample({ sequence: 2, data: metrics({ fans: [
     { name: 'fan1', rpm: 2400 }, { name: 'fan0', rpm: 1800 }, { name: 'new-fan', rpm: 0 },
   ] }) }));
@@ -403,7 +408,7 @@ await check('real fan identities retain node and phase through reordering', asyn
   assert.equal(h.state().fans.get('new-fan').angle, 0);
   await nextPoll(h); await h.answer(sample({ sequence: 3, data: metrics({ fans: [{ name: 'fan0', rpm: 0 }] }) }));
   const stopped = h.state().fans.get('fan0').angle;
-  assert.equal(h.state().fans.size, 1); assert.equal(h.frames.size, 0);
+  assert.equal(h.state().fans.size, 1); assert.equal(h.motionTimers(), 0);
   await animate(h, 10); assert.equal(h.state().fans.get('fan0').angle, stopped);
   assert.equal(h.state().fans.get('fan0').node.querySelector('.fan-rpm').textContent, '0 RPM');
 });
@@ -447,43 +452,115 @@ await check('same identity does not append history; a restart with the same sequ
 await check('503 waiting, offline and stale states recover without erasing the last values', async () => {
   const h = boot({ expanded: true }); await h.answer(null, 503);
   assert.equal(h.status(), 'waiting'); assert.equal(h.requests[0].jsonCalls, 0);
-  assert.equal(h.frames.size, 0); assert.equal(h.state().history.length, 0);
+  assert.equal(h.motionTimers(), 0); assert.equal(h.state().history.length, 0);
   await nextPoll(h); await h.answer(sample());
   assert.equal(h.status(), 'live'); const cpu = h.text('cpu-value');
   await nextPoll(h); await h.fail();
-  assert.equal(h.status(), 'offline'); assert.equal(h.text('cpu-value'), cpu); assert.equal(h.frames.size, 0);
+  assert.equal(h.status(), 'offline'); assert.equal(h.text('cpu-value'), cpu); assert.equal(h.motionTimers(), 0);
   await nextPoll(h); await h.answer(sample({ sequence: 2, age_ms: 2990 }));
   assert.equal(h.status(), 'live'); await h.advance(12);
-  assert.equal(h.status(), 'stale'); assert.equal(h.frames.size, 0); assert.equal(h.text('cpu-value'), cpu);
+  assert.equal(h.status(), 'stale'); assert.equal(h.motionTimers(), 0); assert.equal(h.text('cpu-value'), cpu);
   await nextPoll(h); await h.answer(sample({ sequence: 3 }));
-  assert.equal(h.status(), 'live'); assert.equal(h.frames.size, 1);
+  assert.equal(h.status(), 'live'); assert.equal(h.motionTimers(), 1);
 });
 
 await check('manual and reduced motion stop only fan animation', async () => {
   const h = boot({ expanded: true }); await h.answer(sample()); await animate(h, 10);
   const fan = h.state().fans.get('fan0'), angle = fan.angle;
-  await h.motion(false); assert.equal(h.frames.size, 0);
+  await h.motion(false); assert.equal(h.motionTimers(), 0);
   await animate(h, 10); assert.equal(fan.angle, angle);
   await nextPoll(h); await h.answer(sample({ sequence: 2 }));
-  assert.equal(h.status(), 'live'); assert.equal(h.frames.size, 0);
-  await h.motion(true); assert.equal(h.frames.size, 1); await animate(h, 10);
+  assert.equal(h.status(), 'live'); assert.equal(h.motionTimers(), 0);
+  await h.motion(true); assert.equal(h.motionTimers(), 1); await animate(h, 10);
   assert.ok(fan.angle > angle);
-  await h.reduced(true); assert.equal(h.frames.size, 0); assert.equal(h.elements.get('motion').checked, false);
+  await h.reduced(true); assert.equal(h.motionTimers(), 0); assert.equal(h.elements.get('motion').checked, false);
   await nextPoll(h); await h.answer(sample({ sequence: 3 }));
-  assert.equal(h.status(), 'live'); assert.equal(h.frames.size, 0);
+  assert.equal(h.status(), 'live'); assert.equal(h.motionTimers(), 0);
   const initial = boot({ reduced: true, expanded: true }); await initial.answer(sample());
-  assert.equal(initial.frames.size, 0); assert.equal(initial.elements.get('motion').checked, false);
+  assert.equal(initial.motionTimers(), 0); assert.equal(initial.elements.get('motion').checked, false);
+});
+
+await check('fan FPS targets reduce actual timer callbacks instead of discarding RAF frames', async () => {
+  const angles = [];
+  for (const fps of [15, 30, 60]) {
+    const h = boot({ expanded: true, storage: new Map([['macmon.fan-fps.v1', String(fps)]]) });
+    await h.answer(sample());
+    assert.equal(h.elements.get('fan-fps').value, String(fps));
+    assert.equal(h.motionTimers(), 1);
+    await h.advance(1000);
+    assert.ok(h.animationTimes.length >= fps - 1 && h.animationTimes.length <= fps, `${fps}: ${h.animationTimes.length}`);
+    assert.equal(h.frames.size, 0, 'There is no display-rate RAF wakeup loop');
+    for (let index = 1; index < h.animationTimes.length; index++) {
+      assert.ok(h.animationTimes[index] - h.animationTimes[index - 1] >= 1000 / fps - 1);
+    }
+    angles.push(h.state().fans.get('fan0').angle);
+    assert.ok(h.state().fans.get('fan1').angle > h.state().fans.get('fan0').angle);
+    assert.equal(h.state().sample.interval_ms, 1000);
+  }
+  assert.ok(Math.max(...angles) - Math.min(...angles) < 10, '15 FPS must not slow the rotor through a 50 ms delta cap');
+});
+
+await check('fan FPS changes retain phase, focus and sampling while replacing one deadline', async () => {
+  const h = boot({ expanded: true }); await h.answer(sample()); await h.advance(200);
+  const fan = h.state().fans.get('fan0'), angle = fan.angle, select = h.elements.get('fan-fps');
+  select.focus();
+  const callbacks = h.animationTimes.length;
+  await h.fps(15);
+  assert.equal(fan.angle, angle); assert.equal(h.motionTimers(), 1);
+  assert.equal(h.document.activeElement, select);
+  assert.equal(h.storage.get('macmon.fan-fps.v1'), '15');
+  await h.advance(60); assert.equal(h.animationTimes.length, callbacks);
+  await h.advance(8); assert.equal(h.animationTimes.length, callbacks + 1);
+  for (let index = 0; index < 20; index++) h.inspect('settle()');
+  assert.equal(h.motionTimers(), 1);
+  await nextPoll(h); await h.answer(sample({ sequence: 2 }));
+  assert.equal(h.state().fans.get('fan0'), fan); assert.equal(h.document.activeElement, select);
+  assert.equal(select.value, '15'); assert.equal(h.pending('/api/interval'), undefined);
+  await h.motion(false); await h.fps(60);
+  assert.equal(h.motionTimers(), 0); assert.equal(h.elements.get('motion').checked, false);
+  await h.reduced(true); await h.fps(30); assert.equal(h.motionTimers(), 0);
+  const restored = boot({ storage: h.storage });
+  assert.equal(restored.state().fanFps, 30);
+});
+
+await check('invalid or unavailable FPS storage falls back independently and remains adjustable', async () => {
+  for (const value of [null, '0', '14', '45', '61', '-1', 'Infinity', '__proto__', 'true', '{}']) {
+    const storage = new Map([['macmon.panel-details.v1', JSON.stringify({ cooling: true })]]);
+    if (value !== null) storage.set('macmon.fan-fps.v1', value);
+    const h = boot({ storage }); await h.answer(sample());
+    assert.equal(h.state().fanFps, 30); assert.equal(h.state().details.cooling, true);
+    assert.equal(h.motionTimers(), 1);
+  }
+  const h = boot({ expanded: true, storageFailure: true }); await h.answer(sample());
+  await h.fps(15); await h.advance(1000);
+  assert.equal(h.state().fanFps, 15); assert.ok(h.animationTimes.length <= 15);
+  assert.equal(h.elements.get('fan-fps').getAttribute('aria-label'), 'Fan animation target frames per second');
+  await h.fps('constructor'); assert.equal(h.state().fanFps, 30);
+});
+
+await check('delayed fan deadlines skip missed work and never queue a catchup burst', async () => {
+  const h = boot({ expanded: true }); await h.answer(sample());
+  h.jump(700); await h.advance(0);
+  assert.equal(h.animationTimes.length, 1); assert.equal(h.motionTimers(), 1);
+  assert.ok(h.state().fans.get('fan0').angle > 0 && h.state().fans.get('fan0').angle < 54);
+  assert.ok(h.state().next > h.now());
+  await h.advance(0); assert.equal(h.animationTimes.length, 1);
+  await h.motion(false);
+  const count = h.animationTimes.length; await h.advance(1000);
+  assert.equal(h.animationTimes.length, count);
+  await h.hidden(true); await h.advance(10000);
+  assert.equal(h.animationTimes.length, count); assert.equal(h.motionTimers(), 0);
 });
 
 await check('hidden tabs cancel animation and polling, then refresh on return', async () => {
   const h = boot({ expanded: true }); await h.answer(sample()); await animate(h, 5);
   const angle = h.state().fans.get('fan0').angle, count = h.requests.length;
-  await h.hidden(true); assert.equal(h.frames.size, 0);
+  await h.hidden(true); assert.equal(h.motionTimers(), 0);
   await h.advance(10000); assert.equal(h.requests.length, count);
   assert.equal(h.state().fans.get('fan0').angle, angle);
   await h.hidden(false); await h.advance(0);
   assert.ok(h.pending()); await h.answer(sample({ sequence: 2 }));
-  assert.equal(h.status(), 'live'); assert.equal(h.frames.size, 1);
+  assert.equal(h.status(), 'live'); assert.equal(h.motionTimers(), 1);
   await animate(h, 2); assert.ok(h.state().fans.get('fan0').angle > angle);
 });
 
@@ -1024,21 +1101,21 @@ await check('new samples and offline recovery retain controls, focus, sort, scro
   await h.click('cooling-toggle'); assert.equal(h.state().details.cooling, false);
   await nextPoll(h); await h.answer(sample({ sequence: 3 }));
   assert.equal(h.status(), 'live'); assert.equal(h.state().details.network, true); assert.equal(h.state().details.cooling, false);
-  assert.equal(h.frames.size, 0);
+  assert.equal(h.motionTimers(), 0);
 });
 
 await check('collapsed cooling stops animation while RPM and thermal summaries keep sampling, then resumes existing fans', async () => {
   const h = boot(); await h.answer(sample());
-  assert.equal(h.frames.size, 0); assert.match(h.text('fan-summary'), /fan0 1800 RPM/);
+  assert.equal(h.motionTimers(), 0); assert.match(h.text('fan-summary'), /fan0 1800 RPM/);
   assert.equal(h.text('cooling-cpu-temp'), '45.0 °C'); assert.equal(h.elements.get('fans').visible, false);
   await h.click('cooling-toggle'); await animate(h, 10);
   const fan = h.state().fans.get('fan0'), angle = fan.angle;
   assert.ok(angle > 0); await h.click('cooling-toggle');
-  assert.equal(h.frames.size, 0); await animate(h, 10); assert.equal(fan.angle, angle);
+  assert.equal(h.motionTimers(), 0); await animate(h, 10); assert.equal(fan.angle, angle);
   await nextPoll(h); await h.answer(sample({ sequence: 2, data: metrics({ fans: [{ name: 'fan0', rpm: 3200 }], temp: { cpu_temp_avg: 55, gpu_temp_avg: 48 } }) }));
   assert.equal(h.state().fans.get('fan0'), fan); assert.equal(fan.angle, angle);
   assert.equal(h.text('fan-summary'), 'fan0 3200 RPM'); assert.equal(h.text('cooling-cpu-temp'), '55.0 °C');
-  assert.equal(h.frames.size, 0); await h.click('cooling-toggle'); await animate(h, 10);
+  assert.equal(h.motionTimers(), 0); await h.click('cooling-toggle'); await animate(h, 10);
   assert.ok(fan.angle > angle); assert.equal(h.elements.get('temperature-chart').width, 600);
 });
 
@@ -1076,7 +1153,7 @@ await check('old backends and missing or VM sensor snapshots retain valid mean t
   assert.equal(h.text('cooling-cpu-temp'), 'Unavailable'); assert.equal(h.text('cooling-gpu-temp'), '0.0 °C');
   await nextPoll(h); await h.answer(sample({ sequence: 3, data: metrics({ soc: { vm: true } }), temperatures: [{ name: 'fake', group: 'cpu', source: 'smc', celsius: 70 }] }));
   assert.equal(h.text('cooling-cpu-temp'), 'Unavailable'); assert.equal(h.elements.get('temperature-table').hidden, true);
-  assert.equal(h.elements.get('temperature-rows').children.length, 0); assert.equal(h.frames.size, 0);
+  assert.equal(h.elements.get('temperature-rows').children.length, 0); assert.equal(h.motionTimers(), 0);
 });
 
 await check('temperature charts redraw after expansion, break gaps and keep a bounded history of mean peaks', async () => {

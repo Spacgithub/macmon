@@ -133,7 +133,7 @@
         <p class="muted thermal-note" id="temperature-groups">Sensor detail unavailable</p>
         <p class="muted thermal-note">Current ranges describe the reported sensor groups. SMC grouping is heuristic; names do not identify physical cores, batteries or storage.</p>
         <div id="temperature-scroll" class="sensor-scroll" tabindex="0" role="region" aria-label="Temperature sensors; scroll to see all"><table id="temperature-table" hidden><caption class="sr-only">Raw sensor name, heuristic group, source and current degrees Celsius</caption><thead><tr><th scope="col">Sensor</th><th scope="col">Group</th><th scope="col">Source</th><th scope="col">°C</th></tr></thead><tbody id="temperature-rows"></tbody></table></div>
-        <label class="motion fan-motion"><input id="motion" type="checkbox"> Fan motion</label>
+        <div class="fan-motion"><label class="motion"><input id="motion" type="checkbox"> Fan motion</label><label class="motion">Target FPS <select id="fan-fps" aria-label="Fan animation target frames per second"><option value="15">15 FPS</option><option value="30">30 FPS</option><option value="60">60 FPS</option></select></label></div>
         <p class="muted" id="fan-empty">Waiting for a sample</p><div class="fans" id="fans" hidden></div>
       </div>
     </section>
