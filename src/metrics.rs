@@ -6,6 +6,7 @@ use std::time::Duration;
 use core_foundation::dictionary::CFDictionaryRef;
 use serde::Serialize;
 
+use crate::disk::{DiskMetric, DiskSampler};
 use crate::memory_activity::{MemoryActivity, MemoryActivitySampler};
 use crate::network::{NetworkMetric, NetworkSampler};
 use crate::shared::{
@@ -596,6 +597,7 @@ pub struct Sampler {
   cpu_ticks: Option<Vec<[u32; 4]>>,
   network: NetworkSampler,
   memory_activity: MemoryActivitySampler,
+  disks: DiskSampler,
   hid: IOHIDSensors,
   smc: Option<SMC>,
   smc_cpu_keys: Vec<String>,
@@ -624,6 +626,7 @@ impl Sampler {
       cpu_ticks: None,
       network: NetworkSampler::default(),
       memory_activity: MemoryActivitySampler::default(),
+      disks: DiskSampler::default(),
       hid,
       smc: smc_sensors.smc,
       smc_cpu_keys: smc_sensors.cpu_keys,
@@ -777,6 +780,7 @@ impl Sampler {
   pub fn get_metrics(&mut self, duration: u32) -> WithError<Metrics> {
     self.temperature_details.clear();
     self.thermal_state = None;
+    let disk_baseline = self.disks.begin();
     // Until this acquisition completes successfully, the public getter and baseline stay empty.
     // Any early error drops the previous interval, rather than averaging across failed samples.
     let mut memory_activity = std::mem::take(&mut self.memory_activity);
@@ -830,6 +834,7 @@ impl Sampler {
 
     memory_activity.sample();
     self.memory_activity = memory_activity;
+    self.disks.sample(disk_baseline, self.soc.vm);
 
     Ok(rs)
   }
@@ -864,6 +869,15 @@ impl Sampler {
   /// it does not prove that hardware is unrestricted. This adds no fields to [`Metrics`].
   pub fn thermal_state(&self) -> Option<ThermalState> {
     self.thermal_state
+  }
+
+  /// Physical-disk snapshot from the last successful acquisition, without another hardware read.
+  ///
+  /// `None` means unavailable or failed sampling; an empty slice means no eligible devices.
+  /// I/O rates require consecutive valid counters. Health refreshes separately at low frequency;
+  /// its `age_ms` is measured at this snapshot, not a claim that health was reread each interval.
+  pub fn disks(&self) -> Option<&[DiskMetric]> {
+    self.disks.latest()
   }
 }
 
@@ -959,6 +973,7 @@ mod tests {
       cpu_ticks: None,
       network: Default::default(),
       memory_activity: Default::default(),
+      disks: Default::default(),
       hid: IOHIDSensors::new().unwrap(),
       smc: None,
       smc_cpu_keys: vec![],
@@ -1187,6 +1202,18 @@ mod tests {
     assert!(sampler.get_metrics(0).is_err());
     assert_eq!(sampler.thermal_state(), None);
     assert_eq!(serde_json::to_value(Metrics::default()).unwrap().get("thermal_state"), None);
+  }
+
+  #[test]
+  fn disks_clear_public_snapshot_and_rate_baseline_after_a_failed_cpu_acquisition() {
+    let mut sampler = sampler_without_sources(4, true);
+    assert!(sampler.disks().is_none());
+    sampler.disks = crate::disk::DiskSampler::fixture();
+    assert_eq!(sampler.disks().unwrap()[0].name, "disk0");
+    assert!(sampler.get_metrics(0).is_err());
+    assert!(sampler.disks().is_none());
+    assert!(sampler.disks.begin().is_none());
+    assert!(serde_json::to_value(Metrics::default()).unwrap().get("disks").is_none());
   }
 
   fn core(

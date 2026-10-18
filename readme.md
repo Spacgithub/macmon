@@ -437,6 +437,33 @@ The public macOS interface MIB supplies 64-bit counters without sudo. Prometheus
 `macmon_network_receive_bytes_per_second` and `macmon_network_transmit_bytes_per_second`
 gauges, labeled by `interface`. Unavailable rates have no gauge series for that sample.
 
+### Disk monitoring API
+
+`Sampler::disks()` and the top-level `disks` field in HTTP `/api/sample` expose physical
+whole-device I/O. `null` means unavailable; `[]` means a successful scan found no eligible
+devices. APFS containers and volumes are excluded. Each disk has its BSD `name`, optional
+model, location and capacity, and an `id` identifying the driver and media connection generation.
+Rates are bytes/s and operations/s over measured intervals. First samples, missing counters,
+counter resets, failed acquisitions and reconnected media need a fresh baseline; idle rates are
+real zeroes. Cumulative counters start when the storage driver is instantiated, not at manufacture
+([Apple counter definitions](https://github.com/apple-oss-distributions/IOStorageFamily/blob/main/IOBlockStorageDriver.h#L56-L82)).
+
+NVMe health runs in a separate worker, at most once per minute, including failed attempts.
+`health.state` is `available`, `unsupported` or `unavailable`; `health.age_ms` records its age
+when the containing sample completed. Clients add the sample's current `age_ms` and treat health
+older than 120 seconds as stale. A stalled hardware health call does not block normal sampling;
+its worker is not replaced while pending. Unknown devices and VM host health stay unavailable.
+
+`health.nvme` includes the critical-warning byte, manufacturer-estimated percentage **used**,
+available spare, temperature and lifetime counters. An estimate can exceed 100%; it does not
+establish remaining years. All 128-bit counters are decimal strings, preserving precision in JSON.
+One reported read/write data unit is 512,000 bytes of host data, not physical NAND writes or wear.
+Units and wear estimates follow the [NVMe SMART/Health log specification](https://nvmexpress.org/wp-content/uploads/NVM-Express-Base-Specification-Revision-2.1-2024.08.05-Ratified.pdf).
+No self-tests, SMART enable commands, serial-number queries or root permissions are used.
+External NVMe support depends on the macOS driver exposing the native SMART interface; USB
+bridges and ATA-specific wear attributes are not decoded. Existing `Metrics`, `pipe`, `/json`,
+Prometheus and saved preferences retain their formats.
+
 ### Output format
 
 The `pipe` command and the HTTP `/json` endpoint return the same metrics. In a macOS VM (`"vm": true` in the `soc` object of `pipe --soc-info` and `/json`) power and frequencies read 0, temperatures `null` and fans are empty:

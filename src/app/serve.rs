@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use macmon::{MemoryActivity, Metrics, SocInfo, TemperatureReading, ThermalState};
+use macmon::{DiskMetric, MemoryActivity, Metrics, SocInfo, TemperatureReading, ThermalState};
 
 use crate::config::{TUI_MAX_MS, TUI_MIN_MS};
 use crate::metrics_to_json_value;
@@ -52,6 +52,7 @@ pub(crate) struct SampleDetails {
   pub temperatures: Vec<TemperatureReading>,
   pub memory_activity: MemoryActivity,
   pub thermal_state: Option<ThermalState>,
+  pub disks: Option<Vec<DiskMetric>>,
 }
 
 impl From<Vec<TemperatureReading>> for SampleDetails {
@@ -251,6 +252,7 @@ fn to_sample(sample: &Sample, soc: &SocInfo, local: bool, cadence: &Cadence) -> 
     "temperatures": sample.details.temperatures,
     "memory_activity": sample.details.memory_activity,
     "thermal_state": sample.details.thermal_state.filter(|_| !soc.vm),
+    "disks": sample.details.disks,
     "processes": processes.map(|snapshot| &snapshot.rows),
     "processes_age_ms": processes.map(|snapshot| snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
   })
@@ -782,6 +784,44 @@ mod tests {
     let response: serde_json::Value =
       serde_json::from_str(body(&get(&shared, "/api/sample"))).unwrap();
     assert!(response["thermal_state"].is_null());
+  }
+
+  #[test]
+  fn disk_snapshots_distinguish_unavailable_empty_and_lossless_health_without_legacy_changes() {
+    use macmon::{DiskHealth, DiskHealthState, DiskMetric, NvmeHealth};
+
+    let shared = Arc::new(RwLock::new(None));
+    let expected_prometheus = to_prometheus(&Metrics::default(), &SocInfo::default());
+    let disk = DiskMetric {
+      id: "123:456".into(),
+      name: "disk0".into(),
+      read_bytes: Some(0),
+      read_bytes_per_sec: Some(0.0),
+      write_bytes_per_sec: None,
+      health: DiskHealth {
+        state: DiskHealthState::Available,
+        age_ms: Some(6000),
+        nvme: Some(NvmeHealth {
+          data_units_written: u128::MAX.to_string(),
+          percentage_used: 201,
+          ..Default::default()
+        }),
+      },
+      ..Default::default()
+    };
+    for (index, disks) in [Some(vec![disk]), None, Some(vec![])].into_iter().enumerate() {
+      let expected = serde_json::to_value(&disks).unwrap();
+      let details = super::SampleDetails { disks, ..Default::default() };
+      publish_sample(&shared, Metrics::default(), details, 1000, None, super::sample_time());
+      let response: serde_json::Value =
+        serde_json::from_str(body(&get(&shared, "/api/sample"))).unwrap();
+      assert_eq!(response["sequence"], index + 1);
+      assert_eq!(response["disks"], expected);
+      assert!(response["metrics"].get("disks").is_none());
+      let legacy: serde_json::Value = serde_json::from_str(body(&get(&shared, "/json"))).unwrap();
+      assert!(legacy.get("disks").is_none());
+      assert_eq!(body(&get(&shared, "/metrics")), expected_prometheus);
+    }
   }
 
   #[test]

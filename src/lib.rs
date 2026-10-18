@@ -71,6 +71,7 @@
 //! ```
 
 mod clpc;
+mod disk;
 
 #[cfg(feature = "app")]
 #[doc(hidden)]
@@ -85,6 +86,8 @@ mod temperature;
 mod thermal;
 
 // Re-export the commonly used types.
+#[doc(inline)]
+pub use disk::{DiskHealth, DiskHealthState, DiskMetric, NvmeHealth};
 #[doc(inline)]
 pub use memory_activity::{MemoryActivity, MemoryPressure};
 #[doc(inline)]
