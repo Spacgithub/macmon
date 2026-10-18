@@ -25,6 +25,7 @@ const HELP: &[Row] = &[
   Section("Keys"),
   Key("q", "quit"),
   Key("1–6", "toggle Compute, Memory, Power, Network, Cooling, Processes"),
+  Key("7", "toggle physical Disk"),
   Key("Tab / ⇧Tab", "select a panel (starts on Processes)"),
   Key("Enter", "expand / summarize the selected panel"),
   Key("d", "expand all / summarize all panels"),
@@ -57,6 +58,9 @@ const HELP: &[Row] = &[
   Term("freq", "usage weighted by frequency; raw: share of time busy"),
   Term("POWER -", "not available for other users' processes"),
   Term("Network", "per-interface counters; tunnels are never added together"),
+  Term("Disk", "driver counters and NVMe host lifetime units are separate"),
+  Term("NVMe used", "manufacturer endurance used; >100% is possible, not years left"),
+  Term("Disk health", "NVMe report every 60s; STALE after 120s; 0x bits show warnings"),
   Term("Temperature", "raw sensor names are not physical-core identities"),
   Term("Temp history", "latest 60 sampling windows; missing readings leave gaps"),
 ];

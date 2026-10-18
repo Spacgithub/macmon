@@ -81,6 +81,10 @@ pub struct Config {
   #[serde_inline_default([false; 6])]
   pub panel_details: [bool; 6],
 
+  /// Physical disk panel (`7`); the released six-element panel array stays unchanged.
+  #[serde_inline_default(false)]
+  pub disk_details: bool,
+
   #[serde_inline_default(ProcSort::Cpu)]
   pub proc_sort: ProcSort,
 
@@ -238,13 +242,25 @@ impl Config {
     self.save();
   }
 
+  pub fn panel_detailed(&self, panel: usize) -> bool {
+    self.panel_details.get(panel).copied().unwrap_or(panel == 6 && self.disk_details)
+  }
+
   pub fn toggle_panel(&mut self, panel: usize) {
-    self.panel_details[panel] = !self.panel_details[panel];
+    if let Some(detail) = self.panel_details.get_mut(panel) {
+      *detail = !*detail;
+    } else if panel == 6 {
+      self.disk_details = !self.disk_details;
+    } else {
+      return;
+    }
     self.save();
   }
 
   pub fn toggle_all_panels(&mut self) {
-    self.panel_details = [!self.panel_details.iter().all(|detail| *detail); 6];
+    let detailed = !(self.disk_details && self.panel_details.iter().all(|detail| *detail));
+    self.panel_details = [detailed; 6];
+    self.disk_details = detailed;
     self.save();
   }
 
@@ -375,6 +391,40 @@ mod tests {
     assert_eq!(Config::load_from(Some(file.path())).panel_details, [true; 6]);
     cfg.toggle_all_panels();
     assert_eq!(Config::load_from(Some(file.path())).panel_details, [false; 6]);
+  }
+
+  #[test]
+  fn disk_detail_is_additive_and_old_six_panel_preferences_round_trip() {
+    let old =
+      r#"{"view_type":"Gauge","interval":500,"panel_details":[true,false,true,false,true,false]}"#;
+    let mut cfg = parse(old);
+    assert!(!cfg.disk_details);
+    let original = cfg.panel_details;
+    cfg.toggle_panel(6);
+    assert!(cfg.disk_details && cfg.panel_detailed(6));
+    assert!(!cfg.panel_detailed(7));
+    assert_eq!(cfg.panel_details, original);
+    let json = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(json["view_type"], "Gauge");
+    assert_eq!(json["panel_details"].as_array().unwrap().len(), 6);
+    let cfg = parse(&json.to_string());
+    assert!(cfg.disk_details);
+    assert_eq!(cfg.panel_details, original);
+    for invalid in ["null", "1", "\"true\"", "[]"] {
+      let cfg = parse(&format!(r#"{{"disk_details":{invalid},"interval":500}}"#));
+      assert!(!cfg.disk_details);
+      assert_eq!(cfg.interval(), 500);
+    }
+    let file = TempConfig::new("disk_details");
+    let mut cfg = Config::load_from(Some(file.path()));
+    cfg.toggle_panel(6);
+    assert_eq!(file.saved()["disk_details"], true);
+    cfg.toggle_all_panels();
+    let restored = Config::load_from(Some(file.path()));
+    assert!(restored.disk_details && restored.panel_details.iter().all(|value| *value));
+    cfg.toggle_all_panels();
+    let restored = Config::load_from(Some(file.path()));
+    assert!(!restored.disk_details && restored.panel_details.iter().all(|value| !*value));
   }
 
   #[test]

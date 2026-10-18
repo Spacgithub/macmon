@@ -23,6 +23,22 @@ pub(super) const MEMORY: Color = Color::Blue;
 pub(super) const POWER: Color = Color::Green;
 pub(super) const DOWNLOAD: Color = CPU;
 pub(super) const UPLOAD: Color = GPU;
+pub(super) const DISK_READ: Color = CPU;
+pub(super) const DISK_WRITE: Color = GPU;
+
+/// A fresh NVMe report can identify warnings; an absent or stale report makes no health claim.
+pub(super) fn disk_health(health: &macmon::DiskHealth, sample_age_ms: u64) -> Color {
+  if health.state != macmon::DiskHealthState::Available || health.age_ms.is_none() {
+    DIM
+  } else if health.age_ms.is_some_and(|age| age.saturating_add(sample_age_ms) > 120_000) {
+    Color::Yellow
+  } else {
+    health
+      .nvme
+      .as_ref()
+      .map_or(DIM, |nvme| if nvme.critical_warning == 0 { Color::Green } else { Color::Red })
+  }
+}
 
 /// Operating-system pressure levels are separate from the RAM utilization gradient.
 pub(super) fn memory_pressure(pressure: Option<macmon::MemoryPressure>) -> Color {

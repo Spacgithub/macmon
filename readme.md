@@ -80,11 +80,12 @@ Options:
 
 ### Interactive mode
 
-Run `macmon` without a subcommand to open six compact panels: Compute, Memory, Power,
-Network, Cooling and Processes. Their live summaries keep the three busiest named interfaces,
-five sorted processes, current CPU/GPU temperatures and fan RPM visible.
+Run `macmon` without a subcommand to open seven compact panels: Compute, Memory, Power,
+Network, Cooling, Processes and Disk. At 80×24 their live summaries keep the three busiest named
+interfaces, five sorted processes, current CPU/GPU temperatures, fan RPM and the busiest physical
+disk visible. Disk keeps read/write rates separate; IOPS appears when the whole field fits.
 
-Use `1`–`6` to toggle a panel, `Tab` / `Shift-Tab` to select one, and `Enter` to toggle the
+Use `1`–`7` to toggle a panel, `Tab` / `Shift-Tab` to select one, and `Enter` to toggle the
 selected panel. `d` expands all panels or returns them to summaries. `f` opens the selected
 panel in a full-screen detail view; `f` / `Esc` returns. Use arrows, Page Up/Down or Home/End
 to scroll complete interface and sensor lists. Process arrows retain their selection behavior
@@ -95,14 +96,25 @@ Expanded Cooling shows each group's current sensor count/range, the current hots
 name, a 60-sample mean-temperature trend with gaps for missing readings, historical mean
 statistics and every sensor's original name, source and Celsius. Use `f` to give long lists
 more room. Folding Cooling pauses its fan drawing while RPM and temperature sampling continue.
-The optional `panel_details` setting saves only the six expansion choices, in the order above;
-old settings remain compatible, and the temporary `f` view is not saved. Press `?` for help.
+The optional `panel_details` setting keeps the original six expansion choices; `disk_details`
+saves Disk independently. Old settings remain compatible, and the temporary `f` view is not
+saved. Press `?` for help.
+
+Select Disk with `7` and press `f` for every physical device's IOPS, driver read/write counters
+and supported NVMe health fields. Driver counters are separate from lifetime host read/write
+bytes and exact NVMe data units (512,000 bytes each); neither measures physical NAND writes.
+Endurance used may exceed 100% (`>254%` for NVMe's 255 sentinel), not a prediction of remaining
+years. Unsupported and unavailable health are distinct; reports older than 120 seconds say
+STALE. The summary says NVMe OK or NVMe warning; details retain the original hexadecimal
+critical-warning bit field.
 
 When all panels are expanded, the advanced chart layout remains available. At least 100
 columns and 30 rows show Compute on the left, Memory and a Power/Temperature ledger on the
 right, and full-width Network and Processes below. Smaller windows and VMs use the adaptive
 metric grid. This overview keeps Network concise; select it or Cooling and press `f` for the
-complete interface or named-sensor detail view.
+complete interface or named-sensor detail view. Disk has its own full-width strip. When a small
+advanced window needs space for complete fans and Disk, Processes shows a concise entry;
+`6` then `f` still opens the full process list without changing the sampling preference.
 
 CPU, GPU and RAM charts use terminal-theme accents; high-load history remains red. Primary
 values are bold, while secondary details are dimmed. Network receive/transmit rates and totals

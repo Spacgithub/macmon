@@ -844,6 +844,9 @@ impl App {
     let count = view.procs().map_or(0, <[_]>::len);
     let title = if view.typing() || !view.filter().is_empty() {
       view.titles(area.width).right(hint("f", "full"))
+    } else if area.height < 5 {
+      Titles::new(theme::value(format!("6 Processes · {count}"), theme::SECTION))
+        .right(hint("f", "full"))
     } else {
       Titles::new(theme::value(format!("6 Processes · top 5 / {count}"), theme::SECTION))
         .right(hint("f", "full"))
@@ -855,6 +858,10 @@ impl App {
     }
     if self.proc_view.procs().is_none() {
       f.render_widget(Line::from(dim("collecting…")), inner);
+      return;
+    }
+    if inner.height < 2 {
+      f.render_widget(Line::from(dim("6 then f: full process list")), inner);
       return;
     }
     let columns = fit_columns(inner.width, self.proc_view.sort);

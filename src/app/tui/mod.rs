@@ -3,6 +3,7 @@
 mod boxes;
 mod cooling;
 mod cooling_layout;
+mod disk;
 mod fan_clock;
 mod fan_images;
 mod fan_protocol;
@@ -35,7 +36,8 @@ use info::Info;
 use kill::Kill;
 use layout::LayoutPlan;
 use macmon::{
-  MemoryActivity, Metrics, NetworkMetric, Sampler, SocInfo, TemperatureReading, ThermalState,
+  DiskMetric, MemoryActivity, Metrics, NetworkMetric, Sampler, SocInfo, TemperatureReading,
+  ThermalState,
 };
 use panels::{Panel, PanelState, Temperatures};
 use proc_view::ProcView;
@@ -125,7 +127,14 @@ fn set_mouse_capture(out: &mut impl Write, on: bool, want: bool) -> io::Result<b
 // MARK: Threads
 
 enum Event {
-  Update(Box<Metrics>, Vec<TemperatureReading>, MemoryActivity, Option<ThermalState>),
+  Update(
+    Box<Metrics>,
+    Vec<TemperatureReading>,
+    MemoryActivity,
+    Option<ThermalState>,
+    Option<Vec<DiskMetric>>,
+    Instant,
+  ),
   /// The sampler failed: the app ends with this error.
   Failed(String),
   /// A process sample with the number of the panel showing it was started in.
@@ -270,11 +279,20 @@ fn run_sampler_thread(tx: mpsc::Sender<Event>, msec: Arc<RwLock<u32>>) {
 
       loop {
         let metrics = sampler.get_metrics(window)?;
+        let sampled = Instant::now();
         let temperatures = sampler.temperature_details().to_vec();
         let memory_activity = *sampler.memory_activity();
         let thermal_state = sampler.thermal_state();
+        let disks = sampler.disks().map(<[DiskMetric]>::to_vec);
         if tx
-          .send(Event::Update(Box::new(metrics), temperatures, memory_activity, thermal_state))
+          .send(Event::Update(
+            Box::new(metrics),
+            temperatures,
+            memory_activity,
+            thermal_state,
+            disks,
+            sampled,
+          ))
           .is_err()
         {
           return Ok(());
@@ -387,6 +405,8 @@ pub struct App {
   mem: MemoryStore,
   memory_activity: MemoryActivity,
   thermal_state: Option<ThermalState>,
+  disks: Option<Vec<DiskMetric>>,
+  disk_sampled: Option<Instant>,
 
   cpu_power: PowerStore,
   gpu_power: PowerStore,
@@ -527,9 +547,11 @@ impl App {
         self.handle_mouse(mouse);
         return ControlFlow::Continue(());
       }
-      Event::Update(data, temperatures, memory_activity, thermal_state) => {
+      Event::Update(data, temperatures, memory_activity, thermal_state, disks, sampled) => {
         self.memory_activity = memory_activity;
         self.thermal_state = thermal_state;
+        self.disks = disks;
+        self.disk_sampled = Some(sampled);
         self.temperatures.push(temperatures, &data.temp);
         self.update_metrics(*data);
         return ControlFlow::Continue(());
@@ -715,7 +737,7 @@ impl App {
   /// Screen layout for the current settings and metrics.
   #[cfg(test)]
   fn layout(&self, area: Rect) -> LayoutPlan {
-    self.cooling_layout(area, self.cfg.show_procs).0
+    self.legacy_layout(area).0
   }
 
   fn cooling_layout(&self, area: Rect, procs: bool) -> (LayoutPlan, Vec<Placement>) {
@@ -815,14 +837,14 @@ impl App {
 
   /// Layout of a frame for the window `area`, with the state that follows the window updated
   /// before anything is drawn: whether the process list fits, and whether it is on screen.
-  fn layout_frame(&mut self, area: Rect) -> LayoutPlan {
+  fn layout_frame(&mut self, area: Rect) -> (LayoutPlan, Option<Rect>) {
     self.procs_fit = !area.is_empty();
-    let (plan, placements) = self.cooling_layout(area, self.cfg.show_procs);
+    let (plan, placements, disk) = self.legacy_layout(area);
     self.placements = placements;
     // Layout pressure never discards the process selection or pauses a requested sample.
     // `f` can still show the complete list when the advanced grid has no table rectangle.
     self.set_procs_visible(self.cfg.show_procs);
-    plan
+    (plan, disk)
   }
 
   fn render(&mut self, f: &mut Frame) {
@@ -834,8 +856,8 @@ impl App {
       self.render_panels(f);
       return;
     }
-    self.panels.targets.clear();
-    let plan = self.layout_frame(f.area());
+    let (plan, disk) = self.layout_frame(f.area());
+    self.panels.targets = disk.map(|area| (Panel::Disk, area)).into_iter().collect();
     self.fan_motion_visible = self.help.is_none()
       && self.placements.is_empty()
       && self.fans.motion_glyph(0).is_some()
@@ -845,11 +867,19 @@ impl App {
     self.render_metrics_box(f, &plan);
     self.cooling.render(f, &self.placements);
     if let Some(r) = plan.proc {
-      self.render_proc_box(f, r);
+      if r.height < 6 {
+        self.panels.targets.push((Panel::Processes, r));
+        self.render_proc_summary(f, r);
+      } else {
+        self.render_proc_box(f, r);
+      }
     } else {
       self.proc_view.clear_targets();
     }
-    let overlay = plan.proc.unwrap_or(f.area());
+    if let Some(area) = disk {
+      self.render_disk_panel(f, area);
+    }
+    let overlay = plan.proc.filter(|area| area.height >= 6).unwrap_or(f.area());
     self.info.iter_mut().for_each(|info| info.render(f, overlay));
     self.kill.render(f, overlay);
     if let Some(scroll) = self.help {
@@ -980,7 +1010,7 @@ mod tests {
   use std::ops::ControlFlow;
   use std::sync::atomic::AtomicBool;
   use std::sync::{Arc, Mutex, RwLock, mpsc};
-  use std::time::Duration;
+  use std::time::{Duration, Instant};
 
   use macmon::{
     CpuTierInfo, CpuTierMetrics, FanMetric, MemMetrics, Metrics, NetworkMetric, SocInfo,
@@ -1017,7 +1047,14 @@ mod tests {
     terminal.draw(|frame| app.render(frame)).unwrap();
     for _ in 0..10 {
       let mut events = vec![Event::Tick, Event::Tick, Event::Tick, Event::Tick];
-      events.push(Event::Update(Box::new(test_metrics()), Vec::new(), Default::default(), None));
+      events.push(Event::Update(
+        Box::new(test_metrics()),
+        Vec::new(),
+        Default::default(),
+        None,
+        None,
+        Instant::now(),
+      ));
       let showing = app.procs_shown.showing().unwrap();
       events.push(Event::Procs { showing, procs: test_procs() });
       for event in events {
@@ -1189,7 +1226,14 @@ mod tests {
         assert_eq!(
           app
             .apply_event(
-              Event::Update(Box::new(metrics), Vec::new(), Default::default(), None),
+              Event::Update(
+                Box::new(metrics),
+                Vec::new(),
+                Default::default(),
+                None,
+                None,
+                Instant::now()
+              ),
               &interval
             )
             .unwrap(),
@@ -1539,9 +1583,8 @@ mod tests {
     (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
   }
 
-  /// Screen row where the process box starts in a 200x50 window: right under the metrics box, 40 %
-  /// of the height.
-  const PROC_Y: u16 = 20;
+  /// Screen row where processes start in a 200×50 advanced window: 40% metrics plus Disk's strip.
+  const PROC_Y: u16 = 23;
 
   /// Text of row `y` of the process box in a 200x50 window: 0 is the title, 1 the header.
   fn proc_row(buf: &Buffer, y: u16) -> String {
@@ -1614,7 +1657,7 @@ mod tests {
     with_procs(test_app(), procs)
   }
 
-  /// App with 100 processes `proc0`… (pids 1000…) in the same order by CPU and pid; 27 of them
+  /// App with 100 processes `proc0`… (pids 1000…) in the same order by CPU and pid; 24 of them
   /// fit in a 200x50 window.
   fn hundred_procs_app() -> App {
     let procs = (0..100).map(|i| ProcInfo {
@@ -1748,11 +1791,13 @@ mod tests {
     let mut app = with_procs(saving_app(&file), varied_procs());
     assert!(app.procs_visible());
 
-    // hidden: the metrics take the whole screen, and no process is sampled
+    // Hidden: metrics fill the space above Disk, and no process is sampled.
     assert!(app.handle_key(key('p')).is_continue());
     assert_eq!(file.saved()["show_procs"], false);
     let buf = render_buffer(&mut app, 200, 50);
-    assert_eq!(app.layout(buf.area).top, Some(buf.area));
+    assert_eq!(app.layout(buf.area).top, Some(Rect { height: 47, ..buf.area }));
+    assert_eq!(app.legacy_layout(buf.area).2, Some(Rect::new(0, 47, 200, 3)));
+    assert!(screen_text(&buf).contains("7 Disk"));
     assert!(!screen_text(&buf).contains("WindowServer") && !app.procs_visible());
 
     // shown again: collecting until the next sample
@@ -1977,34 +2022,34 @@ mod tests {
 
   #[test]
   fn a_scrollbar_on_the_right_border_shows_where_the_rows_on_screen_are() {
-    // the right border from the header to the corner: beside the 27 rows of 100 processes `↑`, a
-    // track of 25 cells with a thumb of 7 (27 / 100 of it), `↓`
+    // Disk leaves 24 process rows: a 22-cell track has a five-cell thumb, with arrows at its ends.
     let mut app = hundred_procs_app();
     let border = |app: &mut App| {
       let buf = render_buffer(app, 200, 50);
       (PROC_Y + 1..50).map(|y| buf[(199, y)].symbol().to_string()).collect::<String>()
     };
     let bar = |above: usize, below: usize| {
-      format!("│↑{}{}{}↓╯", "│".repeat(above), "┃".repeat(7), "│".repeat(below))
+      format!("│↑{}{}{}↓╯", "│".repeat(above), "┃".repeat(5), "│".repeat(below))
     };
-    assert_eq!(border(&mut app), bar(0, 18));
-    // scrolled to row 36 of the 73 it can start at, then to the end
+    assert_eq!(app.layout(Rect::new(0, 0, 200, 50)).proc.unwrap(), Rect::new(0, PROC_Y, 200, 27));
+    assert_eq!(border(&mut app), bar(0, 17));
+    // Scrolled to row 36 of the 76 it can start at, then to the end.
     for _ in 0..12 {
       app.handle_mouse(mouse(MouseEventKind::ScrollDown, 100, PROC_Y + 10));
     }
-    assert_eq!(border(&mut app), bar(9, 9));
+    assert_eq!(border(&mut app), bar(8, 9));
     assert!(press(&mut app, KeyCode::End).is_continue());
-    assert_eq!(border(&mut app), bar(18, 0));
+    assert_eq!(border(&mut app), bar(17, 0));
     // the arrows in the border color, the thumb in the text color
     let buf = render_buffer(&mut app, 200, 50);
     let fg = |y: u16| buf[(199, PROC_Y + y)].fg;
-    assert_eq!([fg(2), fg(27), fg(28)], [theme::BORDER, theme::TEXT, theme::BORDER]);
+    assert_eq!([fg(2), fg(24), fg(25)], [theme::BORDER, theme::TEXT, theme::BORDER]);
 
     // the 11 rows of `proc9` fit: the plain border
     for c in "/proc9".chars() {
       assert!(app.handle_key(key(c)).is_continue());
     }
-    assert_eq!(border(&mut app), format!("{}╯", "│".repeat(28)));
+    assert_eq!(border(&mut app), format!("{}╯", "│".repeat(25)));
 
     // in any window the box keeps its corners
     let widths = [1, 2, 3, 5, 10, 20, 40, 60, 80, 100, 119];
@@ -2049,6 +2094,62 @@ mod tests {
     render_buffer(&mut app, 200, 50);
     click(&mut app, mem.0, mem.1);
     assert_eq!(app.cfg.proc_sort, ProcSort::Mem);
+  }
+
+  #[test]
+  fn compact_advanced_process_summary_click_restores_focus_without_toggling_preferences() {
+    use super::fan_protocol::Capabilities;
+
+    for native in [false, true] {
+      let mut app = test_app_with(|metrics| {
+        metrics.fans = ["fan0", "fan1"]
+          .map(|name| FanMetric { name: name.into(), rpm: 1800, max_rpm: None })
+          .into();
+      });
+      app.cell_pixels = Some((9, 18));
+      app.capabilities = native.then_some(Capabilities {
+        foreground: [230; 3],
+        background: [20; 3],
+        accent: None,
+        cell_pixels: (9, 18),
+      });
+      let mut app = with_procs(app, varied_procs());
+      assert!(press(&mut app, KeyCode::Down).is_continue());
+      for disk_row in [0, 1] {
+        for process_row in [0, 1, 2] {
+          let buf = render_buffer(&mut app, 80, 24);
+          assert_eq!(app.placements.len(), 2);
+          let process = app.layout(buf.area).proc.unwrap();
+          assert_eq!(process, Rect::new(0, 21, 80, 3));
+          let disk = app.legacy_layout(buf.area).2.unwrap();
+          assert_eq!(disk, Rect::new(0, 18, 80, 3));
+          click(&mut app, disk.x + 2, disk.y + disk_row);
+          assert_eq!(app.panels.focus, super::Panel::Disk);
+          assert!(app.panels_legacy());
+          let choices = (app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs);
+          let showing = app.procs_shown.showing();
+          let selected = app.proc_view.selected_pid();
+          assert!(showing.is_some());
+          render_buffer(&mut app, 80, 24);
+          click(&mut app, process.x + 2, process.y + process_row);
+          assert_eq!(app.panels.focus, super::Panel::Processes);
+          assert!(app.panels_legacy());
+          assert_eq!((app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs), choices);
+          assert_eq!(app.procs_shown.showing(), showing);
+          assert_eq!(app.proc_view.selected_pid(), selected);
+          assert!(press(&mut app, KeyCode::Char('f')).is_continue());
+          let full = render_buffer(&mut app, 80, 24);
+          assert!(app.panels.fullscreen && app.panels.focus == super::Panel::Processes);
+          assert!(screen_text(&full).contains("WindowServer"));
+          assert!(app.placements.is_empty());
+          assert_eq!((app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs), choices);
+          assert_eq!(app.procs_shown.showing(), showing);
+          assert!(press(&mut app, KeyCode::Esc).is_continue());
+          render_buffer(&mut app, 80, 24);
+          assert_eq!(app.placements.len(), 2);
+        }
+      }
+    }
   }
 
   #[test]
@@ -2491,7 +2592,10 @@ mod tests {
 
   #[test]
   fn info_finder_kill_are_on_the_process_title_with_a_selection_while_not_typing() {
-    let title = |app: &mut App, width| proc_row(&render_buffer(app, width, 50), 0);
+    let title = |app: &mut App, width| {
+      let buf = render_buffer(app, width, 50);
+      row(&buf, app.layout(buf.area).proc.unwrap().y)
+    };
     let mut app = app_with_procs(varied_procs()); // [631, 2301, 1]
     assert!(!title(&mut app, 200).contains("kill"), "no selection");
     assert!(press(&mut app, KeyCode::Down).is_continue());
@@ -2586,8 +2690,13 @@ mod tests {
     assert!(app.handle_key(key('k')).is_continue());
     // centered over the process box
     let buf = render_buffer(&mut app, 200, 50);
-    assert!(row(&buf, 31).contains("╭─ Kill WindowServer? ──"), "{}", row(&buf, 31));
-    assert!(row(&buf, 33).contains("│  pid 631 · vlad "), "{}", row(&buf, 33));
+    let procs = app.layout(buf.area).proc.unwrap();
+    let top = (procs.y..procs.bottom())
+      .find(|&y| row(&buf, y).contains("╭─ Kill WindowServer? ──"))
+      .unwrap();
+    let bottom = (top + 1..procs.bottom()).find(|&y| row(&buf, y).contains('╰')).unwrap();
+    assert!((top - procs.y).abs_diff(procs.bottom() - bottom - 1) <= 1);
+    assert!(row(&buf, top + 2).contains("│  pid 631 · vlad "), "{}", row(&buf, top + 2));
 
     // a new sample without WindowServer drops the selection: `t` still kills the popup's process
     let mut procs = varied_procs();
@@ -2655,7 +2764,7 @@ mod tests {
     assert!(proc_row(&buf, 3).starts_with(&format!("│ exe       {WINDOW_SERVER} ")));
     assert!(proc_row(&buf, 4).starts_with("│ cwd       / "), "{}", proc_row(&buf, 4));
     assert!(proc_row(&buf, 5).starts_with("│ file  r-  /var/log/system.log "));
-    assert_eq!(proc_row(&buf, 29), format!("╰{} ? | q back ─╯", "─".repeat(185)));
+    assert_eq!(row(&buf, buf.area.bottom() - 1), format!("╰{} ? | q back ─╯", "─".repeat(185)));
 
     // it takes every key, the list's and the global ones (`q` closes it); Ctrl-C still quits
     for c in ['k', 'i', 'p', 's', 'v'] {
