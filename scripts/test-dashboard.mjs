@@ -1584,6 +1584,42 @@ await check('demand updates serialize and coalesce rapid blur hide restore so la
   assert.deepEqual(bodies, ['summary', 'details', 'summary', 'none', 'details']);
 });
 
+await check('lost or malformed hidden-demand replies require same-lease summary confirmation on restore', async () => {
+  for (const failure of ['lost', 'malformed']) {
+    const h = boot({ managed: true }); await h.demand();
+    await h.answer(sample({ ...processFixture(), process_collection: collection() }));
+    await h.hidden(true); assert.deepEqual(demandBody(h), { lease: 'a'.repeat(32), demand: 'none' });
+    // The server may already have applied none when its response is lost or unreadable.
+    if (failure === 'lost') { h.pending('/api/process-demand').fail(); await drainMicrotasks(); }
+    else await h.demand({ lease: 'a'.repeat(32), ttl_ms: 0 });
+    await h.hidden(false);
+    assert.ok(h.pending('/api/process-demand'), `${failure}: restore must confirm summary again`);
+    assert.deepEqual(demandBody(h), { lease: 'a'.repeat(32), demand: 'summary' });
+    assert.equal(h.requests.filter((request) => request.url === '/api/sample').length, 1, 'No GET may renew an unconfirmed server demand');
+    await h.demand();
+    assert.equal(h.pending().options.headers['X-Macmon-Process-Lease'], 'a'.repeat(32));
+    await h.answer(sample({ ...processFixture(), process_collection: collection() }));
+    assert.match(h.text('process-status'), /summary 5\.0s/);
+  }
+});
+
+await check('timed-out hidden demand retries the latest coalesced visible state before polling', async () => {
+  for (const expanded of [false, true]) {
+    const h = boot({ managed: true }); await h.demand();
+    await h.answer(sample({ ...processFixture(), process_collection: collection() }));
+    await h.hidden(true); await h.hidden(false);
+    if (expanded) await h.click('process-toggle');
+    assert.equal(demandBody(h).demand, 'none', 'The hidden update remains the only in-flight POST');
+    await h.advance(2500); assert.equal(h.status(), 'offline');
+    await h.advance(1000);
+    assert.ok(h.pending('/api/process-demand'), 'A timeout must not leave a confirmed-demand cache');
+    assert.deepEqual(demandBody(h), { lease: 'a'.repeat(32), demand: expanded ? 'details' : 'summary' });
+    assert.equal(h.requests.filter((request) => request.url === '/api/sample').length, 1);
+    await h.demand();
+    assert.equal(h.pending().options.headers['X-Macmon-Process-Lease'], 'a'.repeat(32));
+  }
+});
+
 await check('hidden tabs release process demand and do not renew it while asleep', async () => {
   const h = boot({ managed: true }); await h.demand();
   await h.answer(sample({ ...processFixture(), process_collection: collection() }));

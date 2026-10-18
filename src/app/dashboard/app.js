@@ -52,7 +52,8 @@ function syncProcessDemand() {
           || started + result.ttl_ms <= performance.now()) throw new Error("Invalid process lease");
         Object.assign(processLease, { mode: "managed", token: result.lease, ttl: result.ttl_ms, expires: started + result.ttl_ms, sent: demand });
         if (processLease.sent === processLease.wanted) return;
-      } finally { clearTimeout(timeout); }
+      } catch (error) { processLease.sent = null; throw error; }
+      finally { clearTimeout(timeout); }
     }
   })().finally(() => { processLease.pending = null; });
   return processLease.pending;
