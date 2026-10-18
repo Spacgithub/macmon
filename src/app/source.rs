@@ -1510,7 +1510,13 @@ mod tests {
     let lock = dir.runtime().owner_lock().unwrap();
     assert_eq!(dir.runtime().owner_lock().unwrap_err().kind(), io::ErrorKind::WouldBlock);
     drop(lock);
-    assert!(dir.runtime().owner_lock().is_ok());
+    // Parallel tests can fork while the descriptor is open; CLOEXEC closes the
+    // child's inherited copy at exec, briefly extending the same exclusive lock.
+    until(|| match dir.runtime().owner_lock() {
+      Ok(_) => true,
+      Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
+      Err(error) => panic!("released sampling lock cannot be acquired: {error}"),
+    });
   }
 
   #[test]
