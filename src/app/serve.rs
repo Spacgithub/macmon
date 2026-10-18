@@ -20,26 +20,31 @@ pub type SharedCadence = Arc<RwLock<Cadence>>;
 pub struct Cadence {
   requested_ms: u32,
   effective_ms: u32,
+  generation: u64,
   source: Option<Arc<crate::source::Client>>,
 }
 
 impl Cadence {
   pub fn new(initial_ms: u32) -> Self {
-    Self { requested_ms: initial_ms, effective_ms: initial_ms, source: None }
+    Self { requested_ms: initial_ms, effective_ms: initial_ms, generation: 0, source: None }
   }
 
   pub fn begin(&mut self) -> u32 {
-    self.effective_ms = self.requested_ms;
+    if self.effective_ms != self.requested_ms {
+      self.effective_ms = self.requested_ms;
+      self.generation = self.generation.saturating_add(1);
+    }
     self.effective_ms
   }
 
   pub(crate) fn adjust(&mut self, adjustment: &str) -> bool {
-    self.requested_ms = match adjustment {
+    let requested_ms = match adjustment {
       "increase" => self.requested_ms.saturating_add(250) / 250 * 250,
       "decrease" => self.requested_ms.saturating_sub(250).div_ceil(250) * 250,
       _ => return false,
     }
     .clamp(TUI_MIN_MS, TUI_MAX_MS);
+    self.set(requested_ms);
     true
   }
 
@@ -51,17 +56,27 @@ impl Cadence {
       requested_ms: self.requested_ms,
       effective_ms: self.effective_ms,
       pending: self.requested_ms != self.effective_ms,
+      generation: self.generation,
     }
   }
   pub(crate) fn set(&mut self, interval_ms: u32) {
-    self.requested_ms = interval_ms;
+    if self.requested_ms != interval_ms {
+      self.requested_ms = interval_ms;
+      self.generation = self.generation.saturating_add(1);
+    }
   }
   pub(crate) fn with_source(source: Arc<crate::source::Client>) -> Self {
     Self { source: Some(source), ..Self::new(1000) }
   }
   fn value(&self) -> serde_json::Value {
-    serde_json::to_value(self.state()).unwrap_or_default()
+    cadence_value(self.state())
   }
+}
+
+// Ordering metadata belongs to private IPC; every HTTP cadence keeps its released schema.
+fn cadence_value(state: crate::source::CadenceState) -> serde_json::Value {
+  serde_json::json!({"requested_ms": state.requested_ms, "effective_ms": state.effective_ms,
+    "pending": state.pending})
 }
 
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -106,6 +121,7 @@ pub(crate) fn publish_sample(
       requested_ms: interval_ms,
       effective_ms: interval_ms,
       pending: false,
+      generation: 0,
     },
     process_interval_ms: interval_ms,
     process_state: if processes.is_some() {
@@ -448,7 +464,7 @@ fn handle_conn(
       let adjustment = body["adjustment"].as_str().unwrap_or("");
       if let Some(source) = &control.source {
         match source.adjust(adjustment) {
-          Ok(value) => (200, serde_json::to_string(&value).unwrap()),
+          Ok(value) => (200, cadence_value(value).to_string()),
           Err(_) if matches!(adjustment, "increase" | "decrease") => {
             (503, r#"{"error":"sampling source unavailable"}"#.into())
           }
@@ -694,6 +710,44 @@ mod tests {
     let length = headers.lines().find_map(|line| line.strip_prefix("Content-Length: ")).unwrap();
     assert_eq!(length.parse::<usize>().unwrap(), body.len());
     body
+  }
+
+  #[test]
+  fn cadence_generation_orders_changes_without_entering_any_http_cadence() {
+    let mut control = Cadence::new(1000);
+    assert_eq!(control.state().generation, 0);
+    assert_eq!(control.begin(), 1000);
+    assert_eq!(control.state().generation, 0);
+    assert!(control.adjust("increase"));
+    assert_eq!(control.state().generation, 1);
+    control.set(1250);
+    assert_eq!(control.state().generation, 1, "an unchanged request adds no generation");
+    let pending = serde_json::json!({"requested_ms":1250,"effective_ms":1000,"pending":true});
+    assert_eq!(super::cadence_value(control.state()), pending, "shared-control HTTP response");
+    assert_eq!(control.value(), pending);
+    let shared = Arc::new(RwLock::new(None));
+    publish_sample(&shared, Metrics::default(), vec![], 1000, None, super::sample_time());
+    let sample: serde_json::Value = serde_json::from_str(&to_sample(
+      shared.read().unwrap().as_ref().unwrap(),
+      &SocInfo::default(),
+      true,
+      &control,
+    ))
+    .unwrap();
+    assert_eq!(sample["cadence"], pending, "GET /api/sample keeps its three fields");
+    let control = Arc::new(RwLock::new(control));
+    let response = adjustment(&shared, &control, "increase");
+    assert_eq!(
+      serde_json::from_str::<serde_json::Value>(body(&response)).unwrap(),
+      serde_json::json!({"requested_ms":1500,"effective_ms":1000,"pending":true}),
+      "POST /api/interval keeps its three fields"
+    );
+    let mut control = control.write().unwrap();
+    assert_eq!(control.state().generation, 2);
+    assert_eq!(control.begin(), 1500);
+    assert_eq!(control.state().generation, 3);
+    assert_eq!(control.begin(), 1500);
+    assert_eq!(control.state().generation, 3, "an unchanged window adds no generation");
   }
 
   #[test]

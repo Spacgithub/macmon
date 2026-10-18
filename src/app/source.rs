@@ -50,6 +50,9 @@ pub(crate) struct CadenceState {
   pub requested_ms: u32,
   pub effective_ms: u32,
   pub pending: bool,
+  // Missing on older owners. Their zero-generation messages keep the old ordering behavior.
+  #[serde(default)]
+  pub generation: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -306,6 +309,30 @@ struct ClientData {
   error: String,
   socket: Option<UnixStream>,
 }
+
+impl ClientData {
+  fn accept_cadence(&mut self, session: &str, cadence: CadenceState) -> bool {
+    if self.session != session || cadence.generation < self.cadence.generation {
+      return false;
+    }
+    if self.cadence != cadence {
+      self.cadence = cadence;
+      if let Some(frame) = self.frame.as_mut().filter(|frame| frame.session == session) {
+        Arc::make_mut(frame).cadence = cadence;
+      }
+    }
+    true
+  }
+
+  fn welcome(&mut self, session: &str, cadence: CadenceState) {
+    if self.session != session {
+      self.session = session.into();
+      self.cadence = cadence;
+    } else {
+      self.accept_cadence(session, cadence);
+    }
+  }
+}
 struct ClientInner {
   data: Mutex<ClientData>,
   changed: Condvar,
@@ -409,11 +436,15 @@ impl Client {
     if !matches!(adjustment, "increase" | "decrease") {
       return Err(invalid("invalid interval adjustment"));
     }
-    self.control(Request::Adjust {
-      protocol: PROTOCOL,
-      session: self.session()?,
-      adjustment: adjustment.into(),
-    })
+    let session = self.session()?;
+    self.control(
+      &session,
+      Request::Adjust {
+        protocol: PROTOCOL,
+        session: session.clone(),
+        adjustment: adjustment.into(),
+      },
+    )
   }
   pub fn set_demand(&self, demand: ProcessDemand) -> io::Result<()> {
     *self.inner.demand.lock().unwrap() = demand;
@@ -426,7 +457,7 @@ impl Client {
     }
     Ok(data.session.clone())
   }
-  fn control(&self, request: Request) -> io::Result<CadenceState> {
+  fn control(&self, session: &str, request: Request) -> io::Result<CadenceState> {
     let mut stream = self.inner.runtime.connect()?;
     write_json(&mut stream, b'Q', &request)?;
     let (kind, bytes) = read_packet(&mut stream)?;
@@ -434,7 +465,16 @@ impl Client {
       return Err(invalid("collector rejected control"));
     }
     let cadence = serde_json::from_slice(&bytes)?;
-    self.inner.data.lock().unwrap().cadence = cadence;
+    let mut data = self.inner.data.lock().unwrap();
+    if data.session != session {
+      return Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "sampling source changed during control",
+      ));
+    }
+    data.accept_cadence(session, cadence);
+    let cadence = data.cadence;
+    drop(data);
     self.inner.changed.notify_all();
     Ok(cadence)
   }
@@ -527,11 +567,11 @@ fn client_worker(inner: Arc<ClientInner>, mut initial_ms: Option<u32>) {
       if welcome.protocol != PROTOCOL {
         return Err(invalid("incompatible sampling protocol"));
       }
+      let session = welcome.session;
       initial_ms = None; // Reconnects never replay an old CLI preference over another consumer.
       {
         let mut data = inner.data.lock().unwrap();
-        data.session = welcome.session;
-        data.cadence = welcome.cadence;
+        data.welcome(&session, welcome.cadence);
         data.socket = Some(stream.try_clone()?);
       }
       let mut sent_demand = subscribed_demand;
@@ -568,11 +608,18 @@ fn client_worker(inner: Arc<ClientInner>, mut initial_ms: Option<u32>) {
               }
             }
             let mut data = inner.data.lock().unwrap();
-            data.cadence = frame.cadence;
+            if frame.session != session {
+              return Err(invalid("collector frame belongs to another session"));
+            }
+            data.accept_cadence(&session, frame.cadence);
+            frame.cadence = data.cadence;
             data.frame = Some(Arc::new(frame));
             data.state = ConnectionState::Live;
           }
-          b'C' => inner.data.lock().unwrap().cadence = serde_json::from_slice(&bytes)?,
+          b'C' => {
+            let cadence = serde_json::from_slice(&bytes)?;
+            inner.data.lock().unwrap().accept_cadence(&session, cadence);
+          }
           _ => return Err(invalid("invalid collector response")),
         }
         inner.changed.notify_all();
@@ -993,7 +1040,12 @@ impl Frame {
       sampled_at: "2026-10-18T00:00:00Z".into(),
       sampled: Instant::now(),
       interval_ms: 1000,
-      cadence: CadenceState { requested_ms: 1000, effective_ms: 1000, pending: false },
+      cadence: CadenceState {
+        requested_ms: 1000,
+        effective_ms: 1000,
+        pending: false,
+        generation: 0,
+      },
       process_interval_ms: 1000,
       process_state: ProcessState::Warming,
       processes: None,
@@ -1033,6 +1085,160 @@ mod tests {
       thread::sleep(Duration::from_millis(5));
     }
   }
+
+  fn revisioned_cadence(requested: u32, effective: u32, generation: u64) -> CadenceState {
+    serde_json::from_value(serde_json::json!({
+      "requested_ms": requested, "effective_ms": effective,
+      "pending": requested != effective, "generation": generation,
+    }))
+    .unwrap()
+  }
+
+  #[test]
+  fn queued_frames_and_heartbeats_cannot_roll_back_an_acknowledged_adjustment() {
+    let dir = Directory::new();
+    let runtime = dir.runtime();
+    let listener = UnixListener::bind(runtime.socket()).unwrap();
+    fs::set_permissions(runtime.socket(), fs::Permissions::from_mode(0o600)).unwrap();
+    let (release, next) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+      let (mut subscription, _) = listener.accept().unwrap();
+      let _ = read_packet(&mut subscription).unwrap();
+      let mut frame = Frame::fixture(1, 1);
+      frame.cadence = revisioned_cadence(250, 250, 0);
+      write_json(
+        &mut subscription,
+        b'H',
+        &Welcome { protocol: PROTOCOL, session: frame.session.clone(), cadence: frame.cadence },
+      )
+      .unwrap();
+      write_json(&mut subscription, b'F', &frame).unwrap();
+      let (mut command, _) = listener.accept().unwrap();
+      let (_, bytes) = read_packet(&mut command).unwrap();
+      assert!(matches!(
+        serde_json::from_slice::<Request>(&bytes).unwrap(),
+        Request::Adjust { adjustment, .. } if adjustment == "increase"
+      ));
+      write_json(&mut command, b'C', &revisioned_cadence(500, 250, 1)).unwrap();
+      next.recv_timeout(IO_TIMEOUT).unwrap();
+      frame.revision = 2;
+      write_json(&mut subscription, b'F', &frame).unwrap();
+      next.recv_timeout(IO_TIMEOUT).unwrap();
+      write_json(&mut subscription, b'C', &frame.cadence).unwrap();
+      frame.revision = 3; // Observing this frame also proves the preceding C was consumed.
+      write_json(&mut subscription, b'F', &frame).unwrap();
+      let (mut command, _) = listener.accept().unwrap();
+      let _ = read_packet(&mut command).unwrap();
+      frame.revision = 4;
+      frame.cadence = revisioned_cadence(1000, 250, 3);
+      write_json(&mut subscription, b'F', &frame).unwrap();
+      next.recv_timeout(IO_TIMEOUT).unwrap();
+      // Another consumer's later change arrived before this control connection's older ACK.
+      write_json(&mut command, b'C', &revisioned_cadence(750, 250, 2)).unwrap();
+      let _ = subscription.read(&mut [0]);
+    });
+    let client = Arc::new(Client::at(runtime, None, ProcessDemand::Details, 1000).unwrap());
+    let first = client.wait_after(None, IO_TIMEOUT).unwrap().unwrap();
+    assert_eq!(client.adjust("increase").unwrap().requested_ms, 500);
+    assert_eq!(client.latest().unwrap().cadence.requested_ms, 500, "normalize cached F too");
+    release.send(()).unwrap();
+    let frame =
+      client.wait_after(Some((&first.session, first.revision)), IO_TIMEOUT).unwrap().unwrap();
+    assert_eq!(frame.cadence.requested_ms, 500, "a queued F must retain the accepted cadence");
+    assert_eq!(client.cadence().requested_ms, 500);
+    release.send(()).unwrap();
+    let frame =
+      client.wait_after(Some((&frame.session, frame.revision)), IO_TIMEOUT).unwrap().unwrap();
+    assert_eq!(frame.cadence.requested_ms, 500, "an older C must not roll back a later frame");
+    assert_eq!(replacement_interval(client.cadence().requested_ms, Some(5000), 1000), 500);
+    let adjusting = Arc::clone(&client);
+    let adjustment = thread::spawn(move || adjusting.adjust("increase"));
+    until(|| client.latest().unwrap().revision == 4);
+    release.send(()).unwrap();
+    assert_eq!(adjustment.join().unwrap().unwrap().requested_ms, 1000);
+    assert_eq!(client.cadence().requested_ms, 1000);
+    drop(client);
+    server.join().unwrap();
+  }
+
+  #[test]
+  fn welcome_resets_cadence_only_for_a_new_session_and_legacy_owners_still_decode() {
+    let frame = Frame::fixture(1, 1);
+    let mut data = ClientData {
+      frame: Some(Arc::new(frame)),
+      state: ConnectionState::Live,
+      cadence: revisioned_cadence(500, 250, 3),
+      session: "fixture".into(),
+      error: String::new(),
+      socket: None,
+    };
+    data.welcome("fixture", revisioned_cadence(250, 250, 0));
+    assert_eq!(data.cadence.requested_ms, 500);
+    assert!(!data.accept_cadence("fixture", revisioned_cadence(250, 250, 2)));
+    assert!(data.accept_cadence("fixture", revisioned_cadence(500, 500, 4)));
+    assert_eq!(data.frame.as_ref().unwrap().cadence.effective_ms, 500);
+    data.welcome("replacement", revisioned_cadence(750, 750, 0));
+    assert_eq!((data.cadence.requested_ms, data.cadence.generation), (750, 0));
+    assert!(!data.accept_cadence("fixture", revisioned_cadence(250, 250, 100)));
+    let legacy: CadenceState = serde_json::from_value(serde_json::json!({
+      "requested_ms": 1000, "effective_ms": 750, "pending": true,
+    }))
+    .unwrap();
+    assert_eq!(legacy.generation, 0);
+    assert!(data.accept_cadence("replacement", legacy));
+    assert_eq!(data.cadence.requested_ms, 1000);
+  }
+
+  #[test]
+  fn an_old_session_control_ack_cannot_change_a_reconnected_clients_cadence() {
+    let dir = Directory::new();
+    let runtime = dir.runtime();
+    let listener = UnixListener::bind(runtime.socket()).unwrap();
+    fs::set_permissions(runtime.socket(), fs::Permissions::from_mode(0o600)).unwrap();
+    let (release, next) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+      let (mut subscription, _) = listener.accept().unwrap();
+      let _ = read_packet(&mut subscription).unwrap();
+      let mut frame = Frame::fixture(1, 1);
+      frame.cadence = revisioned_cadence(250, 250, 2);
+      write_json(
+        &mut subscription,
+        b'H',
+        &Welcome { protocol: PROTOCOL, session: frame.session.clone(), cadence: frame.cadence },
+      )
+      .unwrap();
+      write_json(&mut subscription, b'F', &frame).unwrap();
+      let (mut command, _) = listener.accept().unwrap();
+      let _ = read_packet(&mut command).unwrap();
+      drop(subscription);
+      let (mut replacement, _) = listener.accept().unwrap();
+      let _ = read_packet(&mut replacement).unwrap();
+      frame.session = "replacement".into();
+      frame.cadence = revisioned_cadence(750, 750, 0);
+      write_json(
+        &mut replacement,
+        b'H',
+        &Welcome { protocol: PROTOCOL, session: frame.session.clone(), cadence: frame.cadence },
+      )
+      .unwrap();
+      write_json(&mut replacement, b'F', &frame).unwrap();
+      next.recv_timeout(IO_TIMEOUT).unwrap();
+      write_json(&mut command, b'C', &revisioned_cadence(500, 250, 3)).unwrap();
+      let _ = replacement.read(&mut [0]);
+    });
+    let client = Arc::new(Client::at(runtime, None, ProcessDemand::Details, 1000).unwrap());
+    assert!(client.wait_after(None, IO_TIMEOUT).unwrap().is_some());
+    let adjusting = Arc::clone(&client);
+    let adjustment = thread::spawn(move || adjusting.adjust("increase"));
+    until(|| client.latest().is_some_and(|frame| frame.session == "replacement"));
+    release.send(()).unwrap();
+    assert_eq!(adjustment.join().unwrap().unwrap_err().kind(), io::ErrorKind::NotConnected);
+    assert_eq!((client.cadence().requested_ms, client.cadence().generation), (750, 0));
+    assert_eq!(client.latest().unwrap().cadence.requested_ms, 750);
+    drop(client);
+    server.join().unwrap();
+  }
+
   fn subscribe(owner: &Arc<Owner>, id: &str, initial_ms: Option<u32>) -> UnixStream {
     let (mut client, server) = UnixStream::pair().unwrap();
     client.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
