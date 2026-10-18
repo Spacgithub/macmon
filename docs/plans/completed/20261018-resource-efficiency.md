@@ -1,3 +1,5 @@
+Done: 2026-10-18, PR #35
+
 # Resource efficiency in Terminal and Web
 
 ## Behavior and decisions
@@ -44,6 +46,19 @@
 - [x] Record an optimization baseline and define matched before/after scenarios.
 - [x] Implement and verify shared sampling, cadence, safe transport and collector lifetime.
 - [x] Implement and verify demand-driven process snapshots and selected-PID detail collection.
-- [ ] Add Terminal/Web frame-rate controls and verify real scheduling at each rate.
-- [ ] Complete full checks, independent reviews, real hardware/browser regression and
+- [x] Add Terminal/Web frame-rate controls and verify real scheduling at each rate.
+- [x] Complete full checks, independent reviews, real hardware/browser regression and
       repeated CPU/memory comparisons; retain all existing monitoring and compatibility.
+
+## Result
+
+Delivered in dependent PRs #33 → #34 → #35: one temporary rootless collector,
+5-second/1-second demand-driven full process snapshots and asynchronous details for the selected
+PID, plus saved 15/30/60-FPS controls. Legacy outputs, library-only builds,
+preferences and existing monitoring/grouping remain supported without dependencies.
+
+Full checks, independent reviews, real hardware/Terminal/browser regression and
+three matched 30-second rounds per workload passed. CPU medians fell 24.5–65.9%;
+RSS rose about 19–28 MiB including the collector. See [measurement method and
+results](../../resource-efficiency.md) for ranges, footprint and runtime coverage.
+The installed program and primary main remain on merged main pending review.

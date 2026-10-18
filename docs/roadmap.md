@@ -238,7 +238,7 @@ what we need.
       a per-process view and safe actions on explicitly selected process members.
       Plan: [docs/plans/completed/20261018-process-grouping.md](plans/completed/20261018-process-grouping.md).
 
-- [ ] **37. Reduce combined Terminal and Web resource use.** Share a rootless sampling
+- [x] **37. Reduce combined Terminal and Web resource use.** Share a rootless sampling
       source, collect process details at a lower rate on demand, and provide animation FPS
       controls with measured CPU/memory comparisons and compatible outputs/preferences.
-      Plan: [docs/plans/20261018-resource-efficiency.md](plans/20261018-resource-efficiency.md).
+      Plan: [docs/plans/completed/20261018-resource-efficiency.md](plans/completed/20261018-resource-efficiency.md).

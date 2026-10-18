@@ -166,11 +166,12 @@ If those reports omit pixels after a resize, macmon safely switches to text with
 1:2 cell aspect ratio; restart macmon to query native image dimensions again in such sessions.
 
 Each rotor follows its own reported RPM; zero RPM stays stationary and unavailable fans stay
-absent. Press `a` to toggle animation (enabled by default, saved as `animate_fans`). Complete fans
-target 60 updates per second independently of metric/process sampling; compact indicators
-change at most four times per second. Animation pauses on focus loss, under help and when
-hidden, preserving your manual choice. It never controls hardware fans or changes the saved
-sampling interval (1000 ms by default).
+absent. Press `a` to toggle animation (enabled by default, saved as `animate_fans`). Press
+`Shift+A` to cycle the target between 15, 30 and 60 FPS; the default is 30 FPS, saved as
+`fan_fps`. This changes actual animation wakeups independently of metric/process sampling;
+compact indicators still change at most four times per second. Animation pauses on focus
+loss, under help and when hidden, preserving your manual choice. It never controls hardware
+fans or changes the saved sampling interval (1000 ms by default).
 
 The screen redraws when data, input, the window size or a visible fan frame changes. Other input
 heartbeats skip drawing, and interfaces are ranked when samples arrive. Existing configuration
@@ -396,11 +397,15 @@ per second; sample age uses completed and effective windows, so an unstarted req
 hide stale readings.
 
 Compact mechanical fans show reported names and RPM. Zero RPM remains stationary; missing
-readings and VM-only placeholders stay unavailable. The Fan motion switch and reduced-motion
-preference control browser animation independently of sampling. Hidden pages pause polling
+readings and VM-only placeholders stay unavailable. Cooling's Target FPS selector offers
+15, 30 and 60 FPS, initially 30, saved separately in browser storage. The Fan motion switch
+and reduced-motion preference remain independent of this rate and of sampling. Hidden pages pause polling
 and animation. WAITING, LIVE, STALE and OFFLINE describe connection/sample state while keeping
 the last available values visible. `/api/sample` adds freshness metadata; `/json`, `/metrics`,
 the root JSON response and existing server defaults retain their formats.
+
+See [resource efficiency validation](docs/resource-efficiency.md) for sampling, animation
+and matched CPU/memory measurement details.
 
 #### Terminal web control
 
