@@ -22,11 +22,20 @@ pub struct Cadence {
   effective_ms: u32,
   generation: u64,
   source: Option<Arc<crate::source::Client>>,
+  leases: crate::process_demand::Leases,
+  process_demand: crate::source::ProcessDemand,
 }
 
 impl Cadence {
   pub fn new(initial_ms: u32) -> Self {
-    Self { requested_ms: initial_ms, effective_ms: initial_ms, generation: 0, source: None }
+    Self {
+      requested_ms: initial_ms,
+      effective_ms: initial_ms,
+      generation: 0,
+      source: None,
+      leases: Default::default(),
+      process_demand: crate::source::ProcessDemand::None,
+    }
   }
 
   pub fn begin(&mut self) -> u32 {
@@ -67,6 +76,23 @@ impl Cadence {
   }
   pub(crate) fn with_source(source: Arc<crate::source::Client>) -> Self {
     Self { source: Some(source), ..Self::new(1000) }
+  }
+  /// Called by the forwarding loop even if every browser stops sending requests.
+  pub(crate) fn refresh_process_demand(&mut self, now: Instant) -> Duration {
+    let demand = self.leases.demand(now);
+    if demand != self.process_demand {
+      if let Some(source) = &self.source {
+        let _ = source.set_demand(demand);
+      }
+      self.process_demand = demand;
+    }
+    self
+      .leases
+      .deadline(now)
+      .map(|deadline| deadline.saturating_duration_since(now))
+      .unwrap_or(Duration::from_secs(1))
+      .min(Duration::from_secs(1))
+      .max(Duration::from_millis(1))
   }
   fn value(&self) -> serde_json::Value {
     cadence_value(self.state())
@@ -129,6 +155,7 @@ pub(crate) fn publish_sample(
     } else {
       crate::source::ProcessState::Warming
     },
+    process_demand: crate::source::ProcessDemand::Details,
     metrics,
     details: details.into(),
     sequence,
@@ -297,6 +324,9 @@ fn to_sample(sample: &Sample, soc: &SocInfo, local: bool, cadence: &Cadence) -> 
     "processes": processes.map(|processes| &processes.snapshot.rows),
     "process_groups": processes.map(|processes| &processes.snapshot.groups),
     "processes_age_ms": processes.map(|processes| processes.snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
+    "process_collection": local.then(|| serde_json::json!({"session": sample.session,
+      "sequence": sample.processes.as_ref().map_or(0, |processes| processes.sequence), "state": sample.process_state,
+      "demand": sample.process_demand, "interval_ms": (sample.process_interval_ms > 0).then_some(sample.process_interval_ms)})),
   })
   .to_string()
 }
@@ -340,7 +370,12 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
         let name = name.to_ascii_lowercase();
         if matches!(
           name.as_str(),
-          "host" | "origin" | "content-type" | "content-length" | "transfer-encoding"
+          "host"
+            | "origin"
+            | "content-type"
+            | "content-length"
+            | "transfer-encoding"
+            | "x-macmon-process-lease"
         ) && headers.insert(name, value.trim().to_string()).is_some()
         {
           return None;
@@ -354,7 +389,8 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
       };
       if method == "POST" {
         let length: usize = request.headers.get("content-length")?.parse().ok()?;
-        if length > 64 || request.headers.contains_key("transfer-encoding") {
+        let maximum = if request.path == "/api/process-demand" { 256 } else { 64 };
+        if length > maximum || request.headers.contains_key("transfer-encoding") {
           return None;
         }
         while request.body.len() < length {
@@ -396,6 +432,8 @@ fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body:
     400 => "Bad Request",
     403 => "Forbidden",
     404 => "Not Found",
+    410 => "Gone",
+    429 => "Too Many Requests",
     503 => "Service Unavailable",
     _ => "OK",
   };
@@ -452,13 +490,37 @@ fn handle_conn(
         kind.split(';').next().unwrap().trim().eq_ignore_ascii_case("application/json")
       });
     let body = serde_json::from_slice::<serde_json::Value>(&request.body).unwrap_or_default();
-    let status = if path != "/api/interval" {
+    let status = if !matches!(path.as_str(), "/api/interval" | "/api/process-demand") {
       404
     } else if !allowed {
       403
     } else {
       200
     };
+    if status == 200 && path == "/api/process-demand" {
+      let lease = match body.get("lease") {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.as_str())),
+        _ => Err(crate::process_demand::Error::Invalid),
+      };
+      let demand = serde_json::from_value::<crate::source::ProcessDemand>(body["demand"].clone())
+        .map_err(|_| crate::process_demand::Error::Invalid);
+      let mut control = cadence.write().unwrap();
+      let result = lease.and_then(|lease| {
+        demand.and_then(|demand| control.leases.register(lease, demand, Instant::now()))
+      });
+      control.refresh_process_demand(Instant::now());
+      let (status, body) = match result {
+        Ok(lease) => (
+          200,
+          serde_json::json!({"lease": lease, "ttl_ms": crate::process_demand::TTL_MS}).to_string(),
+        ),
+        Err(error) => process_demand_error(error),
+      };
+      drop(control);
+      write_response(&mut stream, status, "application/json", &body);
+      return;
+    }
     let (status, body) = if status == 200 {
       let mut control = cadence.write().unwrap();
       let adjustment = body["adjustment"].as_str().unwrap_or("");
@@ -480,6 +542,20 @@ fn handle_conn(
     };
     write_response(&mut stream, status, "application/json", &body);
     return;
+  }
+
+  if path == "/api/sample" && local {
+    let mut control = cadence.write().unwrap();
+    let result = control
+      .leases
+      .observe(request.headers.get("x-macmon-process-lease").map(String::as_str), Instant::now());
+    control.refresh_process_demand(Instant::now());
+    if let Err(error) = result {
+      let (status, body) = process_demand_error(error);
+      drop(control);
+      write_response(&mut stream, status, "application/json", &body);
+      return;
+    }
   }
 
   if path == "/api/source" {
@@ -549,6 +625,17 @@ fn handle_conn(
       write_response(&mut stream, 404, "application/json", r#"{"error":"not found"}"#);
     }
   }
+}
+
+fn process_demand_error(error: crate::process_demand::Error) -> (u16, String) {
+  use crate::process_demand::Error;
+  let (status, message) = match error {
+    Error::Invalid => (400, "invalid process lease or demand"),
+    Error::Expired => (410, "process lease expired; register again"),
+    Error::Capacity => (429, "process lease limit reached"),
+    Error::Unavailable => (503, "process lease registration unavailable"),
+  };
+  (status, serde_json::json!({"error":message}).to_string())
 }
 
 pub fn launchd(host: &str, port: u16, install: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -688,6 +775,96 @@ mod tests {
     }
     worker.join().unwrap();
     response
+  }
+
+  fn process_post(
+    shared: &SharedMetrics,
+    cadence: &SharedCadence,
+    value: serde_json::Value,
+  ) -> String {
+    exchange(shared, cadence, |port| {
+      let body = value.to_string();
+      vec![format!("POST /api/process-demand HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()]
+    })
+  }
+
+  #[test]
+  fn managed_process_leases_expire_without_downgrading_or_impersonating_legacy_clients() {
+    let shared = Arc::new(RwLock::new(None));
+    publish_sample(&shared, Metrics::default(), vec![], 1000, None, super::sample_time());
+    let cadence = Arc::new(RwLock::new(Cadence::new(1000)));
+    let response =
+      process_post(&shared, &cadence, serde_json::json!({"lease":null,"demand":"summary"}));
+    assert!(response.starts_with("HTTP/1.1 200"));
+    let lease: serde_json::Value = serde_json::from_str(body(&response)).unwrap();
+    assert_eq!(lease["ttl_ms"], 15000);
+    let token = lease["lease"].as_str().unwrap();
+    assert_eq!(cadence.read().unwrap().process_demand, crate::source::ProcessDemand::Summary);
+    let response = exchange(&shared, &cadence, |port| {
+      vec![format!("GET /api/sample HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Macmon-Process-Lease: {token}\r\n\r\n").into_bytes()]
+    });
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert_eq!(cadence.read().unwrap().process_demand, crate::source::ProcessDemand::Summary);
+    let _ = exchange(&shared, &cadence, |port| {
+      vec![format!("GET /api/sample HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").into_bytes()]
+    });
+    assert_eq!(cadence.read().unwrap().process_demand, crate::source::ProcessDemand::Details);
+    let response =
+      process_post(&shared, &cadence, serde_json::json!({"lease":token,"demand":"none"}));
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert_eq!(
+      cadence.read().unwrap().process_demand,
+      crate::source::ProcessDemand::Details,
+      "One tab cannot cancel a legacy consumer"
+    );
+    cadence.write().unwrap().refresh_process_demand(Instant::now() + Duration::from_secs(16));
+    assert_eq!(cadence.read().unwrap().process_demand, crate::source::ProcessDemand::None);
+    let response = exchange(&shared, &cadence, |port| {
+      vec![format!("GET /api/sample HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Macmon-Process-Lease: {token}\r\n\r\n").into_bytes()]
+    });
+    assert!(response.starts_with("HTTP/1.1 410"));
+    assert_eq!(cadence.read().unwrap().process_demand, crate::source::ProcessDemand::None);
+    assert!(
+      process_post(&shared, &cadence, serde_json::json!({"lease":token,"demand":"details"}))
+        .starts_with("HTTP/1.1 410")
+    );
+  }
+
+  #[test]
+  fn process_controls_are_bounded_same_origin_and_never_enable_remote_collection() {
+    let shared = Arc::new(RwLock::new(None));
+    publish_sample(&shared, Metrics::default(), vec![], 1000, None, super::sample_time());
+    let cadence = Arc::new(RwLock::new(Cadence::new(1000)));
+    for value in [
+      serde_json::json!({"demand":"summary"}),
+      serde_json::json!({"lease":null,"demand":"full"}),
+      serde_json::json!({"lease":"none","demand":"summary"}),
+    ] {
+      assert!(process_post(&shared, &cadence, value).starts_with("HTTP/1.1 400"));
+    }
+    let remote = exchange(&shared, &cadence, |port| {
+      vec![format!("POST /api/process-demand HTTP/1.1\r\nHost: remote.invalid:{port}\r\nOrigin: http://remote.invalid:{port}\r\nContent-Type: application/json\r\nContent-Length: 33\r\n\r\n{{\"lease\":null,\"demand\":\"summary\"}}").into_bytes()]
+    });
+    assert!(remote.starts_with("HTTP/1.1 403"));
+    let remote = exchange(&shared, &cadence, |port| {
+      vec![format!("GET /api/sample HTTP/1.1\r\nHost: remote.invalid:{port}\r\nX-Macmon-Process-Lease: none\r\n\r\n").into_bytes()]
+    });
+    assert!(remote.starts_with("HTTP/1.1 200"));
+    let json: serde_json::Value = serde_json::from_str(body(&remote)).unwrap();
+    assert!(json["process_collection"].is_null() && json["processes"].is_null());
+    assert_eq!(cadence.read().unwrap().process_demand, crate::source::ProcessDemand::None);
+    let duplicate = exchange(&shared, &cadence, |port| {
+      vec![format!("GET /api/sample HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Macmon-Process-Lease: none\r\nX-Macmon-Process-Lease: none\r\n\r\n").into_bytes()]
+    });
+    assert!(duplicate.is_empty());
+    for (error, status) in [
+      (crate::process_demand::Error::Invalid, 400),
+      (crate::process_demand::Error::Expired, 410),
+      (crate::process_demand::Error::Capacity, 429),
+      (crate::process_demand::Error::Unavailable, 503),
+    ] {
+      assert_eq!(super::process_demand_error(error).0, status);
+    }
   }
 
   fn get(shared: &SharedMetrics, path: &str) -> String {
@@ -1090,7 +1267,12 @@ mod tests {
       mem_bytes: 64,
       power_w: Some(2.0),
       started: Some((42, 0)),
-      meta: ProcMeta { instance: instance.into(), app: Some(app.clone()), known },
+      meta: ProcMeta {
+        instance: instance.into(),
+        app: Some(app.clone()),
+        known,
+        ..Default::default()
+      },
     };
     let rows = vec![
       row(20, "opaque-one", 125.0, 0.0, (true, true)),

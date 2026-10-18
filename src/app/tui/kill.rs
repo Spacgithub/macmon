@@ -15,6 +15,7 @@ use ratatui::widgets::Clear;
 use super::boxes::{Titles, cells, draw_box};
 use super::proc_view::{cut_end, cut_start};
 use super::theme::{self, dim, faint, heading, text};
+#[cfg(test)]
 use crate::fds::{self, OpenFile};
 use crate::procs::{self, ProcInfo};
 
@@ -35,6 +36,7 @@ pub(super) trait ProcSys: fmt::Debug {
   /// is gone, a zombie or not readable for this user.
   fn identity(&self, pid: i32) -> Option<(u64, u64)>;
   /// The working directory and open descriptors of `pid`; the errno when it can't be read.
+  #[cfg(test)]
   fn open_files(&self, pid: i32) -> Result<Vec<OpenFile>, i32>;
   /// `open -R path`: shows it in Finder.
   fn reveal(&self, path: &str);
@@ -57,6 +59,7 @@ impl ProcSys for LibcSys {
     (info.pbi_status != libc::SZOMB).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
   }
 
+  #[cfg(test)]
   fn open_files(&self, pid: i32) -> Result<Vec<OpenFile>, i32> {
     fds::open_files(pid)
   }

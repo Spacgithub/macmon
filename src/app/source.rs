@@ -92,6 +92,8 @@ pub(crate) struct Frame {
   pub cadence: CadenceState,
   pub process_interval_ms: u32,
   pub process_state: ProcessState,
+  #[serde(default)]
+  pub process_demand: ProcessDemand,
   #[serde(with = "optional_arc")]
   pub processes: Option<Arc<ProcessFrame>>,
 }
@@ -352,7 +354,7 @@ impl Client {
     Self::connect_role(initial_ms, demand, true, 1000)
   }
   pub fn connect_server(initial_ms: Option<u32>) -> io::Result<Self> {
-    Self::connect(initial_ms, ProcessDemand::Details)
+    Self::connect(initial_ms, ProcessDemand::None)
   }
   pub fn connect_tui(
     default_ms: u32,
@@ -658,7 +660,22 @@ struct OwnerData {
   frame: Option<Frame>,
   latest: Option<Arc<Encoded>>,
   processes: Option<Arc<ProcessFrame>>,
+  process_demand: ProcessDemand,
+  process_epoch: u64,
+  process_state: ProcessState,
   error: Option<String>,
+}
+
+impl OwnerData {
+  fn refresh_process_demand(&mut self) {
+    let demand = self.leases.values().map(|lease| lease.0).max().unwrap_or(ProcessDemand::None);
+    if (demand == ProcessDemand::None) != (self.process_demand == ProcessDemand::None) {
+      self.process_epoch = self.process_epoch.wrapping_add(1);
+      self.process_state =
+        if demand == ProcessDemand::None { ProcessState::Disabled } else { ProcessState::Warming };
+    }
+    self.process_demand = demand;
+  }
 }
 struct Owner {
   _lock: File,
@@ -685,6 +702,9 @@ impl Owner {
         frame: None,
         latest: None,
         processes: None,
+        process_demand: ProcessDemand::None,
+        process_epoch: 0,
+        process_state: ProcessState::Disabled,
         error: None,
       }),
       changed: Condvar::new(),
@@ -693,10 +713,27 @@ impl Owner {
     }
   }
   fn publish(&self, system: Option<Frame>, processes: Option<Arc<ProcessFrame>>) -> io::Result<()> {
+    self.publish_checked(system, processes, None)
+  }
+  fn publish_checked(
+    &self,
+    system: Option<Frame>,
+    processes: Option<Arc<ProcessFrame>>,
+    expected: Option<(u64, bool)>,
+  ) -> io::Result<()> {
     // Only publishers serialize; control and lease requests never wait on JSON/FFI work.
     let _publishing = self.publishing.lock().unwrap();
     let mut frame = {
       let mut data = self.data.lock().unwrap();
+      if let Some((epoch, first)) = expected {
+        if data.process_epoch != epoch
+          || data.process_demand == ProcessDemand::None
+          || self.stopped.load(Ordering::Acquire)
+        {
+          return Ok(());
+        }
+        data.process_state = if first { ProcessState::Warming } else { ProcessState::Ready };
+      }
       if let Some(processes) = processes {
         data.processes = Some(processes);
       }
@@ -705,10 +742,12 @@ impl Owner {
       frame.sequence = data.sequence + u64::from(system_sample);
       frame.revision = data.revision + 1;
       frame.processes = data.processes.clone();
-      frame.process_state =
-        if frame.processes.is_some() { ProcessState::Ready } else { ProcessState::Warming };
+      frame.process_state = data.process_state;
+      frame.process_demand = data.process_demand;
       frame.cadence = data.cadence.state();
-      frame.process_interval_ms = frame.cadence.effective_ms;
+      frame.process_interval_ms =
+        crate::process_demand::interval_ms(data.process_demand, frame.cadence.effective_ms)
+          .unwrap_or(0);
       frame
     };
     let packet = Arc::new(Encoded { revision: frame.revision, bytes: serde_json::to_vec(&frame)? });
@@ -829,9 +868,11 @@ fn owner_connection(mut stream: UnixStream, owner: Arc<Owner>) -> io::Result<()>
           data.cadence.set(initial.max(100));
         }
         data.leases.insert(id.clone(), (demand, generation.clone()));
+        data.refresh_process_demand();
         data.cadence.state()
       };
       owner.changed.notify_all();
+      owner.publish(None, None)?;
       let closed = Arc::new(AtomicBool::new(false));
       let disconnect = Arc::clone(&closed);
       let leases = Arc::clone(&owner);
@@ -844,10 +885,13 @@ fn owner_connection(mut stream: UnixStream, owner: Arc<Owner>) -> io::Result<()>
         if data.leases.get(&id).is_some_and(|lease| lease.1 == generation) {
           data.leases.remove(&id);
         }
+        data.refresh_process_demand();
         if data.leases.is_empty() {
           data.last_empty = Instant::now();
         }
         leases.changed.notify_all();
+        drop(data);
+        let _ = leases.publish(None, None);
       });
       let result = (|| {
         write_json(
@@ -906,8 +950,10 @@ fn owner_connection(mut stream: UnixStream, owner: Arc<Owner>) -> io::Result<()>
         _ => false,
       };
       let cadence = data.cadence.state();
+      data.refresh_process_demand();
       drop(data);
       owner.changed.notify_all();
+      owner.publish(None, None)?;
       if accepted {
         write_json(&mut stream, b'C', &cadence)
       } else {
@@ -975,40 +1021,87 @@ fn sample_system(owner: &Owner) -> io::Result<()> {
         cadence,
         process_interval_ms: cadence.effective_ms,
         process_state,
+        process_demand: ProcessDemand::None,
         processes,
       }),
       None,
     )?;
+    let previous = owner.data.lock().unwrap().cadence.state().effective_ms;
     window = owner.data.lock().unwrap().cadence.begin();
+    if previous != window {
+      owner.publish(None, None)?;
+    }
   }
   Ok(())
 }
 fn sample_processes(owner: &Owner) {
-  {
-    let data = owner.data.lock().unwrap();
-    let _guard = owner
-      .changed
-      .wait_while(data, |data| data.leases.is_empty() && !owner.stopped.load(Ordering::Acquire))
-      .unwrap();
+  sample_processes_with(owner, ProcSampler::new);
+}
+
+trait ProcessReader {
+  fn sample(&mut self) -> Vec<ProcInfo>;
+  fn reset_rates(&mut self);
+}
+impl ProcessReader for ProcSampler {
+  fn sample(&mut self) -> Vec<ProcInfo> {
+    ProcSampler::sample(self)
   }
-  let mut sampler = ProcSampler::new();
-  let _ = sampler.sample();
+  fn reset_rates(&mut self) {
+    ProcSampler::reset_rates(self);
+  }
+}
+
+fn sample_processes_with<S: ProcessReader>(owner: &Owner, mut factory: impl FnMut() -> S) {
+  let mut sampler = None;
+  let mut epoch = 0;
+  let mut last = None::<Instant>;
   let mut sequence = 0;
+  let mut warming = true;
   while !owner.stopped.load(Ordering::Acquire) {
-    let interval = owner.data.lock().unwrap().cadence.state().effective_ms.max(100);
-    let data = owner.data.lock().unwrap();
-    drop(
-      owner
-        .changed
-        .wait_timeout_while(data, Duration::from_millis(interval.into()), |_| {
-          !owner.stopped.load(Ordering::Acquire)
-        })
-        .unwrap(),
-    );
-    if owner.stopped.load(Ordering::Acquire) {
-      break;
+    let mut data = owner.data.lock().unwrap();
+    let interval =
+      crate::process_demand::interval_ms(data.process_demand, data.cadence.state().effective_ms);
+    if epoch != data.process_epoch {
+      if let Some(sampler) = &mut sampler {
+        ProcessReader::reset_rates(sampler);
+      }
+      warming = true;
+      last = None;
+      epoch = data.process_epoch;
     }
-    let rows = sampler.sample();
+    let Some(interval) = interval else {
+      last = None;
+      drop(owner.changed.wait_timeout(data, Duration::from_secs(1)).unwrap());
+      continue;
+    };
+    if let Some(completed) = last {
+      let wait = Duration::from_millis(interval.into()).saturating_sub(completed.elapsed());
+      if !wait.is_zero() {
+        drop(owner.changed.wait_timeout(data, wait).unwrap());
+        continue;
+      }
+    }
+    drop(data);
+    let first = warming;
+    let rows = sampler.get_or_insert_with(&mut factory).sample();
+    last = Some(Instant::now());
+    data = owner.data.lock().unwrap();
+    if owner.stopped.load(Ordering::Acquire)
+      || epoch != data.process_epoch
+      || data.process_demand == ProcessDemand::None
+    {
+      continue;
+    }
+    if rows.is_empty() {
+      data.process_state = ProcessState::Failed;
+      sampler.as_mut().unwrap().reset_rates();
+      warming = true;
+      drop(data);
+      let _ = owner.publish(None, None);
+      continue;
+    }
+    warming = false;
+    drop(data);
     let snapshot = ProcSampler::snapshot(&rows, Instant::now());
     let extras = snapshot
       .groups
@@ -1016,9 +1109,11 @@ fn sample_processes(owner: &Owner) {
       .map(|group| (group.power_w, group.power_known, group.cpu_time_ns))
       .collect();
     sequence += 1;
-    if let Err(error) =
-      owner.publish(None, Some(Arc::new(ProcessFrame { sequence, rows, snapshot, extras })))
-    {
+    if let Err(error) = owner.publish_checked(
+      None,
+      Some(Arc::new(ProcessFrame { sequence, rows, snapshot, extras })),
+      Some((epoch, first)),
+    ) {
       owner.data.lock().unwrap().error = Some(error.to_string());
       owner.changed.notify_all();
       break;
@@ -1048,6 +1143,7 @@ impl Frame {
       },
       process_interval_ms: 1000,
       process_state: ProcessState::Warming,
+      process_demand: ProcessDemand::Details,
       processes: None,
     }
   }
@@ -1058,6 +1154,122 @@ mod tests {
   use std::os::unix::fs::{PermissionsExt, symlink};
 
   use super::*;
+
+  struct FakeReader<F>(F);
+  impl<F: FnMut() -> Vec<ProcInfo>> ProcessReader for FakeReader<F> {
+    fn sample(&mut self) -> Vec<ProcInfo> {
+      (self.0)()
+    }
+    fn reset_rates(&mut self) {}
+  }
+
+  fn fake_process() -> ProcInfo {
+    ProcInfo {
+      pid: 42,
+      name: "fixture".into(),
+      path: "/fixture".into(),
+      user: "fixture".into(),
+      cpu_pct: 0.0,
+      gpu_pct: 0.0,
+      cpu_time_ns: 0,
+      mem_bytes: 1024,
+      power_w: None,
+      started: Some((1, 0)),
+      meta: Default::default(),
+    }
+  }
+
+  fn demand(owner: &Owner, demand: ProcessDemand) {
+    let mut data = owner.data.lock().unwrap();
+    data.leases.insert("fixture".into(), (demand, "generation".into()));
+    data.refresh_process_demand();
+    drop(data);
+    owner.changed.notify_all();
+  }
+
+  #[test]
+  fn process_worker_stops_without_demand_and_restarts_with_a_fresh_full_baseline() {
+    let dir = Directory::new();
+    let owner = dir.owner();
+    owner.publish(Some(Frame::fixture(0, 0)), None).unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let factories = Arc::new(AtomicUsize::new(0));
+    let worker = {
+      let (owner, reads, factories) = (owner.clone(), reads.clone(), factories.clone());
+      thread::spawn(move || {
+        sample_processes_with(&owner, || {
+          factories.fetch_add(1, Ordering::Relaxed);
+          let reads = reads.clone();
+          FakeReader(move || {
+            reads.fetch_add(1, Ordering::Relaxed);
+            vec![fake_process()]
+          })
+        })
+      })
+    };
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
+    demand(&owner, ProcessDemand::Summary);
+    until(|| owner.data.lock().unwrap().processes.is_some());
+    let cached = owner.data.lock().unwrap().processes.clone().unwrap();
+    assert_eq!(owner.data.lock().unwrap().process_state, ProcessState::Warming);
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    demand(&owner, ProcessDemand::None);
+    owner.publish(None, None).unwrap();
+    let data = owner.data.lock().unwrap();
+    assert!(Arc::ptr_eq(data.processes.as_ref().unwrap(), &cached));
+    assert_eq!(data.frame.as_ref().unwrap().process_state, ProcessState::Disabled);
+    assert_eq!(data.frame.as_ref().unwrap().process_interval_ms, 0);
+    drop(data);
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    demand(&owner, ProcessDemand::Details);
+    until(|| factories.load(Ordering::Relaxed) == 1 && reads.load(Ordering::Relaxed) == 2);
+    until(|| owner.data.lock().unwrap().processes.as_ref().unwrap().sequence == 2);
+    assert!(
+      serde_json::to_value(
+        &owner.data.lock().unwrap().processes.as_ref().unwrap().snapshot.rows[0]
+      )
+      .unwrap()["cpu_pct"]
+        .is_null()
+    );
+    owner.stopped.store(true, Ordering::Release);
+    owner.changed.notify_all();
+    worker.join().unwrap();
+  }
+
+  #[test]
+  fn old_process_epochs_and_empty_failures_cannot_refresh_the_cached_snapshot() {
+    let dir = Directory::new();
+    let owner = dir.owner();
+    owner.publish(Some(Frame::fixture(0, 0)), None).unwrap();
+    demand(&owner, ProcessDemand::Details);
+    let epoch = owner.data.lock().unwrap().process_epoch;
+    let snapshot =
+      ProcSampler::snapshot(&[fake_process()], Instant::now() - Duration::from_secs(5));
+    let frame = Arc::new(ProcessFrame::fixture(snapshot));
+    owner.publish_checked(None, Some(frame.clone()), Some((epoch, false))).unwrap();
+    demand(&owner, ProcessDemand::None);
+    demand(&owner, ProcessDemand::Details);
+    let next =
+      Arc::new(ProcessFrame::fixture(ProcSampler::snapshot(&[fake_process()], Instant::now())));
+    owner.publish_checked(None, Some(next), Some((epoch, false))).unwrap();
+    assert!(Arc::ptr_eq(owner.data.lock().unwrap().processes.as_ref().unwrap(), &frame));
+    let worker = {
+      let owner = owner.clone();
+      thread::spawn(move || sample_processes_with(&owner, || FakeReader(Vec::new)))
+    };
+    until(|| owner.data.lock().unwrap().process_state == ProcessState::Failed);
+    assert!(Arc::ptr_eq(owner.data.lock().unwrap().processes.as_ref().unwrap(), &frame));
+    assert!(
+      owner.data.lock().unwrap().processes.as_ref().unwrap().snapshot.sampled.elapsed()
+        >= Duration::from_secs(5)
+    );
+    owner.stopped.store(true, Ordering::Release);
+    owner.changed.notify_all();
+    worker.join().unwrap();
+  }
 
   struct Directory(PathBuf);
   impl Directory {
@@ -1298,7 +1510,13 @@ mod tests {
     let lock = dir.runtime().owner_lock().unwrap();
     assert_eq!(dir.runtime().owner_lock().unwrap_err().kind(), io::ErrorKind::WouldBlock);
     drop(lock);
-    assert!(dir.runtime().owner_lock().is_ok());
+    // Parallel tests can fork while the descriptor is open; CLOEXEC closes the
+    // child's inherited copy at exec, briefly extending the same exclusive lock.
+    until(|| match dir.runtime().owner_lock() {
+      Ok(_) => true,
+      Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
+      Err(error) => panic!("released sampling lock cannot be acquired: {error}"),
+    });
   }
 
   #[test]
@@ -1625,8 +1843,31 @@ mod tests {
   #[ignore = "rootless hardware probe; set MACMON_TEST_COLLECTOR_BIN to the matching application binary"]
   fn shared_sampler_rootless_fixture() {
     let dir = Directory::new();
-    let first = Client::at(dir.runtime(), Some(250), ProcessDemand::Details, 1000).unwrap();
+    let first = Client::at(dir.runtime(), Some(250), ProcessDemand::None, 1000).unwrap();
     let a = first.wait_after(None, Duration::from_secs(10)).unwrap().unwrap();
+    assert_eq!(a.process_state, ProcessState::Disabled);
+    assert!(a.processes.is_none());
+    first.set_demand(ProcessDemand::Summary).unwrap();
+    until(|| {
+      first.latest().is_some_and(|frame| {
+        frame.processes.is_some() && frame.process_demand == ProcessDemand::Summary
+      })
+    });
+    let summary = first.latest().unwrap();
+    assert_eq!(summary.process_interval_ms, 5000);
+    assert_eq!(summary.process_state, ProcessState::Warming);
+    assert!(summary.processes.as_ref().unwrap().rows.iter().all(|row| !row.meta.known.0));
+    thread::sleep(Duration::from_millis(1200));
+    assert_eq!(
+      first.latest().unwrap().processes.as_ref().unwrap().sequence,
+      summary.processes.as_ref().unwrap().sequence
+    );
+    first.set_demand(ProcessDemand::Details).unwrap();
+    until(|| {
+      first.latest().is_some_and(|frame| {
+        frame.process_state == ProcessState::Ready && frame.process_interval_ms == 1000
+      })
+    });
     let second = Client::at(dir.runtime(), None, ProcessDemand::Details, 1000).unwrap();
     let b = second.wait_after(None, Duration::from_secs(5)).unwrap().unwrap();
     assert_eq!((a.session.as_str(), a.collector_pid), (b.session.as_str(), b.collector_pid));
@@ -1654,6 +1895,49 @@ mod tests {
       replacement.cadence.requested_ms, 500,
       "recovery preserves the last shared interval"
     );
+    until(|| second.latest().is_some_and(|frame| frame.process_state == ProcessState::Ready));
+    let before_pause = second.latest().unwrap();
+    second.set_demand(ProcessDemand::None).unwrap();
+    until(|| second.latest().is_some_and(|frame| frame.process_state == ProcessState::Disabled));
+    let paused = second.latest().unwrap();
+    let cached =
+      paused.processes.as_ref().map(|processes| (processes.sequence, processes.snapshot.sampled));
+    thread::sleep(Duration::from_millis(1200));
+    let after = second.latest().unwrap();
+    assert_eq!(after.process_interval_ms, 0);
+    assert_eq!(
+      after.processes.as_ref().map(|processes| processes.sequence),
+      cached.map(|value| value.0)
+    );
+    if let Some((_, sampled)) = cached {
+      assert!(
+        after.processes.as_ref().unwrap().snapshot.sampled.elapsed()
+          >= sampled.elapsed().saturating_sub(Duration::from_millis(2))
+      );
+    }
+    second.set_demand(ProcessDemand::Details).unwrap();
+    until(|| {
+      second.latest().is_some_and(|frame| {
+        frame
+          .processes
+          .as_ref()
+          .is_some_and(|processes| Some(processes.sequence) != cached.map(|value| value.0))
+      })
+    });
+    let resumed = second.latest().unwrap();
+    assert!(resumed.processes.as_ref().unwrap().rows.iter().all(|row| !row.meta.known.0));
+    for row in &resumed.processes.as_ref().unwrap().rows {
+      if let Some(before) = before_pause.processes.as_ref().unwrap().rows.iter().find(|before| {
+        before.pid == row.pid
+          && before.meta.identity.is_some()
+          && before.meta.identity == row.meta.identity
+      }) {
+        assert_eq!(before.meta.instance, row.meta.instance);
+        if before.meta.app.is_some() && row.meta.app.is_some() {
+          assert_eq!(before.meta.app, row.meta.app);
+        }
+      }
+    }
     let replacement_pid = replacement.collector_pid;
     drop(second);
     until(|| !dir.runtime().socket().exists());

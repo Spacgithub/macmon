@@ -13,6 +13,9 @@ pub struct ProcMeta {
   pub instance: String,
   pub app: Option<AppIdentity>,
   pub known: (bool, bool),
+  /// Private native lifetime, carried only by the same-user collector protocol.
+  #[serde(default)]
+  pub(crate) identity: Option<Identity>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -119,7 +122,7 @@ pub fn groups(rows: &[ProcInfo]) -> Vec<ProcGroup> {
 // https://github.com/apple-oss-distributions/xnu/blob/xnu-11417.140.69/bsd/sys/proc_info_private.h
 // proc_uniqidentifierinfo is 56 bytes; proc_pidcoalitioninfo is 40 bytes.
 // proc_info.c exempts both flavors from same-user checks, but MAC policy can still deny them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Identity {
   pub unique: u64,
   pub version: i32,
@@ -350,7 +353,7 @@ mod tests {
       power_w: Some(2.0),
       gpu_pct: 75.0,
       started: Some((42, 0)),
-      meta: ProcMeta { instance: instance.into(), app, known },
+      meta: ProcMeta { instance: instance.into(), app, known, ..Default::default() },
     }
   }
 

@@ -21,7 +21,74 @@ function loadProcessView() {
   try { const value = localStorage.getItem(processViewKey); if (["grouped", "raw"].includes(value)) return value; } catch { /* Storage is optional. */ }
   return "grouped";
 }
-const procView = { mode: loadProcessView(), open: new Set(), groups: new Map(), raw: new Map(), anchors: [], nextId: 0 };
+const procView = { mode: loadProcessView(), open: new Set(), groups: new Map(), raw: new Map(), anchors: [], nextId: 0, sample: null, received: 0, collection: null, session: null, identity: null };
+function localProcessPage() {
+  const host = window.location.hostname.toLowerCase(), ipv4 = (value) => value.split(".").length === 4 && value.split(".").every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255) && value.startsWith("127.");
+  if (["localhost", "[::1]", "::1"].includes(host) || ipv4(host)) return true;
+  const mapped = host.match(/^\[::ffff:([\da-f]{1,4}):([\da-f]{1,4})\]$/);
+  return !!mapped && (parseInt(mapped[1], 16) & 0xff00) === 0x7f00;
+}
+const processLease = { mode: localProcessPage() ? "probing" : "restricted", token: null, expires: 0, ttl: 15000, sent: null, wanted: null, pending: null };
+function wantedProcessDemand() { return document.hidden ? "none" : state.details.process && document.hasFocus() ? "details" : "summary"; }
+function syncProcessDemand() {
+  processLease.wanted = wantedProcessDemand();
+  if (["legacy", "restricted"].includes(processLease.mode)) return Promise.resolve();
+  if (processLease.pending) return processLease.pending;
+  processLease.pending = (async () => {
+    while (true) {
+      const demand = processLease.wanted, lease = performance.now() < processLease.expires ? processLease.token : null;
+      if (lease && processLease.sent === demand) return;
+      const request = new AbortController(), started = performance.now(), timeout = setTimeout(() => request.abort(), 2500);
+      try {
+        const response = await fetch("/api/process-demand", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ lease, demand }), signal: request.signal });
+        if ([403, 404].includes(response.status)) {
+          processLease.mode = response.status === 404 ? "legacy" : "restricted";
+          processLease.token = null; return;
+        }
+        if (response.status === 410 && lease) { processLease.token = null; processLease.expires = 0; continue; }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const result = await response.json();
+        if (typeof result?.lease !== "string" || !/^[\da-f]{32}$/i.test(result.lease) || !Number.isSafeInteger(result.ttl_ms) || result.ttl_ms < 1 || result.ttl_ms > 15000
+          || started + result.ttl_ms <= performance.now()) throw new Error("Invalid process lease");
+        Object.assign(processLease, { mode: "managed", token: result.lease, ttl: result.ttl_ms, expires: started + result.ttl_ms, sent: demand });
+        if (processLease.sent === processLease.wanted) return;
+      } catch (error) { processLease.sent = null; throw error; }
+      finally { clearTimeout(timeout); }
+    }
+  })().finally(() => { processLease.pending = null; });
+  return processLease.pending;
+}
+function requestProcessDemand() {
+  const changed = processLease.wanted !== wantedProcessDemand();
+  syncProcessDemand().then(() => {
+    if (changed && state.sample && !document.hidden && processLease.mode === "managed") {
+      clearTimeout(pollTimer); state.urgent = true; poll();
+    }
+  }).catch(() => { /* Hidden tabs release on expiry if the best-effort request fails. */ });
+}
+function processCollection(value) {
+  if (!diskText(value?.session, 256) || !Number.isSafeInteger(value.sequence) || value.sequence < 0
+    || !["disabled", "warming", "ready", "failed"].includes(value.state) || !["none", "summary", "details"].includes(value.demand)
+    || !(value.interval_ms === null || Number.isSafeInteger(value.interval_ms) && value.interval_ms >= 100 && value.interval_ms <= 4294967295)) return null;
+  return value;
+}
+function processAge() { return finite(procView.sample?.processes_age_ms) ? procView.sample.processes_age_ms + performance.now() - procView.received : Infinity; }
+function processLimit() { return procView.collection?.interval_ms ? Math.max(3000, 3 * procView.collection.interval_ms) : limit(); }
+function refreshProcesses(sample, started, systemIdentity) {
+  const collection = processCollection(sample.process_collection), session = collection?.session ?? null;
+  if (session !== procView.session) {
+    procView.open.clear(); procView.groups.clear(); procView.raw.clear(); procView.anchors = []; procView.session = session;
+  }
+  procView.collection = collection;
+  const identity = collection ? `${session}/${collection.sequence}` : `legacy/${systemIdentity}`;
+  if (!collection || identity !== procView.identity) {
+    procView.sample = { processes: sample.processes, process_groups: sample.process_groups, processes_age_ms: sample.processes_age_ms };
+    procView.received = started; procView.identity = identity; processes();
+  } else if (finite(sample.processes_age_ms) && procView.sample) {
+    procView.sample.processes_age_ms = Math.max(processAge(), sample.processes_age_ms + performance.now() - started);
+    procView.received = performance.now();
+  }
+}
 const motion = $("motion");
 const reduced = matchMedia("(prefers-reduced-motion: reduce)");
 motion.checked = !reduced.matches;
@@ -311,6 +378,7 @@ function applyDetails() {
   $("detail-grid").dataset.expanded = String(state.details.network || state.details.cooling);
   diskScope();
   processes();
+  requestProcessDemand();
   drawCharts();
   settle();
 }
@@ -325,12 +393,14 @@ function settle() {
   $("status").dataset.state = status;
   put("status", status.toUpperCase());
   put("network-state", `${state.sample && !live() ? "Retained / " : ""}${state.networkStatus}`);
-  const processAge = finite(state.sample?.processes_age_ms) ? state.sample.processes_age_ms + performance.now() - state.received : Infinity;
-  const processState = state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : processAge > limit() ? "STALE / " : "";
-  put("process-status", Array.isArray(state.sample?.processes) ? `${processState}${finite(processAge) ? `${Math.floor(processAge / 1000)}s old` : "Age unavailable"} / CPU 100% = one core` : "Unavailable for this request");
+  const procAge = processAge(), collection = procView.collection, retained = collection && ["disabled", "warming", "failed"].includes(collection.state);
+  const processState = state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : retained ? `${collection.state === "disabled" ? "PAUSED" : collection.state.toUpperCase()} / retained / ` : procAge > processLimit() ? "STALE / " : "";
+  const cadence = collection ? ` / ${collection.demand}${collection.interval_ms ? ` ${number(collection.interval_ms / 1000)}s` : ""}` : "";
+  const unavailable = state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : "";
+  put("process-status", Array.isArray(procView.sample?.processes) ? `${processState}${finite(procAge) ? `${Math.floor(procAge / 1000)}s old` : "Age unavailable"}${cadence} / CPU 100% = one core` : collection ? `${unavailable}${collection.state.toUpperCase()} / Waiting for a process snapshot${cadence}` : "Unavailable for this request");
   const diskDelay = refreshDiskHealth();
   if (!document.hidden) {
-    const processDelay = Array.isArray(state.sample?.processes) && processAge <= limit() ? Math.max(1, limit() - processAge + 1) : Infinity;
+    const processDelay = Array.isArray(procView.sample?.processes) && finite(procAge) ? Math.min(1000 - procAge % 1000, !retained && procAge <= processLimit() ? Math.max(1, processLimit() - procAge + 1) : Infinity) : Infinity;
     const delay = Math.min(live() ? Math.max(1, limit() - age() + 1) : Infinity, diskDelay, processDelay);
     if (Number.isFinite(delay)) staleTimer = setTimeout(settle, delay);
   }
@@ -617,12 +687,12 @@ function restoreProcessPosition(position, reset) {
   else scroll.scrollTop = position.top;
 }
 function processes(reset = false) {
-  const position = processPosition(), items = state.sample?.processes, seen = new Set();
+  const position = processPosition(), items = procView.sample?.processes, seen = new Set();
   const rows = Array.isArray(items) ? items.filter((row) => {
     if (!diskText(row?.name, 512) || !Number.isSafeInteger(row.pid) || row.pid <= 0 || row.pid > 2147483647 || seen.has(row.pid)) return false;
     seen.add(row.pid); return true;
   }) : [];
-  const groups = Array.isArray(items) && rows.length === items.length ? processGroups(state.sample?.process_groups, rows) : null;
+  const groups = Array.isArray(items) && rows.length === items.length ? processGroups(procView.sample?.process_groups, rows) : null;
   const grouped = procView.mode === "grouped" && groups !== null, all = state.details.process;
   const query = String($("process-filter").value || "").slice(0, 128).trim().toLowerCase(), match = (row) => row.name.toLowerCase().includes(query) || String(row.pid).includes(query);
   const key = ["cpu_pct", "gpu_pct", "mem_bytes"].includes($("process-sort").value) ? $("process-sort").value : "cpu_pct";
@@ -675,7 +745,7 @@ function processes(reset = false) {
   }
   processChildren($("process-rows"), nodes); procView.anchors = anchors;
   $("process-table").hidden = !roots.length; $("process-empty").hidden = !!roots.length;
-  put("process-empty", !Array.isArray(items) ? "Process telemetry requires a local loopback request." : query ? "No entries match this filter."
+  put("process-empty", !Array.isArray(items) ? procView.collection ? "Waiting for the first process snapshot." : "Process telemetry requires a local loopback request." : query ? "No entries match this filter."
     : grouped ? "No application groups reported." : items.length && !rows.length ? "Process telemetry unavailable." : "No processes reported.");
   put("process-count", grouped ? `${groups.length} GROUPS / ${rows.length} PROCESSES` : Array.isArray(items) ? `${rows.length} PROCESSES` : "PROCESS TELEMETRY UNAVAILABLE");
   put("process-scope", `${all ? "All" : `Top ${Math.min(5, roots.length)}`} of ${roots.length} ${grouped ? "groups" : "processes"}${query ? " matching the filter" : ""} in the selected order.`);
@@ -720,9 +790,19 @@ async function poll() {
   state.urgent = false;
   const started = performance.now(), request = new AbortController();
   controller = request;
-  const timeout = setTimeout(() => request.abort(), 2500);
+  let timeout;
   try {
-    const response = await fetch("/api/sample", { cache: "no-store", signal: request.signal });
+    let response;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await syncProcessDemand();
+      if (document.hidden || request.signal.aborted) return;
+      clearTimeout(timeout); timeout = setTimeout(() => request.abort(), 2500);
+      const headers = processLease.mode === "legacy" ? {} : { "X-Macmon-Process-Lease": processLease.token || "none" };
+      response = await fetch("/api/sample", { cache: "no-store", headers, signal: request.signal });
+      if (response.status === 410 && processLease.mode === "managed") { processLease.token = null; processLease.expires = 0; continue; }
+      if (processLease.mode === "managed" && [200, 503].includes(response.status)) processLease.expires = started + processLease.ttl;
+      break;
+    }
     if (response.status === 503) {
       state.waiting = true;
       state.online = true;
@@ -742,11 +822,11 @@ async function poll() {
     state.online = true;
     state.waiting = false;
     const identity = `${sample.sequence}/${sample.sampled_at}`;
+    refreshProcesses(sample, started, identity);
     if (identity !== state.identity) {
       update(sample);
       state.identity = identity;
     }
-    processes();
     settle();
   } catch (error) {
     if (request.signal.reason !== "hidden") {
@@ -758,7 +838,8 @@ async function poll() {
     clearTimeout(timeout);
     controller = null;
     state.busy = false;
-    const delay = state.cadence ? Math.min(state.cadence.effective_ms, state.cadence.pending ? 1000 : 10000) : 1000;
+    const processDelay = processLease.mode === "managed" ? { none: Infinity, summary: 5000, details: 1000 }[processLease.wanted] : Infinity;
+    const delay = Math.min(state.cadence ? Math.min(state.cadence.effective_ms, state.cadence.pending ? 1000 : 10000) : 1000, processDelay);
     if (!document.hidden) pollTimer = setTimeout(poll, state.urgent ? 0 : Math.max(0, Math.max(250, delay) - (performance.now() - started)));
   }
 }
@@ -781,9 +862,12 @@ $("interval-up").addEventListener("click", () => adjustInterval("increase"));
 reduced.addEventListener("change", () => { if (reduced.matches) { motion.checked = false; settle(); } });
 document.addEventListener("visibilitychange", () => {
   clearTimeout(pollTimer);
+  requestProcessDemand();
   if (document.hidden) controller?.abort("hidden"); else { state.urgent = true; poll(); }
   settle();
 });
+window.addEventListener("focus", requestProcessDemand);
+window.addEventListener("blur", requestProcessDemand);
 new ResizeObserver(drawCharts).observe($("dashboard"));
 applyDetails();
 poll();

@@ -713,6 +713,15 @@ impl ProcSampler {
     }
   }
 
+  /// Pause rates without replacing confirmed process instances or application ownership IDs.
+  pub(crate) fn reset_rates(&mut self) {
+    self.last = None;
+    self.clock_ns = 0;
+    for known in self.known.values_mut() {
+      known.cpu_history.clear();
+    }
+  }
+
   /// CPU and power are rates since the previous call; the first call reports them as zero.
   pub fn sample(&mut self) -> Vec<ProcInfo> {
     let now = Instant::now();
@@ -868,6 +877,7 @@ impl ProcSampler {
           instance: instance.clone(),
           app,
           known: if raw.identity.is_some() { available } else { (false, false) },
+          identity: raw.identity,
         },
       });
       let counters = raw.counters;
@@ -1294,6 +1304,48 @@ mod tests {
     let busy = sampler.update(vec![input(4 * SEC)], SEC).remove(0);
     assert_eq!(back.meta.instance, busy.meta.instance);
     assert!(busy.meta.known.0);
+  }
+
+  #[test]
+  fn resetting_rates_preserves_confirmed_application_and_instance_ids_but_not_paused_time() {
+    let path = "/Apps/Browser.app/Contents/MacOS/Browser";
+    let input = |cpu, ps| Raw {
+      path: Some(path.into()),
+      ps,
+      counters: Counters {
+        gpu_ns: Some(cpu),
+        gpu_readable: true,
+        ..row(A, cpu, Some(cpu), "Browser").counters
+      },
+      ..row(A, cpu, Some(cpu), "Browser")
+    };
+    for ps in [false, true] {
+      let mut sampler = ProcSampler::new();
+      let first = sampler.update(vec![input(0, ps)], 0).remove(0);
+      let _ = sampler.update(vec![input(SEC, ps)], SEC);
+      let _ = sampler.update(vec![input(2 * SEC, ps)], SEC);
+      sampler.last = Some(Instant::now());
+      sampler.reset_rates();
+      assert!(sampler.last.is_none());
+      assert!(sampler.known.values().all(|known| known.cpu_history.is_empty()));
+      let resumed = sampler.update(vec![input(100 * SEC, ps)], 0).remove(0);
+      assert_eq!(first.meta.instance, resumed.meta.instance);
+      assert_eq!(first.meta.app, resumed.meta.app);
+      assert_eq!((resumed.cpu_pct, resumed.gpu_pct, resumed.power_w), (0.0, 0.0, Some(0.0)));
+      assert_eq!(resumed.meta.known, (false, false));
+      let next = sampler.update(vec![input(101 * SEC, ps)], SEC).remove(0);
+      assert_eq!(resumed.meta.instance, next.meta.instance);
+      if !ps {
+        assert_eq!((next.cpu_pct, next.gpu_pct), (100.0, 100.0));
+        assert_eq!(next.meta.known, (true, true));
+      }
+      let mut reused = input(102 * SEC, ps);
+      reused.identity.as_mut().unwrap().unique += 1;
+      sampler.reset_rates();
+      let reused = sampler.update(vec![reused], 0).remove(0);
+      assert_ne!(next.meta.instance, reused.meta.instance);
+      assert_eq!(reused.meta.known, (false, false));
+    }
   }
 
   #[test]
