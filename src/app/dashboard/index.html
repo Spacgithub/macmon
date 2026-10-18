@@ -9,7 +9,7 @@
   <script src="/dashboard/app.js" defer></script>
 </head>
 <body>
-  <main class="dashboard">
+  <main class="dashboard" id="dashboard">
     <header class="masthead">
       <div><p class="eyebrow">MACMON / LOCAL TELEMETRY</p><h1>System observatory</h1><p id="device" class="muted">Waiting for device telemetry</p></div>
       <div class="connection"><span id="status" role="status" aria-live="polite" data-state="connecting">CONNECTING</span><p id="sample-time" class="muted">No sample received</p>
@@ -23,29 +23,47 @@
       <article class="metric">
         <div class="metric-top"><h2>CPU activity</h2><button id="cpu-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="cpu-details" aria-label="Show CPU details">Details</button></div>
         <div class="readings"><p class="reading" id="cpu-value">&mdash;</p><div class="temperature"><span>CPU TEMP</span><strong id="cpu-temp">Unavailable</strong></div></div>
-        <div id="cpu-details" hidden>
-        <canvas id="cpu-chart" role="img" aria-label="CPU activity history, up to 60 samples"></canvas>
-        <p class="detail" id="cpu-detail">Waiting for a sample</p>
-        </div>
+        <p class="muted summary-note">Reported activity / all cores</p>
       </article>
       <article class="metric">
         <div class="metric-top"><h2>GPU activity</h2><button id="gpu-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="gpu-details" aria-label="Show GPU details">Details</button></div>
         <div class="readings"><p class="reading" id="gpu-value">&mdash;</p><div class="temperature"><span>GPU TEMP</span><strong id="gpu-temp">Unavailable</strong></div></div>
-        <div id="gpu-details" hidden>
-        <canvas id="gpu-chart" role="img" aria-label="GPU activity history, up to 60 samples"></canvas>
-        <p class="detail" id="gpu-detail">Waiting for a sample</p>
-        </div>
+        <p class="muted summary-note">Reported activity / GPU</p>
       </article>
       <article class="metric">
         <div class="metric-top"><h2>Unified memory</h2><button id="ram-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="ram-details" aria-label="Show memory details">Details</button></div>
         <p class="reading" id="ram-value">&mdash;</p><p class="muted" id="ram-summary">Waiting for a sample</p>
-        <dl class="memory-activity"><div><dt>OS pressure</dt><dd id="memory-pressure" data-level="unavailable">Unavailable</dd></div><div><dt>Swap in</dt><dd id="swap-in-rate">Unavailable</dd></div><div><dt>Swap out</dt><dd id="swap-out-rate">Unavailable</dd></div></dl>
-        <div id="ram-details" hidden><canvas id="ram-chart" role="img" aria-label="Memory usage history, up to 60 samples"></canvas>
-        <p class="detail" id="ram-detail">Waiting for a sample</p>
-        <p class="muted memory-note">OS pressure is reported independently of RAM use. Swap rates describe logical page-equivalent bytes, not physical SSD I/O or wear. The first valid rate needs two samples.</p>
-        </div>
+        <dl class="memory-activity"><div><dt>OS pressure</dt><dd id="memory-pressure" data-level="unavailable">Unavailable</dd></div></dl>
       </article>
     </section>
+    <div id="compute-details" class="compute-details" hidden>
+      <section id="cpu-details" class="panel compute-detail" aria-labelledby="cpu-detail-title" hidden>
+        <div class="panel-head"><h2 id="cpu-detail-title">CPU / core analysis</h2><p class="muted" id="cpu-core-count">Core counts unavailable</p></div>
+        <dl class="compute-stats"><div><dt>Reported activity</dt><dd id="cpu-reported">Unavailable</dd></div><div><dt>Frequency-weighted residency</dt><dd id="cpu-weighted">Unavailable</dd></div><div><dt>Reported CPU power</dt><dd id="cpu-package-power">Unavailable</dd></div></dl>
+        <div class="power-key compute-key"><span>Reported activity</span><span>Frequency-weighted residency</span></div>
+        <canvas id="cpu-chart" role="img" aria-label="CPU reported activity and frequency-weighted residency, 0 to 100 percent, up to 60 samples" aria-describedby="cpu-history"></canvas>
+        <p class="muted" id="cpu-history">History unavailable</p><p class="detail" id="cpu-detail">Waiting for a sample</p>
+        <h3>Core types</h3><div class="compute-scroll tier-scroll" tabindex="0" role="region" aria-label="CPU core types"><table id="cpu-tier-table" hidden><thead><tr><th scope="col">Type</th><th scope="col">Reported / installed cores</th><th scope="col">Activity</th><th scope="col">Weighted</th><th scope="col">Aggregate MHz</th></tr></thead><tbody id="cpu-tier-rows"></tbody></table></div>
+        <h3>Reported cores</h3><p class="muted table-note">Activity is time spent in active states. Weighted residency also weights frequency; it is not throughput. Tick fallbacks and incomplete core coverage have no verified weighted measurement. Core frequencies are active-time means; tier aggregates include a minimum-frequency floor.</p>
+        <div id="cpu-core-scroll" class="compute-scroll" tabindex="0" role="region" aria-label="Reported CPU cores; scroll to see every core"><table id="cpu-core-table" hidden><thead><tr><th scope="col">Type</th><th scope="col">Die</th><th scope="col">Core</th><th scope="col">Activity</th><th scope="col">Weighted</th><th scope="col">Active MHz</th></tr></thead><tbody id="cpu-core-rows"></tbody></table></div>
+        <p class="muted table-note" id="cpu-core-empty">Per-core telemetry unavailable</p>
+      </section>
+      <section id="gpu-details" class="panel compute-detail" aria-labelledby="gpu-detail-title" hidden>
+        <div class="panel-head"><h2 id="gpu-detail-title">GPU / activity analysis</h2></div>
+        <dl class="compute-stats"><div><dt>Reported activity</dt><dd id="gpu-reported">Unavailable</dd></div><div><dt>Frequency-weighted residency</dt><dd id="gpu-weighted">Unavailable</dd></div><div><dt>Active-time mean frequency</dt><dd id="gpu-frequency">Unavailable</dd></div><div><dt>Supported frequency range</dt><dd id="gpu-range">Unavailable</dd></div><div><dt>Reported GPU cores</dt><dd id="gpu-cores">Unavailable</dd></div><div><dt>Reported GPU power</dt><dd id="gpu-package-power">Unavailable</dd></div></dl>
+        <div class="power-key compute-key"><span>Reported activity</span><span>Frequency-weighted residency</span></div>
+        <canvas id="gpu-chart" role="img" aria-label="GPU reported activity and frequency-weighted residency, 0 to 100 percent, up to 60 samples" aria-describedby="gpu-history"></canvas>
+        <p class="muted" id="gpu-history">History unavailable</p><p class="detail" id="gpu-detail">Waiting for a sample</p>
+        <p class="muted table-note">Reported zero does not prove an idle GPU or available counters. Zero MHz means no active frequency was reported; weighted residency then stays unavailable. The supported range describes capability, not a current clock or a throttling limit. Per-core GPU activity is not reported.</p>
+      </section>
+      <section id="ram-details" class="panel compute-detail" aria-labelledby="ram-detail-title" hidden>
+        <div class="panel-head"><h2 id="ram-detail-title">Memory / Swap activity</h2></div>
+        <dl class="compute-stats"><div><dt>Swap in</dt><dd id="swap-in-rate">Unavailable</dd></div><div><dt>Swap out</dt><dd id="swap-out-rate">Unavailable</dd></div></dl>
+        <canvas id="ram-chart" role="img" aria-label="Memory usage history, up to 60 samples"></canvas>
+        <p class="detail" id="ram-detail">Waiting for a sample</p>
+        <p class="muted memory-note">OS pressure is reported independently of RAM use. Swap rates describe logical page-equivalent bytes, not physical SSD I/O or wear. The first valid rate needs two samples.</p>
+      </section>
+    </div>
     <section class="panel power" aria-labelledby="power-title">
       <div class="panel-head"><div><p class="eyebrow">ENERGY TELEMETRY</p><h2 id="power-title">Power</h2></div><button id="power-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="power-details" aria-label="Show power details">Details</button></div>
         <div class="power-totals">
@@ -88,12 +106,13 @@
         <p class="muted disk-note">Health age includes cached health, sample age and elapsed browser time. Readings older than 120 seconds are marked stale; retained samples do not establish current health. Unavailable or unsupported health is not a clean bill of health.</p>
       </div>
     </section>
-    <div class="detail-grid">
+    <div class="detail-grid" id="detail-grid">
     <section class="panel" aria-labelledby="network-title">
       <div class="panel-head"><div><p class="eyebrow" id="network-count">INTERFACE TELEMETRY</p><h2 id="network-title">Network</h2></div><button id="network-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="network-details" aria-label="Show network details">Details</button></div>
       <p class="muted" id="network-empty">Waiting for a sample</p>
-      <p class="muted table-note" id="network-scope">Top 3 interfaces by current traffic; rates are kept separate.</p>
-      <div id="network-details" class="network-scroll" tabindex="0" role="region" aria-label="Network interfaces; expand details to see all" data-expanded="false">
+      <div class="network-overview"><p class="network-observer" id="network-observer">Waiting for a sample</p><dl class="network-rates"><div><dt>Receive / s</dt><dd id="network-rx">Unavailable</dd></div><div><dt>Transmit / s</dt><dd id="network-tx">Unavailable</dd></div></dl><p class="muted" id="network-state">Waiting for rates</p></div>
+      <p class="muted table-note" id="network-scope">Auto observes one named interface; it does not measure Internet connectivity.</p>
+      <div id="network-details" class="network-scroll" tabindex="0" role="region" aria-label="Network interfaces; scroll to see all" hidden>
       <table id="network-table" hidden>
         <caption class="sr-only">Receive and transmit rates and cumulative bytes for each interface</caption>
         <thead><tr><th scope="col">Interface</th><th scope="col">RX / s</th><th scope="col">TX / s</th><th scope="col">RX total</th><th scope="col">TX total</th></tr></thead>

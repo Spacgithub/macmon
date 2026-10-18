@@ -207,9 +207,28 @@ The dashboard is bundled into the binary and uses no external assets or frontend
 It follows the service sampling interval and retains 60 distinct samples. CPU/GPU activity uses
 active residency ratios. Each panel starts with a compact summary; use its **Details** / **Less**
 button or **Expand all** / **Collapse all** to choose how much to show. These choices are saved
-locally in the browser and remain usable when browser storage is blocked. Summaries keep the
-three busiest physical disks and interfaces, and five processes in the selected sort order; expand to scroll
-through all rows. Folding a panel keeps live sampling and summaries running.
+locally in the browser and remain usable when browser storage is blocked. Balanced summary
+cards keep CPU/GPU activity, their temperatures and RAM/OS pressure visible. Each opened
+CPU, GPU or memory detail section gets the full width below these cards. Memory details add
+Swap-in/out rates and history. Network and Cooling also use the full width when either is
+expanded. Disk summaries retain the three busiest physical devices; Processes retains five
+rows in the selected sort order. Folding a panel keeps live sampling and summaries running.
+
+CPU details retain the reported overall activity, core-type breakdown, reported/installed
+core counts and each reported die/core's activity. GPU details show reported activity, core
+count, active-time mean frequency and supported frequency range. Both add reported power
+and activity versus frequency-weighted history. Frequency-weighted values describe residency,
+not throughput. Incomplete CPU coverage, tick fallbacks and virtual machines keep valid
+activity without claiming verified frequency data. A GPU report of zero activity with zero
+frequency does not establish that the GPU is idle; its frequency-weighted value stays unavailable.
+
+The Network overview names one automatically observed interface, preferring reported rates
+and then the busiest known receive/transmit traffic with interface-name tie breaks. It shows
+receive/transmit rates separately, plus observed, traffic-active and rates-pending counts;
+the last two may overlap when one direction is pending. Collecting, unavailable, empty,
+pending rates and measured idle are distinct. These are monitoring states, not Internet
+connectivity checks. Expand for all interfaces and cumulative counters; VPN and bridge
+traffic is never summed into a whole-system total.
 
 The Power panel separates the system estimate from the CPU + GPU + ANE subtotal and plots
 both on a shared watt scale over the latest 60 distinct samples. CPU, GPU, ANE, DRAM and GPU

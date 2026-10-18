@@ -62,7 +62,7 @@ h3 { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
 #status[data-state="offline"], #status[data-state="stale"] { color: #edb77b; }
 .overview {
   display: grid;
-  align-items: start;
+  align-items: stretch;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 18px;
   margin: 32px 0 18px;
@@ -76,6 +76,23 @@ h3 { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
   box-shadow: inset 0 1px #ffffff04, 0 16px 40px #00000012;
 }
 .detail-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(320px, 1fr); gap: 18px; align-items: start; }
+.detail-grid[data-expanded="true"] { grid-template-columns: 1fr; }
+.summary-note { margin-top: 12px; }
+.compute-details { display: grid; gap: 18px; margin-bottom: 18px; }
+.compute-stats, .network-rates { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin: 0 0 20px; font-variant-numeric: tabular-nums; }
+.compute-stats > div, .network-rates > div { min-width: 0; }
+.compute-stats dt, .network-rates dt { color: var(--muted); font-size: 11px; }
+.compute-stats dd, .network-rates dd { margin: 5px 0 0; font-size: 20px; overflow-wrap: anywhere; }
+.compute-key { margin-top: 20px; }
+.compute-detail canvas { height: 110px; }
+.compute-detail .detail { min-height: 0; margin: 10px 0 20px; }
+.compute-detail h3 { margin-top: 20px; }
+.compute-scroll { max-height: 320px; overflow: auto; overflow-anchor: none; scrollbar-color: #3b4e65 transparent; }
+.compute-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
+.compute-scroll thead { position: sticky; top: 0; background: #131e2c; }
+.tier-scroll { max-height: 220px; }
+.network-observer { font-size: 18px; overflow-wrap: anywhere; }
+.network-rates { grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 16px 0 12px; }
 .power { margin-bottom: 18px; }
 .disk { margin-bottom: 18px; }
 .disk-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 14px; }
@@ -197,6 +214,7 @@ footer { margin-top: 24px; text-align: center; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 @media (max-width: 960px) {
   .detail-grid { grid-template-columns: 1fr; }
+  .overview { grid-template-columns: 1fr; }
 }
 @media (max-width: 760px) {
   .dashboard { width: calc(100% - 32px); margin: 24px auto; }
@@ -214,13 +232,15 @@ footer { margin-top: 24px; text-align: center; }
   .power-components { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .power-components > div { padding: 10px; }
   .power-components dd { font-size: 16px; }
+  .compute-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  .compute-stats dd, .network-rates dd { font-size: 18px; }
   .disk-summary { grid-template-columns: 1fr; }
   .disk-summary-card:only-child .disk-rates { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .disk-device .disk-rates, .disk-data { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .fans { grid-template-columns: 1fr; }
 }
 @media (max-width: 520px) {
-  .network-scroll thead, .process-scroll thead, .sensor-scroll thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .network-scroll thead, .process-scroll thead, .sensor-scroll thead, .compute-scroll thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
   tbody { display: grid; gap: 12px; }
   tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); padding-bottom: 12px; border-bottom: 1px solid var(--line); }
   td { border: 0; padding: 7px 0; text-align: left; font-size: 12px; }
