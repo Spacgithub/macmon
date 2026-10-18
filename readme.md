@@ -277,8 +277,9 @@ System metric timestamps and age include the time spent collecting the separate 
 The same local snapshot includes `process_groups`: application summaries and unassigned
 individual processes, with opaque group IDs and `{pid, instance}` member identities. Confirmed
 application packages include their embedded helpers; standalone XPC services join only when
-the operating system identifies a single application owner. Unsupported or ambiguous ownership
-stays independent. Full application totals include every member; `cpu_known` and `gpu_known`
+verified system grouping metadata matches one observed application for the same user. Ambiguous
+or unsupported ownership stays independent. Full application totals include every member;
+`cpu_known` and `gpu_known`
 distinguish partial totals from measured zero. Memory is the sum of reported process memory,
 not deduplicated physical memory; GPU totals sum process shares rather than device utilization.
 The existing five-field `processes` rows and their age stay compatible. Both arrays are `null`
