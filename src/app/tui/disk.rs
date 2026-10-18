@@ -412,7 +412,9 @@ mod tests {
 
   #[test]
   fn compact_80_by_24_retains_memory_network_cooling_top_five_and_disk() {
-    let mut app = App::from_parts(Default::default(), Config::load_from(None));
+    let mut cfg = Config::load_from(None);
+    cfg.proc_grouped = false;
+    let mut app = App::from_parts(Default::default(), cfg);
     let metrics = Metrics {
       memory: MemMetrics { ram_usage: 8 << 30, ram_total: 16 << 30, ..Default::default() },
       temp: TempMetrics { cpu_temp_avg: Some(45.0), gpu_temp_avg: Some(43.0) },

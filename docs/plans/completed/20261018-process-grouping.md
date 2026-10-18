@@ -1,3 +1,5 @@
+Done: 2026-10-18, PR #32
+
 # Application process groups in Terminal and Web
 
 ## Behavior and decisions
@@ -50,6 +52,13 @@
 - [x] Implement shared group identity, unique membership, totals and compatible loopback
   dashboard metadata with focused regression tests.
 - [x] Add Web grouped/raw views, independent expansion and refresh/accessibility regressions.
-- [ ] Add Terminal grouped/raw views, navigation, filtering and safe real-process actions.
-- [ ] Complete focused and full checks, independent reviews and real rootless private-PTY
+- [x] Add Terminal grouped/raw views, navigation, filtering and safe real-process actions.
+- [x] Complete focused and full checks, independent reviews and real rootless private-PTY
   and browser validation; retain disk, Network, temperature, pressure/Swap and panel controls.
+
+## Result
+
+Shared application identities and full-member totals now support independent group expansion
+in Terminal and Web, with an individual-process view and actions limited to explicitly selected
+real processes. Conservative ownership, partial readings and compatible output/preferences
+preserve the existing monitoring features.

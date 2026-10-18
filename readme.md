@@ -24,7 +24,7 @@
 - 🌐 Per-interface network receive/transmit rates and cumulative traffic
 - 📈 Historical charts with average and max values
 - 🌡️ Average CPU / GPU temperature and OS thermal state
-- 📋 Process list with per-process CPU, memory, power and GPU usage
+- 📋 Expandable application groups and individual processes with CPU, memory, power and GPU usage
 - 🎨 Follows your terminal's color scheme
 - 🪟 Can be displayed in a small window
 - 🦀 Written in Rust
@@ -82,7 +82,7 @@ Options:
 
 Run `macmon` without a subcommand to open seven compact panels: Compute, Memory, Power,
 Network, Cooling, Processes and Disk. At 80×24 their live summaries keep one named automatic
-Network observation, five sorted processes, current CPU/GPU temperatures, fan RPM and the
+Network observation, five sorted application/process entries, current CPU/GPU temperatures, fan RPM and the
 busiest physical disk visible. Disk keeps read/write rates separate; IOPS appears when the
 whole field fits.
 
@@ -172,7 +172,23 @@ to `~/.warp/themes/`, then select **Macmon Deep Space** in Warp's Theme Picker
 The program uses ANSI colors and also follows other terminal palettes; it does not change your
 terminal preferences automatically.
 
-Press `/` to filter the process list. A filter is a comma-separated list of terms, each matched case-insensitively against the process name or pid: `safari, cargo` shows processes matching any term, and a term starting with `!` hides its matches (`chrome, !helper`). `Enter` keeps the filter, `Esc` clears it.
+The process panel starts with application totals. Press `g` to switch between applications
+and individual processes; this choice is saved. In the full list (`6` then `f`), select an
+application and press Right to expand its members or Left to collapse it. Left on a member
+returns to its application; click only the arrow to toggle with the mouse. Each application
+keeps its expansion during refresh, sorting and filtering for the current run. Compact views
+show five root entries, without letting expanded children displace other applications.
+`×N` is a member count, never a PID. Information, Finder, copying and termination act only
+on an explicitly selected real process; application summaries have no such action.
+
+Press `/` to filter. Comma-separated terms match application/process names or PIDs without
+case sensitivity: `safari, cargo` matches either, while `chrome, !helper` excludes matching
+helpers. Application totals always include the full membership; the matching/total count
+describes the visible children. In individual mode, the original filter-term totals remain
+available. `Enter` keeps the filter and `Esc` clears it after leaving a full-panel view.
+Grouped CPU 100% is one core, memory sums reported process memory, and GPU totals sum
+process shares. `≥` marks a partial total; `-` means unavailable. Large values retain their
+units using compact notation. Unconfirmed application ownership remains an individual row.
 
 ### JSON output
 

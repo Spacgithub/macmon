@@ -312,6 +312,17 @@ impl App {
     !self.panels.fullscreen && self.cfg.panel_details.iter().all(|detail| *detail)
   }
 
+  pub(super) fn legacy_grouped_summary(&self) -> bool {
+    self.panels_legacy()
+      && self.proc_view.grouped
+      && self.proc_view.row_count() > 0
+      && self
+        .legacy_layout(self.screen_area)
+        .0
+        .proc
+        .is_some_and(|rect| (4..6).contains(&rect.height) && rect.width >= 9)
+  }
+
   fn panel_areas(&self, area: Rect) -> Vec<(Panel, Rect)> {
     let body =
       if area.height >= 3 { Rect { y: area.y + 1, height: area.height - 2, ..area } } else { area };
@@ -328,6 +339,36 @@ impl App {
       focus,
       self.panels.fullscreen,
     )
+  }
+
+  /// Derive visible process rows from the drawing layout, even between two key events.
+  pub(super) fn normalize_proc_selection(&mut self) {
+    if !self.proc_view.grouped || (self.panels.fullscreen && self.panels.focus != Panel::Processes)
+    {
+      return;
+    }
+    let legacy = self.panels_legacy();
+    let rect = if legacy {
+      self.legacy_layout(self.screen_area).0.proc
+    } else {
+      self
+        .panel_areas(self.screen_area)
+        .into_iter()
+        .find(|(panel, _)| *panel == Panel::Processes)
+        .map(|(_, rect)| rect)
+    };
+    let detailed = if legacy {
+      rect.is_some_and(|rect| rect.height >= 6)
+    } else {
+      self.panels.fullscreen || self.cfg.panel_detailed(Panel::Processes as usize)
+    };
+    if detailed && rect.is_some_and(|rect| rect.height >= 4 && rect.width >= 9) {
+      return;
+    }
+    let visible = rect
+      .filter(|rect| !detailed && rect.width >= 9)
+      .map_or(0, |rect| rect.height.saturating_sub(3).min(5) as usize);
+    self.proc_view.compact_selection(visible);
   }
 
   pub(super) fn next_fan_placements(&self, area: Rect) -> Vec<Placement> {
@@ -402,7 +443,7 @@ impl App {
       | KeyCode::Home
       | KeyCode::End => {
         if self.panels.focus == Panel::Processes {
-          if !self.panels_legacy() && !self.panels.fullscreen {
+          if !self.panels.fullscreen && (!self.panels_legacy() || self.legacy_grouped_summary()) {
             self.panels.fullscreen = true;
           }
           return false;
@@ -424,6 +465,7 @@ impl App {
       }
       _ => return false,
     }
+    self.normalize_proc_selection();
     true
   }
 
@@ -435,10 +477,19 @@ impl App {
       })
     {
       // Advanced details and compact process summaries select without changing density/layout.
+      let &(panel, area) =
+        self.panels.targets.iter().find(|(_, area)| area.contains(point)).unwrap();
       if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-        self.panels.focus =
-          self.panels.targets.iter().find(|(_, area)| area.contains(point)).unwrap().0;
+        self.panels.focus = panel;
         self.proc_view.end_typing();
+      }
+      if panel == Panel::Processes
+        && self.proc_view.summary_targets()
+        && mouse.row > area.y
+        && mouse.row < area.bottom() - 1
+      {
+        self.panels.focus = panel;
+        return false;
       }
       return true;
     }
@@ -731,7 +782,9 @@ mod tests {
   use crate::procs::ProcInfo;
 
   fn app() -> App {
-    App::from_parts(Default::default(), Config::default())
+    let mut cfg = Config::default();
+    cfg.proc_grouped = false;
+    App::from_parts(Default::default(), cfg)
   }
 
   fn render(app: &mut App, width: u16, height: u16) -> String {
@@ -829,11 +882,38 @@ mod tests {
               assert!(rect.intersection(*other).is_empty());
             }
           }
-          let mut app = app();
-          app.cfg.panel_details = details;
-          app.cfg.disk_details = disk_details;
-          app.cfg.show_procs = show;
-          render(&mut app, width, height);
+          for grouped in [false, true] {
+            let mut app = app();
+            app.cfg.panel_details = details;
+            app.cfg.disk_details = disk_details;
+            app.cfg.show_procs = show;
+            app.proc_view.grouped = grouped;
+            app.proc_view.set_procs(
+              (0..8)
+                .map(|index| ProcInfo {
+                  pid: 1000 + index,
+                  name: format!("worker{index}"),
+                  path: String::new(),
+                  user: "tester".into(),
+                  cpu_pct: index as f32,
+                  gpu_pct: 0.0,
+                  cpu_time_ns: 0,
+                  mem_bytes: 1024,
+                  power_w: None,
+                  started: None,
+                  meta: crate::proc_groups::ProcMeta {
+                    instance: format!("instance-{index}"),
+                    known: (true, true),
+                    app: Some(crate::proc_groups::AppIdentity {
+                      id: format!("app-{}", index / 4),
+                      name: format!("App {}", index / 4),
+                    }),
+                  },
+                })
+                .collect(),
+            );
+            render(&mut app, width, height);
+          }
         }
       }
     }
