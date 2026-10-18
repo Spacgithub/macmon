@@ -111,7 +111,7 @@ unsafe extern "C" {
 }
 
 /// One row of the process list.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProcInfo {
   pub pid: i32,
   pub name: String,
@@ -138,7 +138,7 @@ pub struct ProcInfo {
 }
 
 /// Minimal dashboard rows; unavailable interval rates remain distinct from measured idle.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct DashboardProc {
   pid: i32,
   name: String,
@@ -147,9 +147,11 @@ pub struct DashboardProc {
   mem_bytes: u64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ProcessSnapshot {
   pub rows: Vec<DashboardProc>,
   pub groups: Vec<ProcGroup>,
+  #[serde(with = "crate::source::instant")]
   pub sampled: Instant,
 }
 
@@ -752,15 +754,24 @@ impl ProcSampler {
     self.update(rows, elapsed_ns)
   }
 
-  pub fn sample_dashboard(&mut self) -> ProcessSnapshot {
-    let rows = self.sample();
+  pub(crate) fn snapshot(rows: &[ProcInfo], sampled: Instant) -> ProcessSnapshot {
     ProcessSnapshot {
-      groups: proc_groups::groups(&rows),
-      rows: Self::dashboard_rows(rows),
-      sampled: self.last.unwrap_or_else(Instant::now),
+      groups: proc_groups::groups(rows),
+      rows: rows
+        .iter()
+        .map(|row| DashboardProc {
+          pid: row.pid,
+          name: row.name.clone(),
+          cpu_pct: row.meta.known.0.then_some(row.cpu_pct).and_then(proc_groups::measured),
+          gpu_pct: row.meta.known.1.then_some(row.gpu_pct).and_then(proc_groups::measured),
+          mem_bytes: row.mem_bytes,
+        })
+        .collect(),
+      sampled,
     }
   }
 
+  #[cfg(test)]
   pub(crate) fn dashboard_rows(rows: Vec<ProcInfo>) -> Vec<DashboardProc> {
     rows
       .into_iter()

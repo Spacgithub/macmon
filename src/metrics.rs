@@ -62,6 +62,7 @@ impl PowerSources {
 
 /// Average hardware temperatures.
 #[derive(Debug, Default, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize, Clone))]
 pub struct TempMetrics {
   /// Average CPU temperature in Celsius, or None when unavailable.
   pub cpu_temp_avg: Option<f32>,
@@ -71,6 +72,7 @@ pub struct TempMetrics {
 
 /// Memory and swap usage.
 #[derive(Debug, Default, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize, Clone))]
 pub struct MemMetrics {
   /// Total physical memory in bytes.
   pub ram_total: u64,
@@ -84,6 +86,7 @@ pub struct MemMetrics {
 
 /// Fan speed metrics.
 #[derive(Debug, Default, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize, Clone))]
 pub struct FanMetric {
   /// Stable fan name derived from the fan order, e.g. `fan0`.
   pub name: String,
@@ -95,6 +98,7 @@ pub struct FanMetric {
 
 /// Metrics for one CPU core.
 #[derive(Debug, Default, Clone, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 pub struct CpuCoreMetrics {
   /// Die index reported by the IOReport channel.
   pub die_id: usize,
@@ -110,6 +114,7 @@ pub struct CpuCoreMetrics {
 
 /// Metrics for one CPU tier (core type) of [`Metrics::cpu_tiers`].
 #[derive(Debug, Default, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize, Clone))]
 pub struct CpuTierMetrics {
   /// Tier label: `E`, `P` or `S`, or `_` when the core type is unknown, e.g. the single tier of a
   /// macOS VM, as in [`SocInfo::cpu_tiers`].
@@ -150,6 +155,7 @@ struct SmcSensors {
 /// let metrics = Metrics { cpu_power: 1.0, ..Default::default() };
 /// ```
 #[derive(Debug, Default, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize, Clone))]
 pub struct Metrics {
   /// Temperature metrics.
   pub temp: TempMetrics,

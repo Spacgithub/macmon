@@ -504,6 +504,7 @@ pub fn libc_swap() -> WithError<(u64, u64)> {
 /// This describes the current machine and the frequency tables used to interpret
 /// CPU/GPU residency counters.
 #[derive(Debug, Default, Clone, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 pub struct SocInfo {
   /// Apple hardware model identifier, such as `Mac14,7`.
   pub mac_model: String,
@@ -545,6 +546,7 @@ pub struct SocInfo {
 
 /// One CPU tier (core type) of [`SocInfo::cpu_tiers`].
 #[derive(Debug, Default, Clone, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 pub struct CpuTierInfo {
   /// Tier label: `E`, `P` or `S`, or `_` when the core type is unknown, e.g. the single tier of a
   /// macOS VM (not a letter, so it can't collide with a future Apple core type).

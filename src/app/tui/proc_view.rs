@@ -706,9 +706,15 @@ impl ProcView {
   }
 
   /// Replaces the process list; the selection follows its pid.
+  #[cfg(test)]
   pub(super) fn set_procs(&mut self, procs: Vec<ProcInfo>) {
+    let groups = crate::proc_groups::groups(&procs);
+    self.set_snapshot(procs, groups);
+  }
+
+  pub(super) fn set_snapshot(&mut self, procs: Vec<ProcInfo>, groups: Vec<ProcGroup>) {
     let anchor = self.anchor();
-    self.applications = crate::proc_groups::groups(&procs);
+    self.applications = groups;
     let live: HashSet<_> = self.applications.iter().map(|group| group.id.as_str()).collect();
     self.expanded.retain(|id| live.contains(id.as_str()));
     self.expand_selected_process();

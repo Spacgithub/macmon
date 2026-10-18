@@ -13,6 +13,7 @@ unsafe extern "C" {
 
 /// System memory pressure reported by macOS, independent of the fraction of RAM in use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryPressure {
   /// The operating system reports normal memory pressure.
@@ -29,6 +30,7 @@ pub enum MemoryPressure {
 /// `swapouts` counters and actual host page size. They are neither changes in allocated swap
 /// space nor the SSD's total physical I/O or wear. In a VM these describe the guest OS.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 pub struct MemoryActivity {
   /// OS pressure level; `None` if the interface is unavailable or its value is unknown.
   pub pressure: Option<MemoryPressure>,

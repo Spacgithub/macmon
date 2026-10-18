@@ -27,7 +27,9 @@ use std::io::{self, Stdout, Write, stdout};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
-use std::thread::{self, JoinHandle};
+use std::thread;
+#[cfg(test)]
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use cooling::{Cooling, Placement};
@@ -37,10 +39,9 @@ use fan_protocol::{Capabilities, PendingQueries};
 use info::Info;
 use kill::Kill;
 use layout::LayoutPlan;
-use macmon::{
-  DiskMetric, MemoryActivity, Metrics, NetworkMetric, Sampler, SocInfo, TemperatureReading,
-  ThermalState,
-};
+#[cfg(test)]
+use macmon::TemperatureReading;
+use macmon::{DiskMetric, MemoryActivity, Metrics, NetworkMetric, SocInfo, ThermalState};
 use panels::{Panel, PanelState, Temperatures};
 use proc_view::ProcView;
 use ratatui::crossterm::event::{
@@ -51,8 +52,12 @@ use ratatui::crossterm::{ExecutableCommand, cursor, terminal};
 use ratatui::prelude::*;
 use store::{CpuClusters, FanStore, FreqSample, FreqStore, MemoryStore, PowerStore, TempStore};
 
-use crate::config::{Config, TUI_MIN_MS};
-use crate::procs::{ProcInfo, ProcSampler};
+use crate::config::Config;
+#[cfg(test)]
+use crate::config::TUI_MIN_MS;
+#[cfg(test)]
+use crate::procs::ProcInfo;
+use crate::source::{CadenceState, Client, ConnectionState, Frame as SourceFrame, ProcessDemand};
 
 type WithError<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -129,6 +134,10 @@ fn set_mouse_capture(out: &mut impl Write, on: bool, want: bool) -> io::Result<b
 // MARK: Threads
 
 enum Event {
+  Source,
+  SourceState(ConnectionState),
+  SourceCadence(CadenceState, bool),
+  #[cfg(test)]
   Update(
     Box<Metrics>,
     Vec<TemperatureReading>,
@@ -140,6 +149,7 @@ enum Event {
   /// The sampler failed: the app ends with this error.
   Failed(String),
   /// A process sample with the number of the panel showing it was started in.
+  #[cfg(test)]
   Procs {
     showing: u64,
     procs: Vec<ProcInfo>,
@@ -184,6 +194,7 @@ fn input_event(event: event::Event) -> Option<Event> {
 }
 
 /// Window of the first process sample after the panel shows up, so the list fills in quickly.
+#[cfg(test)]
 const PROCS_WARMUP: Duration = Duration::from_millis(TUI_MIN_MS as u64);
 
 /// ioctl dimensions also refresh font changes that leave the character grid unchanged.
@@ -271,43 +282,6 @@ fn run_inputs_thread(tx: mpsc::Sender<Event>, tick: u64, mut pending: Option<Pen
   });
 }
 
-/// Sends metrics: the first sample after 100 ms, then one per interval; stops once the app is
-/// gone or after an error.
-fn run_sampler_thread(tx: mpsc::Sender<Event>, msec: Arc<RwLock<u32>>) {
-  thread::spawn(move || {
-    let sample = || -> WithError<()> {
-      let mut sampler = Sampler::new()?;
-      let mut window = 100;
-
-      loop {
-        let metrics = sampler.get_metrics(window)?;
-        let sampled = Instant::now();
-        let temperatures = sampler.temperature_details().to_vec();
-        let memory_activity = *sampler.memory_activity();
-        let thermal_state = sampler.thermal_state();
-        let disks = sampler.disks().map(<[DiskMetric]>::to_vec);
-        if tx
-          .send(Event::Update(
-            Box::new(metrics),
-            temperatures,
-            memory_activity,
-            thermal_state,
-            disks,
-            sampled,
-          ))
-          .is_err()
-        {
-          return Ok(());
-        }
-        window = msec.read().map_or(TUI_MIN_MS, |x| *x).max(TUI_MIN_MS);
-      }
-    };
-    if let Err(err) = sample() {
-      let _ = tx.send(Event::Failed(err.to_string()));
-    }
-  });
-}
-
 /// Whether processes are requested, shared with the process thread. Detail folding and window
 /// size do not pause collection. Hiding with `p` wakes the thread and ends the current showing.
 #[derive(Debug, Default)]
@@ -340,6 +314,7 @@ impl ProcsShown {
   }
 
   /// Blocks until the panel is on screen; returns the number of that showing.
+  #[cfg(test)]
   fn wait_shown(&self) -> u64 {
     let state = self.changed.wait_while(self.state.lock().unwrap(), |state| !state.on);
     state.unwrap().count
@@ -347,6 +322,7 @@ impl ProcsShown {
 
   /// Waits `timeout`, or less once the showing `count` ends (a hide, also with a show right
   /// after it); returns whether it goes on.
+  #[cfg(test)]
   fn wait_while_shown(&self, count: u64, timeout: Duration) -> bool {
     let same = |state: &mut Showing| *state == Showing { on: true, count };
     let state = self.state.lock().unwrap();
@@ -355,17 +331,12 @@ impl ProcsShown {
   }
 }
 
-/// Sampler of a showing in `run_procs_thread`: samples processes with a new `ProcSampler`.
-fn proc_sampler() -> impl FnMut() -> Vec<ProcInfo> {
-  let mut sampler = ProcSampler::new();
-  move || sampler.sample()
-}
-
 /// Sends `Event::Procs` every `msec` while the process panel is `shown` and blocks otherwise.
 /// Each showing gets a new sampler from `new_sampler`, so rates after a hide don't average over
 /// the hidden time; a hide ends the wait for the next sample at once, also during a long
 /// interval. Every sample carries the showing it was started in, so the app can drop one that
 /// a hide (and maybe a show) overtook while it ran. Exits when the receiver is gone.
+#[cfg(test)]
 fn run_procs_thread<S: FnMut() -> Vec<ProcInfo>>(
   tx: mpsc::Sender<Event>,
   msec: Arc<RwLock<u32>>,
@@ -394,11 +365,96 @@ fn run_procs_thread<S: FnMut() -> Vec<ProcInfo>>(
   })
 }
 
+/// One pending source notification retains only the latest immutable frame while output is slow.
+#[derive(Default)]
+struct SourceSlot(Mutex<Option<Arc<SourceFrame>>>);
+impl std::fmt::Debug for SourceSlot {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("SourceSlot")
+  }
+}
+impl SourceSlot {
+  fn put(&self, frame: Arc<SourceFrame>, tx: &mpsc::Sender<Event>) -> bool {
+    let notify = self.0.lock().unwrap().replace(frame).is_none();
+    !notify || tx.send(Event::Source).is_ok()
+  }
+  fn take(&self) -> Option<Arc<SourceFrame>> {
+    self.0.lock().unwrap().take()
+  }
+}
+
+#[derive(Debug)]
+enum SourceCommand {
+  Adjust(bool),
+}
+
+fn source_events(
+  client: Client,
+  tx: mpsc::Sender<Event>,
+  commands: mpsc::Receiver<SourceCommand>,
+  slot: Arc<SourceSlot>,
+  mut previous: Option<(String, u64)>,
+) {
+  thread::spawn(move || {
+    let mut status = None;
+    let mut last_cadence = client.cadence();
+    loop {
+      match commands.try_recv() {
+        Ok(SourceCommand::Adjust(increase)) => {
+          if let Ok(cadence) = client.adjust(if increase { "increase" } else { "decrease" })
+            && tx.send(Event::SourceCadence(cadence, true)).is_err()
+          {
+            break;
+          }
+        }
+        Err(mpsc::TryRecvError::Disconnected) => break,
+        _ => {}
+      }
+      let current = client.status();
+      if status != Some(current) {
+        status = Some(current);
+        if tx.send(Event::SourceState(current)).is_err() {
+          break;
+        }
+      }
+      let key = previous.as_ref().map(|(session, sequence)| (session.as_str(), *sequence));
+      match client.wait_after(key, Duration::from_millis(100)) {
+        Ok(Some(frame)) => {
+          previous = Some((frame.session.clone(), frame.revision));
+          if !slot.put(frame, &tx) {
+            break;
+          }
+        }
+        Err(_) => {
+          let _ = tx.send(Event::SourceState(ConnectionState::Incompatible));
+          break;
+        }
+        _ => {}
+      }
+      let cadence = client.cadence();
+      if cadence != last_cadence {
+        last_cadence = cadence;
+        if tx.send(Event::SourceCadence(cadence, false)).is_err() {
+          break;
+        }
+      }
+    }
+  });
+}
+
 // MARK: App
 
 #[derive(Debug, Default)]
 pub struct App {
   cfg: Config,
+  source_commands: Option<mpsc::Sender<SourceCommand>>,
+  source_frames: Option<Arc<SourceSlot>>,
+  source_state: Option<ConnectionState>,
+  source_session: String,
+  source_sequence: u64,
+  source_sampled: Option<Instant>,
+  source_process: Option<(u64, u64)>,
+  source_fresh: bool,
   /// Graph bars in three levels (blank, `▄`, `█`): Apple Terminal draws gaps between the eighth
   /// blocks.
   three_level_bars: bool,
@@ -468,7 +524,7 @@ pub struct App {
 
 impl App {
   pub fn new() -> WithError<Self> {
-    Ok(Self::from_parts(SocInfo::new()?, Config::load()))
+    Ok(Self::from_parts(SocInfo::default(), Config::load()))
   }
 
   /// App for the chip `soc` with the settings `cfg`. The CPU clusters come from the chip, so the
@@ -481,6 +537,83 @@ impl App {
       panels.focus = Panel::Compute;
     }
     Self { cfg, soc, clusters, proc_view, panels, ..Default::default() }
+  }
+
+  fn source_live(&self) -> bool {
+    self.source_commands.is_none()
+      || (self.source_state == Some(ConnectionState::Live)
+        && self.source_sampled.is_some_and(|sampled| {
+          sampled.elapsed().as_millis()
+            <= u128::from(self.cfg.interval()).saturating_mul(3).max(3000)
+        }))
+  }
+
+  fn apply_source(&mut self, frame: &SourceFrame) {
+    if self.source_session != frame.session {
+      self.source_session.clone_from(&frame.session);
+      self.soc = frame.soc.clone();
+      self.clusters = CpuClusters::from_soc(&self.soc);
+      self.compute = Default::default();
+      self.igpu_freq = Default::default();
+      self.cpu_power = Default::default();
+      self.gpu_power = Default::default();
+      self.ane_power = Default::default();
+      self.all_power = Default::default();
+      self.sys_power = Default::default();
+      self.cpu_temp = Default::default();
+      self.gpu_temp = Default::default();
+      self.temperatures = Default::default();
+      self.mem = Default::default();
+      self.proc_view.clear();
+      self.info = None;
+      self.kill.close();
+      self.source_process = None;
+      self.source_sequence = 0;
+    }
+    self.source_state.get_or_insert(ConnectionState::Live);
+    self.source_sampled = Some(frame.sampled);
+    self.source_fresh = self.source_live();
+    self.cfg.adopt_interval(frame.cadence.effective_ms);
+    if self.source_sequence != frame.sequence {
+      self.source_sequence = frame.sequence;
+      self.memory_activity = frame.details.memory_activity;
+      self.thermal_state = frame.details.thermal_state;
+      self.disks.clone_from(&frame.details.disks);
+      self.disk_sampled = Some(frame.sampled);
+      self.temperatures.push(frame.details.temperatures.clone(), &frame.metrics.temp);
+      self.update_metrics(frame.metrics.clone());
+    }
+    if let (Some(processes), Some(showing)) = (&frame.processes, self.procs_shown.showing())
+      && self.source_process != Some((showing, processes.sequence))
+    {
+      self.normalize_proc_selection();
+      let mut rows = processes.rows.clone();
+      let mut groups = processes.snapshot.groups.clone();
+      if self.soc.vm {
+        rows.iter_mut().for_each(|row| row.power_w = None);
+        groups.iter_mut().for_each(|group| {
+          group.power_w = None;
+          group.power_known = 0;
+        });
+      }
+      self.proc_view.set_snapshot(rows, groups);
+      self.normalize_proc_selection();
+      self.source_process = Some((showing, processes.sequence));
+      if let Some(info) = &mut self.info {
+        info.update_proc(self.proc_view.procs().unwrap_or_default());
+        info.refresh(&*self.kill.sys);
+      }
+    }
+  }
+
+  fn adjust_source_interval(&mut self, increase: bool) {
+    if let Some(commands) = &self.source_commands {
+      let _ = commands.send(SourceCommand::Adjust(increase));
+    } else if increase {
+      self.cfg.inc_interval();
+    } else {
+      self.cfg.dec_interval();
+    }
   }
 
   fn update_metrics(&mut self, data: Metrics) {
@@ -528,6 +661,7 @@ impl App {
   /// gets in: one still in flight when the panel got hidden is dropped, also when the panel is
   /// back by now, so a re-shown panel reads "collecting…" until its own first sample. In a VM no
   /// process has a power reading: process energy doesn't move there.
+  #[cfg(test)]
   fn update_procs(&mut self, showing: u64, mut procs: Vec<ProcInfo>) {
     if self.soc.vm {
       procs.iter_mut().for_each(|proc| proc.power_w = None);
@@ -547,11 +681,32 @@ impl App {
   /// which `msec` hands on to the sampling threads.
   fn handle_event(&mut self, event: Event, msec: &RwLock<u32>) -> ControlFlow<()> {
     let flow = match event {
+      Event::Source => {
+        if let Some(frame) = self.source_frames.as_ref().and_then(|slot| slot.take()) {
+          self.apply_source(&frame);
+        }
+        return ControlFlow::Continue(());
+      }
+      Event::SourceState(state) => {
+        self.source_state = Some(state);
+        if state != ConnectionState::Live {
+          self.kill.close();
+        }
+        return ControlFlow::Continue(());
+      }
+      Event::SourceCadence(cadence, save) => {
+        if save {
+          self.cfg.save_interval(cadence.requested_ms);
+        }
+        self.cfg.adopt_interval(cadence.effective_ms);
+        return ControlFlow::Continue(());
+      }
       Event::Key(key) => self.handle_key(key),
       Event::Mouse(mouse) => {
         self.handle_mouse(mouse);
         return ControlFlow::Continue(());
       }
+      #[cfg(test)]
       Event::Update(data, temperatures, memory_activity, thermal_state, disks, sampled) => {
         self.memory_activity = memory_activity;
         self.thermal_state = thermal_state;
@@ -561,6 +716,7 @@ impl App {
         self.update_metrics(*data);
         return ControlFlow::Continue(());
       }
+      #[cfg(test)]
       Event::Procs { showing, procs } => {
         self.update_procs(showing, procs);
         return ControlFlow::Continue(());
@@ -604,7 +760,28 @@ impl App {
     if let Event::Failed(err) = event {
       return Err(err.into());
     }
+    if let Event::SourceState(state) = &event
+      && self.source_state == Some(*state)
+    {
+      return Ok(ControlFlow::Continue(false));
+    }
+    if let Event::SourceCadence(cadence, false) = &event
+      && self.cfg.interval() == cadence.effective_ms
+    {
+      return Ok(ControlFlow::Continue(false));
+    }
     if matches!(event, Event::Tick) {
+      let fresh = self.source_live();
+      if self.source_commands.is_some() && self.source_fresh != fresh {
+        self.source_fresh = fresh;
+        if !fresh {
+          self.kill.close();
+        }
+        return Ok(ControlFlow::Continue(true));
+      }
+      if !fresh {
+        return Ok(ControlFlow::Continue(false));
+      }
       if self.fans_visible() {
         return Ok(ControlFlow::Continue(false));
       }
@@ -629,6 +806,9 @@ impl App {
   /// and the kill popup; then keys of the process panel (only while it is on screen) take
   /// precedence, and while a filter is typed every key except Ctrl-C goes to it.
   fn handle_key(&mut self, key: KeyEvent) -> ControlFlow<()> {
+    if !self.source_live() {
+      self.kill.close();
+    }
     if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
       return ControlFlow::Break(());
     }
@@ -689,15 +869,17 @@ impl App {
       KeyCode::Char('?') => self.help = Some(0),
       KeyCode::Char('r') => self.cfg.toggle_ratio_mode(),
       KeyCode::Char('a') => self.cfg.toggle_animate_fans(),
-      KeyCode::Char('+') => self.cfg.inc_interval(),
-      KeyCode::Char('=') => self.cfg.inc_interval(), // fallback to press without shift
-      KeyCode::Char('-') => self.cfg.dec_interval(),
+      KeyCode::Char('+') => self.adjust_source_interval(true),
+      KeyCode::Char('=') => self.adjust_source_interval(true), // fallback to press without shift
+      KeyCode::Char('-') => self.adjust_source_interval(false),
       // a window too small for the list keeps it hidden whatever the setting says, so `p` would
       // change a setting without a change on screen
       KeyCode::Char('p') if self.procs_fit => self.cfg.toggle_procs(),
       KeyCode::Char('v') => self.cfg.toggle_view_type(),
       // the last `Char` arm: it takes every character left while the list is on screen
-      KeyCode::Char(c) if self.procs_visible() && self.panels.focus == Panel::Processes => {
+      KeyCode::Char(c)
+        if self.procs_visible() && self.panels.focus == Panel::Processes && self.source_live() =>
+      {
         match (c, self.proc_view.selected()) {
           ('i', Some(proc)) => self.info = Some(Info::new(proc, &*self.kill.sys)),
           ('k', Some(proc)) => self.kill.open(proc),
@@ -724,6 +906,9 @@ impl App {
   /// mouse is captured (events still on the way when capture turns off are dropped). While an
   /// overlay is open, they go to it; under the help to nothing.
   fn handle_mouse(&mut self, mouse: MouseEvent) {
+    if !self.source_live() {
+      self.kill.close();
+    }
     if self.help.is_some() {
       return;
     }
@@ -785,6 +970,9 @@ impl App {
   }
 
   fn fan_frames_active(&self) -> bool {
+    if !self.source_live() {
+      return false;
+    }
     self.fans_visible() && self.cfg.animate_fans && !self.unfocused && self.cooling.moving()
   }
 
@@ -880,6 +1068,7 @@ impl App {
     }
     if !self.panels_legacy() {
       self.render_panels(f);
+      self.render_source_status(f);
       return;
     }
     let (plan, disk) = self.layout_frame(f.area());
@@ -918,6 +1107,19 @@ impl App {
       self.fan_base.clone_from(f.buffer_mut());
       self.paint_text_fans(f.buffer_mut());
     }
+    self.render_source_status(f);
+  }
+
+  fn render_source_status(&self, frame: &mut Frame) {
+    if self.source_commands.is_some() && !self.source_live() {
+      let message = match self.source_state {
+        Some(ConnectionState::Live) => "Sampling stale",
+        Some(ConnectionState::Incompatible) => "Sampling incompatible · restart macmon",
+        Some(ConnectionState::Connecting) => "Sampling connecting",
+        _ => "Sampling disconnected · retrying",
+      };
+      frame.render_widget(Line::from(theme::dim(message)), Rect { height: 1, ..frame.area() });
+    }
   }
 
   pub fn run_loop(&mut self, interval: Option<u32>) -> WithError<()> {
@@ -927,10 +1129,30 @@ impl App {
     }
     let msec = Arc::new(RwLock::new(self.cfg.interval()));
 
+    let client = Client::connect_tui(
+      self.cfg.interval(),
+      interval.map(|interval| interval.clamp(crate::config::TUI_MIN_MS, crate::config::TUI_MAX_MS)),
+      ProcessDemand::Details,
+    )?;
+    client.set_demand(ProcessDemand::Details)?;
+    let first = client
+      .wait_after(None, Duration::from_secs(10))?
+      .ok_or("sampling source did not become ready")?;
+    self.apply_source(&first);
     let (tx, rx) = mpsc::channel::<Event>();
-    run_sampler_thread(tx.clone(), msec.clone());
-    run_procs_thread(tx.clone(), msec.clone(), self.procs_shown.clone(), proc_sampler);
+    let (commands, requested) = mpsc::channel();
+    self.source_commands = Some(commands);
+    let slot = Arc::new(SourceSlot::default());
+    self.source_frames = Some(Arc::clone(&slot));
+    source_events(
+      client,
+      tx.clone(),
+      requested,
+      slot,
+      Some((first.session.clone(), first.revision)),
+    );
 
+    drop(first);
     // the guard restores the terminal on every way out of here, `?` included
     self.run_terminal(tx, rx, &msec)
   }
@@ -1065,6 +1287,73 @@ mod tests {
 
   include!("ui_preview.rs");
   include!("fan_preview.rs");
+
+  #[test]
+  fn slow_terminal_retains_only_the_latest_frame_and_one_pending_notification() {
+    let slot = super::SourceSlot::default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut old = Vec::new();
+    for revision in 1..=100 {
+      let frame = std::sync::Arc::new(crate::source::Frame::fixture(revision, revision));
+      old.push(std::sync::Arc::downgrade(&frame));
+      assert!(slot.put(frame, &tx));
+    }
+    assert_eq!(rx.try_iter().count(), 1);
+    assert!(old[..99].iter().all(|frame| frame.upgrade().is_none()));
+    assert_eq!(slot.take().unwrap().revision, 100);
+    assert!(slot.take().is_none());
+    assert!(old[99].upgrade().is_none());
+  }
+
+  #[test]
+  fn shared_process_revisions_do_not_add_system_history_and_heartbeats_do_not_draw() {
+    let mut app = App::default();
+    let (commands, _receiver) = std::sync::mpsc::channel();
+    app.source_commands = Some(commands);
+    let interval = RwLock::new(1000);
+    let mut frame = crate::source::Frame::fixture(1, 1);
+    app.apply_source(&frame);
+    assert_eq!(app.mem.items.len(), 1);
+    frame.revision = 2;
+    app.apply_source(&frame);
+    assert_eq!(app.mem.items.len(), 1, "process-only revision must not duplicate history");
+    for _ in 0..5 {
+      assert_eq!(
+        app.apply_event(Event::SourceCadence(frame.cadence, false), &interval).unwrap(),
+        ControlFlow::Continue(false)
+      );
+      assert_eq!(
+        app
+          .apply_event(Event::SourceState(crate::source::ConnectionState::Live), &interval)
+          .unwrap(),
+        ControlFlow::Continue(false)
+      );
+    }
+    frame.sequence += 1;
+    frame.revision += 1;
+    app.apply_source(&frame);
+    assert_eq!(app.mem.items.len(), 2);
+    frame.session = "replacement".into();
+    frame.sequence = 1;
+    app.apply_source(&frame);
+    assert_eq!(app.mem.items.len(), 1, "a new collector resets histories");
+  }
+
+  #[test]
+  fn disconnected_or_stale_sources_pause_fans_and_keep_quit_available() {
+    let mut app = network_app();
+    let (commands, _receiver) = std::sync::mpsc::channel();
+    app.source_commands = Some(commands);
+    let interval = RwLock::new(1000);
+    let mut frame = crate::source::Frame::fixture(1, 1);
+    frame.sampled -= Duration::from_secs(4);
+    app.apply_source(&frame);
+    assert!(!app.source_live());
+    assert!(!app.fan_frames_active());
+    assert_eq!(app.apply_event(Event::Tick, &interval).unwrap(), ControlFlow::Continue(false));
+    app.source_state = Some(crate::source::ConnectionState::Disconnected);
+    assert_eq!(app.apply_event(Event::Key(key('q')), &interval).unwrap(), ControlFlow::Break(()));
+  }
 
   #[test]
   fn idle_heartbeats_do_not_draw_but_samples_and_resize_do() {
@@ -2872,6 +3161,85 @@ mod tests {
     assert!(app.handle_key(key('t')).is_continue());
     assert!(!app.kill.is_open());
     assert_eq!(fake.calls(), [(631, 0), (631, libc::SIGTERM)]);
+  }
+
+  #[test]
+  fn cached_frame_after_disconnect_cannot_reenable_actions_until_a_live_state_event() {
+    use crate::source::ConnectionState;
+    for disconnected in [ConnectionState::Disconnected, ConnectionState::Incompatible] {
+      let (mut app, fake) = kill_app();
+      let (commands, _receiver) = std::sync::mpsc::channel();
+      let slot = std::sync::Arc::new(super::SourceSlot::default());
+      let (tx, rx) = std::sync::mpsc::channel();
+      app.source_commands = Some(commands);
+      app.source_frames = Some(std::sync::Arc::clone(&slot));
+      app.source_session = "fixture".into();
+      app.source_state = Some(ConnectionState::Live);
+      app.source_sampled = Some(Instant::now());
+      let _ = press(&mut app, KeyCode::Char('k'));
+      assert!(app.kill.is_open());
+      let before = fake.calls();
+      let interval = RwLock::new(1000);
+      let _ = app.apply_event(Event::SourceState(disconnected), &interval).unwrap();
+      assert!(!app.kill.is_open());
+      assert!(slot.put(std::sync::Arc::new(crate::source::Frame::fixture(1, 1)), &tx));
+      let _ = app.apply_event(rx.recv().unwrap(), &interval).unwrap();
+      assert_eq!(app.source_state, Some(disconnected));
+      assert!(!app.source_live());
+      let _ = press(&mut app, KeyCode::Char('k'));
+      assert!(!app.kill.is_open());
+      assert_eq!(fake.calls(), before);
+      let _ = app.apply_event(Event::SourceState(ConnectionState::Live), &interval).unwrap();
+      assert!(app.source_live());
+      let _ = press(&mut app, KeyCode::Char('k'));
+      assert!(app.kill.is_open());
+      assert_eq!(
+        fake.calls().last(),
+        Some(&(631, 0)),
+        "only a fake permission probe, never a signal"
+      );
+    }
+  }
+
+  #[test]
+  fn stale_shared_samples_cannot_confirm_an_existing_kill_popup_by_mouse_or_keyboard() {
+    for transition in ["disconnect", "stale-tick", "stale-click", "stale-key"] {
+      let (mut app, fake) = kill_app();
+      let _ = press(&mut app, KeyCode::Char('k'));
+      assert!(app.kill.is_open());
+      let buf = render_buffer(&mut app, 160, 50);
+      let y = (0..50).find(|&y| row(&buf, y).contains("[ Force kill ]")).unwrap();
+      let x = x_of(&row(&buf, y), "[ Force kill ]");
+      let before = fake.calls();
+      let (commands, _receiver) = std::sync::mpsc::channel();
+      app.source_commands = Some(commands);
+      app.source_state = Some(crate::source::ConnectionState::Live);
+      app.source_sampled = Some(Instant::now() - Duration::from_secs(40));
+      app.source_fresh = true;
+      let interval = RwLock::new(1000);
+      match transition {
+        "disconnect" => {
+          let _ = app
+            .apply_event(
+              Event::SourceState(crate::source::ConnectionState::Disconnected),
+              &interval,
+            )
+            .unwrap();
+          assert!(!app.kill.is_open());
+        }
+        "stale-tick" => {
+          let _ = app.apply_event(Event::Tick, &interval).unwrap();
+          assert!(!app.kill.is_open());
+        }
+        "stale-key" => {
+          let _ = press(&mut app, KeyCode::Char('f'));
+        }
+        _ => {}
+      }
+      click(&mut app, x, y);
+      assert!(!app.kill.is_open(), "{transition}");
+      assert_eq!(fake.calls(), before, "{transition}");
+    }
   }
 
   #[test]

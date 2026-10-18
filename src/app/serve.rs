@@ -11,43 +11,75 @@ use macmon::{DiskMetric, MemoryActivity, Metrics, SocInfo, TemperatureReading, T
 
 use crate::config::{TUI_MAX_MS, TUI_MIN_MS};
 use crate::metrics_to_json_value;
+#[cfg(test)]
 use crate::procs::ProcessSnapshot;
 
-pub type SharedMetrics = Arc<RwLock<Option<Sample>>>;
+pub type SharedMetrics = Arc<RwLock<Option<Arc<Sample>>>>;
 pub type SharedCadence = Arc<RwLock<Cadence>>;
 
 pub struct Cadence {
   requested_ms: u32,
   effective_ms: u32,
+  generation: u64,
+  source: Option<Arc<crate::source::Client>>,
 }
 
 impl Cadence {
   pub fn new(initial_ms: u32) -> Self {
-    Self { requested_ms: initial_ms, effective_ms: initial_ms }
+    Self { requested_ms: initial_ms, effective_ms: initial_ms, generation: 0, source: None }
   }
 
   pub fn begin(&mut self) -> u32 {
-    self.effective_ms = self.requested_ms;
+    if self.effective_ms != self.requested_ms {
+      self.effective_ms = self.requested_ms;
+      self.generation = self.generation.saturating_add(1);
+    }
     self.effective_ms
   }
 
-  fn adjust(&mut self, adjustment: &str) -> bool {
-    self.requested_ms = match adjustment {
+  pub(crate) fn adjust(&mut self, adjustment: &str) -> bool {
+    let requested_ms = match adjustment {
       "increase" => self.requested_ms.saturating_add(250) / 250 * 250,
       "decrease" => self.requested_ms.saturating_sub(250).div_ceil(250) * 250,
       _ => return false,
     }
     .clamp(TUI_MIN_MS, TUI_MAX_MS);
+    self.set(requested_ms);
     true
   }
 
+  pub(crate) fn state(&self) -> crate::source::CadenceState {
+    if let Some(source) = &self.source {
+      return source.cadence();
+    }
+    crate::source::CadenceState {
+      requested_ms: self.requested_ms,
+      effective_ms: self.effective_ms,
+      pending: self.requested_ms != self.effective_ms,
+      generation: self.generation,
+    }
+  }
+  pub(crate) fn set(&mut self, interval_ms: u32) {
+    if self.requested_ms != interval_ms {
+      self.requested_ms = interval_ms;
+      self.generation = self.generation.saturating_add(1);
+    }
+  }
+  pub(crate) fn with_source(source: Arc<crate::source::Client>) -> Self {
+    Self { source: Some(source), ..Self::new(1000) }
+  }
   fn value(&self) -> serde_json::Value {
-    serde_json::json!({"requested_ms": self.requested_ms, "effective_ms": self.effective_ms,
-      "pending": self.requested_ms != self.effective_ms})
+    cadence_value(self.state())
   }
 }
 
-#[derive(Default)]
+// Ordering metadata belongs to private IPC; every HTTP cadence keeps its released schema.
+fn cadence_value(state: crate::source::CadenceState) -> serde_json::Value {
+  serde_json::json!({"requested_ms": state.requested_ms, "effective_ms": state.effective_ms,
+    "pending": state.pending})
+}
+
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SampleDetails {
   pub temperatures: Vec<TemperatureReading>,
   pub memory_activity: MemoryActivity,
@@ -61,21 +93,14 @@ impl From<Vec<TemperatureReading>> for SampleDetails {
   }
 }
 
-pub struct Sample {
-  metrics: Metrics,
-  details: SampleDetails,
-  sequence: u64,
-  sampled_at: String,
-  sampled: Instant,
-  interval_ms: u32,
-  processes: Option<ProcessSnapshot>,
-}
+pub(crate) type Sample = crate::source::Frame;
 
 /// Capture system-metric completion before collecting the separate process snapshot.
 pub fn sample_time() -> (Instant, String) {
   (Instant::now(), chrono::Utc::now().to_rfc3339())
 }
 
+#[cfg(test)]
 pub(crate) fn publish_sample(
   shared: &SharedMetrics,
   metrics: Metrics,
@@ -87,15 +112,31 @@ pub(crate) fn publish_sample(
   let (sampled, sampled_at) = time;
   let mut latest = shared.write().unwrap();
   let sequence = latest.as_ref().map_or(1, |sample| sample.sequence.saturating_add(1));
-  *latest = Some(Sample {
+  *latest = Some(Arc::new(Sample {
+    session: "fixture".into(),
+    revision: sequence,
+    collector_pid: std::process::id(),
+    soc: SocInfo::default(),
+    cadence: crate::source::CadenceState {
+      requested_ms: interval_ms,
+      effective_ms: interval_ms,
+      pending: false,
+      generation: 0,
+    },
+    process_interval_ms: interval_ms,
+    process_state: if processes.is_some() {
+      crate::source::ProcessState::Ready
+    } else {
+      crate::source::ProcessState::Warming
+    },
     metrics,
     details: details.into(),
     sequence,
     sampled_at,
     sampled,
     interval_ms,
-    processes,
-  });
+    processes: processes.map(|snapshot| Arc::new(crate::source::ProcessFrame::fixture(snapshot))),
+  }));
 }
 
 fn escape_label_value(value: &str) -> String {
@@ -253,9 +294,9 @@ fn to_sample(sample: &Sample, soc: &SocInfo, local: bool, cadence: &Cadence) -> 
     "memory_activity": sample.details.memory_activity,
     "thermal_state": sample.details.thermal_state.filter(|_| !soc.vm),
     "disks": sample.details.disks,
-    "processes": processes.map(|snapshot| &snapshot.rows),
-    "process_groups": processes.map(|snapshot| &snapshot.groups),
-    "processes_age_ms": processes.map(|snapshot| snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
+    "processes": processes.map(|processes| &processes.snapshot.rows),
+    "process_groups": processes.map(|processes| &processes.snapshot.groups),
+    "processes_age_ms": processes.map(|processes| processes.snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
   })
   .to_string()
 }
@@ -420,7 +461,16 @@ fn handle_conn(
     };
     let (status, body) = if status == 200 {
       let mut control = cadence.write().unwrap();
-      if control.adjust(body["adjustment"].as_str().unwrap_or("")) {
+      let adjustment = body["adjustment"].as_str().unwrap_or("");
+      if let Some(source) = &control.source {
+        match source.adjust(adjustment) {
+          Ok(value) => (200, cadence_value(value).to_string()),
+          Err(_) if matches!(adjustment, "increase" | "decrease") => {
+            (503, r#"{"error":"sampling source unavailable"}"#.into())
+          }
+          Err(_) => (400, r#"{"error":"invalid adjustment"}"#.into()),
+        }
+      } else if control.adjust(adjustment) {
         (200, control.value().to_string())
       } else {
         (400, r#"{"error":"invalid adjustment"}"#.to_string())
@@ -429,6 +479,22 @@ fn handle_conn(
       (status, r#"{"error":"local same-origin POST required"}"#.to_string())
     };
     write_response(&mut stream, status, "application/json", &body);
+    return;
+  }
+
+  if path == "/api/source" {
+    let control = cadence.read().unwrap();
+    let source = control.source.as_ref();
+    let frame = source.and_then(|source| source.latest());
+    let body = serde_json::json!({"protocol": 1, "session": frame.as_ref().map(|frame| &frame.session),
+      "collector_pid": frame.as_ref().map(|frame| frame.collector_pid),
+      "connected": source.is_some_and(|source| source.status() == crate::source::ConnectionState::Live)}).to_string();
+    write_response(
+      &mut stream,
+      if local { 200 } else { 403 },
+      "application/json",
+      if local { &body } else { "{}" },
+    );
     return;
   }
 
@@ -548,13 +614,11 @@ pub fn launchd(host: &str, port: u16, install: bool) -> Result<(), Box<dyn std::
 }
 
 pub fn run(
-  host: &str,
-  port: u16,
+  listener: TcpListener,
   shared: SharedMetrics,
   soc: Arc<SocInfo>,
   cadence: SharedCadence,
 ) -> Result<(), Box<dyn std::error::Error>> {
-  let listener = TcpListener::bind((host, port))?;
   eprintln!("macmon serving on http://{}", listener.local_addr()?);
   eprintln!("  GET /dashboard/ → Local dashboard");
   eprintln!("  GET /api/sample → Latest sample with freshness metadata");
@@ -646,6 +710,44 @@ mod tests {
     let length = headers.lines().find_map(|line| line.strip_prefix("Content-Length: ")).unwrap();
     assert_eq!(length.parse::<usize>().unwrap(), body.len());
     body
+  }
+
+  #[test]
+  fn cadence_generation_orders_changes_without_entering_any_http_cadence() {
+    let mut control = Cadence::new(1000);
+    assert_eq!(control.state().generation, 0);
+    assert_eq!(control.begin(), 1000);
+    assert_eq!(control.state().generation, 0);
+    assert!(control.adjust("increase"));
+    assert_eq!(control.state().generation, 1);
+    control.set(1250);
+    assert_eq!(control.state().generation, 1, "an unchanged request adds no generation");
+    let pending = serde_json::json!({"requested_ms":1250,"effective_ms":1000,"pending":true});
+    assert_eq!(super::cadence_value(control.state()), pending, "shared-control HTTP response");
+    assert_eq!(control.value(), pending);
+    let shared = Arc::new(RwLock::new(None));
+    publish_sample(&shared, Metrics::default(), vec![], 1000, None, super::sample_time());
+    let sample: serde_json::Value = serde_json::from_str(&to_sample(
+      shared.read().unwrap().as_ref().unwrap(),
+      &SocInfo::default(),
+      true,
+      &control,
+    ))
+    .unwrap();
+    assert_eq!(sample["cadence"], pending, "GET /api/sample keeps its three fields");
+    let control = Arc::new(RwLock::new(control));
+    let response = adjustment(&shared, &control, "increase");
+    assert_eq!(
+      serde_json::from_str::<serde_json::Value>(body(&response)).unwrap(),
+      serde_json::json!({"requested_ms":1500,"effective_ms":1000,"pending":true}),
+      "POST /api/interval keeps its three fields"
+    );
+    let mut control = control.write().unwrap();
+    assert_eq!(control.state().generation, 2);
+    assert_eq!(control.begin(), 1500);
+    assert_eq!(control.state().generation, 3);
+    assert_eq!(control.begin(), 1500);
+    assert_eq!(control.state().generation, 3, "an unchanged window adds no generation");
   }
 
   #[test]
@@ -829,7 +931,8 @@ mod tests {
   fn sample_metadata_retains_its_time_and_age_until_a_new_success() {
     let shared = Arc::new(RwLock::new(None));
     publish_sample(&shared, Metrics::default(), Vec::new(), 1500, None, super::sample_time());
-    shared.write().unwrap().as_mut().unwrap().sampled = Instant::now() - Duration::from_millis(250);
+    Arc::get_mut(shared.write().unwrap().as_mut().unwrap()).unwrap().sampled =
+      Instant::now() - Duration::from_millis(250);
     let read = || {
       let lock = shared.read().unwrap();
       serde_json::from_str::<serde_json::Value>(&to_sample(
@@ -1043,6 +1146,7 @@ mod tests {
 
   #[test]
   fn process_snapshots_require_loopback_authority_and_keep_their_own_age() {
+    #[cfg(test)]
     use crate::procs::ProcessSnapshot;
     let shared = Arc::new(RwLock::new(None));
     publish_sample(

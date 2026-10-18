@@ -20,6 +20,7 @@ use serde::Serialize;
 
 /// Counters since a physical block-storage driver was instantiated, not NAND writes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 pub struct DiskMetric {
   /// Driver and whole-media registry IDs identify this connection generation.
   pub id: String,
@@ -41,6 +42,7 @@ pub struct DiskMetric {
 
 /// Health availability is separate from both I/O activity and the critical-warning value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 #[serde(rename_all = "lowercase")]
 pub enum DiskHealthState {
   Available,
@@ -51,6 +53,7 @@ pub enum DiskHealthState {
 
 /// Independently sampled health; add the containing sample's age when displaying freshness.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 pub struct DiskHealth {
   pub state: DiskHealthState,
   /// Age at completion of the I/O snapshot; `None` until health has been read successfully.
@@ -60,6 +63,7 @@ pub struct DiskHealth {
 
 /// NVMe health-log counters are lossless decimal strings, including all 128 bits.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 pub struct NvmeHealth {
   pub critical_warning: u8,
   /// Manufacturer estimate of endurance used; may exceed 100, never remaining years.

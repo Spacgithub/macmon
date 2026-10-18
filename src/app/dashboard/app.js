@@ -712,7 +712,6 @@ function update(sample) {
   disks(sample);
   cooling(metrics);
   temperatures(sample);
-  processes();
   drawCharts();
 }
 async function poll() {
@@ -747,6 +746,7 @@ async function poll() {
       update(sample);
       state.identity = identity;
     }
+    processes();
     settle();
   } catch (error) {
     if (request.signal.reason !== "hidden") {
