@@ -430,6 +430,7 @@ mod tests {
   /// WindowServer 631 as sampled.
   fn proc() -> ProcInfo {
     ProcInfo {
+      meta: Default::default(),
       pid: 631,
       name: "WindowServer".into(),
       path: EXE.into(),

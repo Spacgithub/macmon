@@ -846,6 +846,7 @@ mod tests {
     let showing = app.procs_shown.showing().unwrap();
     let procs = (0..12)
       .map(|index| ProcInfo {
+        meta: Default::default(),
         pid: 1000 + index,
         name: format!("worker{index}"),
         cpu_pct: index as f32,
@@ -949,6 +950,7 @@ mod tests {
       showing,
       (0..10)
         .map(|index| ProcInfo {
+          meta: Default::default(),
           pid: 1000 + index,
           name: format!("worker{index}"),
           cpu_pct: index as f32,

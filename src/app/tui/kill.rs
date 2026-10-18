@@ -344,6 +344,7 @@ pub(super) mod tests {
   /// WindowServer sampled with `pid`, started at the second of its pid as in `FakeSys::kill`.
   fn window_server(pid: i32) -> ProcInfo {
     ProcInfo {
+      meta: Default::default(),
       pid,
       name: "WindowServer".into(),
       path: "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer".into(),

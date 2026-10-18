@@ -442,6 +442,7 @@ mod tests {
       app.procs_shown.showing().unwrap(),
       (0..8)
         .map(|index| ProcInfo {
+          meta: Default::default(),
           pid: 100 + index,
           name: format!("worker{index}"),
           cpu_pct: index as f32,

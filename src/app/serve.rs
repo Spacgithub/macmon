@@ -254,6 +254,7 @@ fn to_sample(sample: &Sample, soc: &SocInfo, local: bool, cadence: &Cadence) -> 
     "thermal_state": sample.details.thermal_state.filter(|_| !soc.vm),
     "disks": sample.details.disks,
     "processes": processes.map(|snapshot| &snapshot.rows),
+    "process_groups": processes.map(|snapshot| &snapshot.groups),
     "processes_age_ms": processes.map(|snapshot| snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
   })
   .to_string()
@@ -864,7 +865,11 @@ mod tests {
     let instant = time.0;
     let timestamp = time.1.clone();
     thread::sleep(Duration::from_millis(25)); // Stand in for process enumeration.
-    let processes = crate::procs::ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() };
+    let processes = crate::procs::ProcessSnapshot {
+      rows: Vec::new(),
+      groups: Vec::new(),
+      sampled: Instant::now(),
+    };
     publish_sample(&shared, Metrics::default(), Vec::new(), 1000, Some(processes), time);
     let lock = shared.read().unwrap();
     let sample = lock.as_ref().unwrap();
@@ -903,7 +908,11 @@ mod tests {
   #[test]
   fn ipv6_and_available_dual_stack_connections_keep_local_processes() {
     let shared = Arc::new(RwLock::new(None));
-    let processes = crate::procs::ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() };
+    let processes = crate::procs::ProcessSnapshot {
+      rows: Vec::new(),
+      groups: Vec::new(),
+      sampled: Instant::now(),
+    };
     publish_sample(
       &shared,
       Metrics::default(),
@@ -963,6 +972,76 @@ mod tests {
   }
 
   #[test]
+  fn group_snapshot_keeps_flat_rows_totals_privacy_and_retained_identity() {
+    use crate::proc_groups::{AppIdentity, ProcMeta, groups};
+    use crate::procs::{ProcInfo, ProcSampler, ProcessSnapshot};
+    let app = AppIdentity { id: "opaque-app".into(), name: "Browser".into() };
+    let row = |pid, instance: &str, cpu, gpu, known| ProcInfo {
+      pid,
+      name: "worker".into(),
+      path: "/private/never-published/Browser.app/Contents/MacOS/worker".into(),
+      user: "private-user".into(),
+      cpu_pct: cpu,
+      gpu_pct: gpu,
+      cpu_time_ns: 20,
+      mem_bytes: 64,
+      power_w: Some(2.0),
+      started: Some((42, 0)),
+      meta: ProcMeta { instance: instance.into(), app: Some(app.clone()), known },
+    };
+    let rows = vec![
+      row(20, "opaque-one", 125.0, 0.0, (true, true)),
+      row(21, "opaque-two", 0.0, 9.0, (false, false)),
+    ];
+    let snapshot = ProcessSnapshot {
+      groups: groups(&rows),
+      rows: ProcSampler::dashboard_rows(rows),
+      sampled: Instant::now() - Duration::from_secs(5),
+    };
+    let shared = Arc::new(RwLock::new(None));
+    publish_sample(
+      &shared,
+      Metrics::default(),
+      Vec::new(),
+      1000,
+      Some(snapshot),
+      super::sample_time(),
+    );
+    let lock = shared.read().unwrap();
+    let sample = lock.as_ref().unwrap();
+    let value = |local| {
+      serde_json::from_str::<serde_json::Value>(&to_sample(
+        sample,
+        &SocInfo::default(),
+        local,
+        &Cadence::new(1000),
+      ))
+      .unwrap()
+    };
+    let local = value(true);
+    let retained = value(true);
+    assert_eq!(local["sequence"], retained["sequence"]);
+    assert_eq!(local["process_groups"], retained["process_groups"]);
+    assert!(local["processes_age_ms"].as_u64().unwrap() >= 5000);
+    assert_eq!(local["processes"][0].as_object().unwrap().len(), 5);
+    let group = &local["process_groups"][0];
+    assert_eq!(group["kind"], "application");
+    assert_eq!(group["members"].as_array().unwrap().len(), 2);
+    assert_eq!((group["cpu_pct"].as_f64(), group["gpu_pct"].as_f64()), (Some(125.0), Some(0.0)));
+    assert_eq!((group["cpu_known"].as_u64(), group["gpu_known"].as_u64()), (Some(1), Some(1)));
+    assert_eq!(group["mem_bytes"], 128);
+    assert!(local["processes"][1]["cpu_pct"].is_null());
+    assert!(local["processes"][1]["gpu_pct"].is_null());
+    let serialized = local.to_string();
+    for private in ["/private/never-published", "private-user", "power_known", "cpu_time_ns"] {
+      assert!(!serialized.contains(private), "{private}");
+    }
+    let remote = value(false);
+    assert!(remote["process_groups"].is_null() && remote["processes"].is_null());
+    assert!(remote["processes_age_ms"].is_null());
+  }
+
+  #[test]
   fn process_snapshots_require_loopback_authority_and_keep_their_own_age() {
     use crate::procs::ProcessSnapshot;
     let shared = Arc::new(RwLock::new(None));
@@ -971,7 +1050,11 @@ mod tests {
       Metrics::default(),
       Vec::new(),
       1000,
-      Some(ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() - Duration::from_secs(5) }),
+      Some(ProcessSnapshot {
+        rows: Vec::new(),
+        groups: Vec::new(),
+        sampled: Instant::now() - Duration::from_secs(5),
+      }),
       super::sample_time(),
     );
     for (authority, allowed) in [
@@ -1007,6 +1090,7 @@ mod tests {
       }
       let json: serde_json::Value = serde_json::from_str(body(&response)).unwrap();
       assert_eq!(json["processes"].is_array(), allowed, "{authority}");
+      assert_eq!(json["process_groups"].is_array(), allowed, "{authority}");
       if allowed {
         assert!(json["processes_age_ms"].as_u64().unwrap() >= 5000);
       } else {
@@ -1023,8 +1107,10 @@ mod tests {
     ))
     .unwrap();
     assert!(remote["processes"].is_null() && remote["processes_age_ms"].is_null());
+    assert!(remote["process_groups"].is_null());
     let old: serde_json::Value = serde_json::from_str(body(&get(&shared, "/json"))).unwrap();
     assert!(old.get("processes").is_none() && old.get("processes_age_ms").is_none());
+    assert!(old.get("process_groups").is_none());
     assert_eq!(
       body(&get(&shared, "/metrics")),
       to_prometheus(&Metrics::default(), &SocInfo::default())
@@ -1259,7 +1345,11 @@ mod tests {
           Metrics::default(),
           Vec::new(),
           interval,
-          Some(crate::procs::ProcessSnapshot { rows: Vec::new(), sampled: Instant::now() }),
+          Some(crate::procs::ProcessSnapshot {
+            rows: Vec::new(),
+            groups: Vec::new(),
+            sampled: Instant::now(),
+          }),
           time,
         );
         event_tx.send((interval, true, started.elapsed())).unwrap();

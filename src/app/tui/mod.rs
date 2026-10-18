@@ -1617,6 +1617,7 @@ mod tests {
   /// Processes that all have a power reading, without readable paths.
   fn test_procs() -> Vec<ProcInfo> {
     let proc = |pid: i32, name: &str| ProcInfo {
+      meta: Default::default(),
       pid,
       name: name.to_string(),
       path: String::new(),
@@ -1644,6 +1645,7 @@ mod tests {
       _ => format!("/Applications/{name}.app/Contents/MacOS/{name}"),
     };
     let proc = |pid: i32, name: &str, cpu, secs: u64, mem_mb: u64, power_w, gpu_pct| ProcInfo {
+      meta: Default::default(),
       pid,
       name: name.to_string(),
       path: path(name),
@@ -1684,6 +1686,7 @@ mod tests {
   /// fit in a 200x50 window.
   fn hundred_procs_app() -> App {
     let procs = (0..100).map(|i| ProcInfo {
+      meta: Default::default(),
       pid: 1000 + i,
       name: format!("proc{i}"),
       ..test_procs()[0].clone()
