@@ -312,6 +312,17 @@ impl App {
     !self.panels.fullscreen && self.cfg.panel_details.iter().all(|detail| *detail)
   }
 
+  pub(super) fn legacy_grouped_summary(&self) -> bool {
+    self.panels_legacy()
+      && self.proc_view.grouped
+      && self.proc_view.row_count() > 0
+      && self
+        .legacy_layout(self.screen_area)
+        .0
+        .proc
+        .is_some_and(|rect| (4..6).contains(&rect.height) && rect.width >= 9)
+  }
+
   fn panel_areas(&self, area: Rect) -> Vec<(Panel, Rect)> {
     let body =
       if area.height >= 3 { Rect { y: area.y + 1, height: area.height - 2, ..area } } else { area };
@@ -432,7 +443,7 @@ impl App {
       | KeyCode::Home
       | KeyCode::End => {
         if self.panels.focus == Panel::Processes {
-          if !self.panels_legacy() && !self.panels.fullscreen {
+          if !self.panels.fullscreen && (!self.panels_legacy() || self.legacy_grouped_summary()) {
             self.panels.fullscreen = true;
           }
           return false;
@@ -466,10 +477,19 @@ impl App {
       })
     {
       // Advanced details and compact process summaries select without changing density/layout.
+      let &(panel, area) =
+        self.panels.targets.iter().find(|(_, area)| area.contains(point)).unwrap();
       if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-        self.panels.focus =
-          self.panels.targets.iter().find(|(_, area)| area.contains(point)).unwrap().0;
+        self.panels.focus = panel;
         self.proc_view.end_typing();
+      }
+      if panel == Panel::Processes
+        && self.proc_view.summary_targets()
+        && mouse.row > area.y
+        && mouse.row < area.bottom() - 1
+      {
+        self.panels.focus = panel;
+        return false;
       }
       return true;
     }

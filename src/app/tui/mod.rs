@@ -672,7 +672,7 @@ impl App {
     if self.procs_visible()
       && self.panels.focus == Panel::Processes
       && key.code == KeyCode::Right
-      && self.proc_view.summary_targets()
+      && (self.proc_view.summary_targets() || self.legacy_grouped_summary())
       && self.proc_view.selected_application()
     {
       self.panels.fullscreen = true;
@@ -3078,6 +3078,133 @@ mod tests {
     assert!(app.panels.fullscreen);
     assert_eq!(app.cfg.panel_details, [false; 6]);
     assert_eq!(app.procs_shown.showing(), showing);
+  }
+
+  fn legacy_group_summary(rows: u16, native: bool) -> (App, FakeSys, Rect) {
+    let (mut app, fake) = info_app();
+    let _ = press(&mut app, KeyCode::Esc);
+    let mut procs = varied_procs();
+    for proc in &mut procs {
+      proc.meta.instance = format!("instance-{}", proc.pid);
+      proc.meta.known = (true, true);
+      if proc.pid > 100 {
+        proc.meta.app = Some(crate::proc_groups::AppIdentity {
+          id: "example-app".into(),
+          name: "Example App".into(),
+        });
+      }
+    }
+    app.update_metrics(Metrics {
+      fans: ["fan0", "fan1"]
+        .map(|name| FanMetric { name: name.into(), rpm: 1800, max_rpm: None })
+        .into(),
+      ..test_metrics()
+    });
+    app.cell_pixels = Some((9, 18));
+    app.capabilities = native.then_some(Capabilities {
+      foreground: [230; 3],
+      background: [20; 3],
+      accent: None,
+      cell_pixels: (9, 18),
+    });
+    put_procs(&mut app, procs);
+    let _ = app.handle_key(key('g'));
+    let height = if rows == 3 { 24 } else { 24 + rows + u16::from(native) };
+    let buf = render_buffer(&mut app, 80, height);
+    let process = app.layout(buf.area).proc.unwrap();
+    assert_eq!(process.height, rows, "native={native}, height={height}");
+    assert_eq!(app.placements.len(), 2);
+    assert!(app.panels_legacy());
+    (app, fake, process)
+  }
+
+  #[test]
+  fn legacy_group_summary_navigation_enters_full_without_inheriting_hidden_actions() {
+    for native in [false, true] {
+      for rows in [4, 5] {
+        for code in [
+          KeyCode::Up,
+          KeyCode::Down,
+          KeyCode::PageUp,
+          KeyCode::PageDown,
+          KeyCode::Home,
+          KeyCode::End,
+          KeyCode::Right,
+        ] {
+          let (mut app, fake, process) = legacy_group_summary(rows, native);
+          let choices = (app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs);
+          let showing = app.procs_shown.showing();
+          let _ = app.handle_key(key('f'));
+          let _ = press(&mut app, KeyCode::Down);
+          let _ = press(&mut app, KeyCode::Right);
+          let _ = press(&mut app, KeyCode::Down);
+          assert_eq!(app.proc_view.selected_pid(), Some(631));
+          render_buffer(&mut app, 80, process.bottom());
+          let _ = app.handle_key(key('f'));
+          assert!(app.proc_view.selected_application());
+          for action in ['i', 'e', 'c', 'k'] {
+            let _ = app.handle_key(key(action));
+          }
+          assert!(app.info.is_none() && !app.kill.is_open() && fake.calls().is_empty());
+          // No frame after f: navigation must inspect current geometry, not old full targets.
+          let _ = press(&mut app, code);
+          assert!(app.panels.fullscreen, "rows={rows}, native={native}, key={code:?}");
+          if code == KeyCode::Down {
+            assert_eq!(app.proc_view.selected_pid(), Some(631));
+          }
+          assert_eq!((app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs), choices);
+          assert_eq!(app.procs_shown.showing(), showing);
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn legacy_group_summary_mouse_reaches_rows_headers_and_full_scroll_but_keeps_empty_raw_routes() {
+    for native in [false, true] {
+      for rows in [3, 4, 5] {
+        let (mut app, fake, process) = legacy_group_summary(rows, native);
+        let height = process.bottom();
+        let showing = app.procs_shown.showing();
+        let choices = (app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs);
+        let disk = app.legacy_layout(Rect::new(0, 0, 80, height)).2.unwrap();
+        click(&mut app, disk.x + 2, disk.y + 1);
+        assert_eq!(app.panels.focus, Panel::Disk);
+        click(&mut app, process.x + 12, process.y + 2);
+        assert_eq!(app.panels.focus, Panel::Processes);
+        assert_eq!(app.proc_view.selected_application(), rows > 3);
+        assert!(app.panels_legacy());
+        for action in ['i', 'e', 'c', 'k'] {
+          let _ = app.handle_key(key(action));
+        }
+        assert!(app.info.is_none() && !app.kill.is_open() && fake.calls().is_empty());
+        if rows > 3 {
+          let buf = render_buffer(&mut app, 80, height);
+          let header = row(&buf, process.y + 1);
+          click(&mut app, x_of(&header, "MEM"), process.y + 1);
+          assert_eq!(app.cfg.proc_sort, ProcSort::Mem);
+          assert!(!app.panels.fullscreen);
+        }
+        for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+          render_buffer(&mut app, 80, height);
+          app.handle_mouse(mouse(kind, process.x + 12, process.y + 1));
+          assert_eq!(app.panels.fullscreen, rows > 3, "rows={rows}, native={native}");
+          if rows > 3 {
+            let _ = app.handle_key(key('f'));
+          }
+        }
+        assert_eq!((app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs), choices);
+        assert_eq!(app.procs_shown.showing(), showing);
+        let _ = app.handle_key(key('g'));
+        render_buffer(&mut app, 80, height);
+        let sort = app.cfg.proc_sort;
+        click(&mut app, process.x + 12, process.y + 1);
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, process.x + 12, process.y + 1));
+        let _ = press(&mut app, KeyCode::Down);
+        assert!(!app.panels.fullscreen && app.panels_legacy());
+        assert_eq!(app.cfg.proc_sort, sort);
+      }
+    }
   }
 
   #[test]
