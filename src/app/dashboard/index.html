@@ -139,13 +139,15 @@
     </section>
     </div>
     <section class="panel processes" aria-labelledby="process-title">
-      <div class="panel-head"><div><p class="eyebrow" id="process-count">PROCESS TELEMETRY</p><h2 id="process-title">Processes</h2></div>
-        <div class="panel-actions"><label class="motion">Sort by <select id="process-sort"><option value="cpu_pct">CPU usage</option><option value="gpu_pct">GPU usage</option><option value="mem_bytes">Memory</option></select></label><button id="process-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="process-details" aria-label="Show process details">Details</button></div></div>
+      <div class="panel-head"><div><p class="eyebrow" id="process-count">PROCESS TELEMETRY</p><h2 id="process-title">Applications &amp; processes</h2></div><button id="process-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="process-details" aria-label="Show process details">Details</button></div>
+      <div class="process-controls"><label class="motion">View <select id="process-view"><option value="grouped">Applications</option><option value="raw">Processes</option></select></label><label class="motion">Sort by <select id="process-sort"><option value="cpu_pct">CPU usage</option><option value="gpu_pct">GPU usage</option><option value="mem_bytes">Memory</option></select></label><label class="motion process-filter">Filter <input id="process-filter" type="search" maxlength="128" placeholder="Name or PID" aria-label="Filter application or process names and PIDs"></label></div>
+      <p class="muted table-note" id="process-view-status">Waiting for application grouping</p>
       <p class="muted" id="process-status">Waiting for a sample</p><p class="muted" id="process-empty">Waiting for a sample</p>
       <p class="muted table-note" id="process-scope">Top 5 processes in the selected order.</p>
+      <p class="muted table-note" id="process-notes" hidden>Totals include every member, even hidden matches. ≥ marks partial readings. GPU totals are not device utilization. Memory sums process readings; shared pages can be counted twice.</p>
       <div id="process-details" class="process-scroll" tabindex="0" role="region" aria-label="Processes; expand details to see all" data-expanded="false">
-        <table id="process-table" hidden><caption class="sr-only">Process name and PID, CPU percent (100% is one core), GPU percent and memory; unavailable rates shown as a dash</caption>
-          <thead><tr><th scope="col">Process / PID</th><th scope="col">CPU %</th><th scope="col">GPU %</th><th scope="col">Memory</th></tr></thead><tbody id="process-rows"></tbody>
+        <table id="process-table" hidden><caption class="sr-only">Application totals and individual process names and PIDs, CPU percent (100% is one core), GPU process shares and summed memory; missing readings show Unavailable and partial totals show a lower bound with the number known</caption>
+          <thead id="process-head"><tr><th scope="col">Application / process</th><th scope="col">CPU %</th><th scope="col">GPU %</th><th scope="col">Memory</th></tr></thead><tbody id="process-rows"></tbody>
         </table>
       </div>
     </section>

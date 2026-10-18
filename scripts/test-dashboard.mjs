@@ -27,6 +27,9 @@ class Element extends Target {
   get clientWidth() { return this.visible ? this._width : 0; }
   get clientHeight() { return this.visible ? this._height : 0; }
   get visible() { return !this.hidden && (!this.parentElement || this.parentElement.visible); }
+  getBoundingClientRect() { return { top: 0, bottom: this.clientHeight, height: this.clientHeight, width: this.clientWidth }; }
+  contains(target) { for (let node = target; node; node = node.parentElement) if (node === this) return true; return false; }
+  get nextElementSibling() { return this.parentElement?.children[this.parentElement.children.indexOf(this) + 1] || null; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   getAttribute(name) { return this.attributes.get(name) ?? null; }
   focus() { this.ownerDocument.activeElement = this; }
@@ -41,6 +44,12 @@ class Element extends Target {
       this.children.push(node);
     }
   }
+  insertBefore(node, reference) {
+    if (node === reference) return;
+    assert.ok(reference === null || this.children.includes(reference), 'insertBefore reference must be a child');
+    node.remove(); node.parentElement = this;
+    this.children.splice(reference === null ? this.children.length : this.children.indexOf(reference), 0, node);
+  }
   replaceChildren(...nodes) {
     for (const child of this.children) child.parentElement = null;
     this.children = [];
@@ -48,6 +57,7 @@ class Element extends Target {
     this.append(...nodes);
   }
   remove() {
+    if (this.ownerDocument && this.contains(this.ownerDocument.activeElement)) this.ownerDocument.activeElement = this.ownerDocument.documentElement;
     if (this.parentElement) this.parentElement.children = this.parentElement.children.filter((node) => node !== this);
     this.parentElement = null;
   }
@@ -105,7 +115,11 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
   const timers = new Map(), frames = new Map(), requests = [], elements = new Map();
   const document = new Target();
   Object.assign(document, { hidden: false, activeElement: null, documentElement: new Element('root'),
-    getElementById(id) { assert.ok(elements.has(id), `Unknown DOM id: ${id}`); return elements.get(id); },
+    getElementById(id) {
+      const find = (node) => node.getAttribute('id') === id ? node : node.children.map(find).find(Boolean);
+      const element = elements.get(id) || find(this.documentElement);
+      assert.ok(element, `Unknown DOM id: ${id}`); return element;
+    },
     createElement(tag) { const element = new Element(tag); element.ownerDocument = document; return element; } });
   const stack = [document.documentElement];
   for (const token of html.matchAll(/<\/?([a-z][\w-]*)\b([^>]*?)>|([^<]+)/gi)) {
@@ -237,8 +251,27 @@ function computeFixture(labels = ['E', 'P'], count = 2) {
     cores: Array.from({ length: count }, (_, i) => ({ die_id: Math.floor(i / 12), core_id: i % 12, freq_mhz: 1200, active_ratio: 0.4, scaled_ratio: 0.2 })) }));
   return data;
 }
-function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, temperatures, memory_activity, thermal_state, disks } = {}) {
-  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, temperatures, memory_activity, thermal_state, disks };
+function processFixture(count = 2, members = 3) {
+  const processes = [], process_groups = [];
+  for (let group = 0; group < count; group++) {
+    const rows = Array.from({ length: members }, (_, i) => ({ pid: group * 100 + i + 1, name: i ? `Worker ${group}-${i}` : `Test App ${group}`,
+      cpu_pct: group * 10 + i, gpu_pct: i ? null : 0, mem_bytes: 1024 * (i + 1) }));
+    processes.push(...rows);
+    process_groups.push({ id: `app/${group}`, name: `Test App ${group}`, kind: 'application', members: rows.map((row) => ({ pid: row.pid, instance: `birth-${row.pid}` })),
+      cpu_pct: rows.reduce((sum, row) => sum + row.cpu_pct, 0), gpu_pct: 0, cpu_known: members, gpu_known: 1, mem_bytes: rows.reduce((sum, row) => sum + row.mem_bytes, 0) });
+  }
+  return { processes, process_groups, processes_age_ms: 0 };
+}
+const processGroups = (h) => h.elements.get('process-rows').children.filter((row) => row.querySelector('.process-group-button'));
+const processRoots = (h) => h.elements.get('process-rows').children.filter((row) => row.className !== 'process-members-row');
+const processName = (row) => (row.querySelector('.process-group-button')?.children[1] || row.children[0].children[0]).textContent;
+const processNamed = (h, name) => processRoots(h).find((row) => processName(row) === name);
+const processGroupDetail = (h, row) => h.document.getElementById(row.querySelector('.process-group-button').getAttribute('aria-controls'));
+const groupMembers = (h, row) => processGroupDetail(h, row).querySelector('.process-members-table')?.children.find((node) => node.tagName === 'TBODY').children || [];
+async function toggleProcessGroup(h, row) { row.querySelector('.process-group-button').emit('click'); await drainMicrotasks(); }
+async function processControl(h, id, value, event = 'change') { h.elements.get(id).value = value; h.elements.get(id).emit(event); await drainMicrotasks(); }
+function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, process_groups, temperatures, memory_activity, thermal_state, disks } = {}) {
+  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, process_groups, temperatures, memory_activity, thermal_state, disks };
 }
 function nvme(overrides = {}) {
   return { critical_warning: 0, percentage_used: 5, available_spare_percent: 100, spare_threshold_percent: 10,
@@ -537,11 +570,11 @@ await check('all processes sort by real usage with missing rates last and safe n
   assert.equal(rows().length, 80); assert.equal(h.elements.get('process-table').hidden, false);
   assert.equal(rows()[0].children[1].textContent, '237.0%', 'per-core CPU may exceed 100%');
   assert.equal(rows().at(-1).children[0].textContent, `${name}PID 1`);
-  assert.equal(rows().at(-1).children[1].textContent, '—');
+  assert.equal(rows().at(-1).children[1].textContent, 'Unavailable');
   const requests = h.requests.length;
   h.elements.get('process-sort').value = 'gpu_pct'; h.elements.get('process-sort').emit('change');
   assert.equal(rows()[0].children[0].textContent, 'process78PID 79');
-  assert.equal(rows().at(-1).children[2].textContent, '—');
+  assert.equal(rows().at(-1).children[2].textContent, 'Unavailable');
   h.elements.get('process-sort').value = 'mem_bytes'; h.elements.get('process-sort').emit('change');
   assert.equal(rows()[0].children[0].textContent, `${name}PID 1`);
   assert.equal(h.requests.length, requests, 'sorting does not request or resample');
@@ -563,6 +596,239 @@ await check('process snapshots distinguish local-only, empty, stale and retained
   assert.match(h.text('process-status'), /^OFFLINE \/ retained/);
   await nextPoll(h); await h.answer(sample(), 503);
   assert.match(h.text('process-status'), /^WAITING \/ retained/);
+});
+
+await check('application view defaults safely, persists only the chosen mode and falls back for old services', async () => {
+  const storage = new Map(), data = processFixture(), h = boot({ storage });
+  await h.answer(sample(data));
+  assert.equal(h.elements.get('process-view').value, 'grouped');
+  assert.equal(processGroups(h).length, 2); assert.match(h.text('process-count'), /2 GROUPS \/ 6 PROCESSES/);
+  await toggleProcessGroup(h, processGroups(h)[0]);
+  await processControl(h, 'process-view', 'raw');
+  assert.equal(processGroups(h).length, 0); assert.equal(processRoots(h).length, 6);
+  assert.equal(storage.get('macmon.process-view.v1'), 'raw');
+  const next = boot({ storage }); await next.answer(sample(data));
+  assert.equal(next.elements.get('process-view').value, 'raw');
+  await processControl(next, 'process-view', 'grouped');
+  assert.ok(processGroups(next).every((row) => row.querySelector('.process-group-button').getAttribute('aria-expanded') === 'false'), 'Member expansion is not persisted');
+  for (const invalid of ['applications', '"raw"', '{}', 'false']) {
+    const bad = boot({ storage: new Map([['macmon.process-view.v1', invalid]]) }); await bad.answer(sample(data));
+    assert.equal(processGroups(bad).length, 2);
+  }
+  const denied = boot({ storageFailure: true }); await denied.answer(sample(data));
+  await processControl(denied, 'process-view', 'raw'); assert.equal(processRoots(denied).length, 6);
+  for (const process_groups of [undefined, null]) {
+    const old = boot(); await old.answer(sample({ ...data, process_groups }));
+    assert.equal(processGroups(old).length, 0); assert.equal(processRoots(old).length, 6);
+    assert.match(old.text('process-view-status'), /grouping unavailable; showing raw/);
+  }
+  const empty = boot(); await empty.answer(sample({ processes: [], process_groups: [], processes_age_ms: 0 }));
+  assert.match(empty.text('process-count'), /0 GROUPS \/ 0 PROCESSES/);
+  assert.match(empty.text('process-empty'), /No application groups/);
+});
+
+await check('malformed, duplicate or incomplete application membership falls back without guessing', async () => {
+  const mutations = [
+    (data) => { data.process_groups[0].kind = 'invented'; },
+    (data) => { data.process_groups[0].id = ''; },
+    (data) => { data.process_groups[0].name = '\u0000bad'; },
+    (data) => { data.process_groups[1].id = data.process_groups[0].id; },
+    (data) => { data.process_groups[0].members[0].pid = 999999; },
+    (data) => { data.process_groups[1].members[0] = data.process_groups[0].members[0]; },
+    (data) => { data.process_groups[0].members[0].instance = ''; },
+    (data) => { data.process_groups[0].members.pop(); },
+    (data) => { data.process_groups[0].cpu_known = 4; },
+    (data) => { data.process_groups[0].gpu_known = -1; },
+    (data) => { data.process_groups[0].kind = 'process'; },
+  ];
+  for (const mutate of mutations) {
+    const data = processFixture(), h = boot(); mutate(data); await h.answer(sample(data));
+    assert.equal(processGroups(h).length, 0); assert.equal(processRoots(h).length, 6);
+    assert.match(h.text('process-view-status'), /grouping unavailable/);
+  }
+});
+
+await check('standalone roots show their real PID directly and use group known flags', async () => {
+  const data = processFixture(2, 1), h = boot();
+  Object.assign(data.process_groups[0], { kind: 'process', cpu_pct: 0, cpu_known: 0, gpu_pct: 0, gpu_known: 1 });
+  data.processes[0].cpu_pct = 99;
+  await h.answer(sample(data));
+  const row = processNamed(h, 'Test App 0');
+  assert.equal(processGroups(h).length, 1); assert.equal(processRoots(h).length, 2);
+  assert.equal(row.querySelector('.process-group-button'), null);
+  assert.equal(row.children[0].textContent, 'Test App 0PID 1');
+  assert.match(row.children[1].textContent, /^Unavailable/); assert.equal(row.children[2].textContent, '0.0%');
+  await h.click('expand-all');
+  assert.equal(processRoots(h).length, 2); assert.equal(h.elements.get('process-rows').children.length, 3, 'No extra self-member row for a standalone process');
+  await processControl(h, 'process-view', 'raw');
+  assert.equal(processNamed(h, 'Test App 0').children[1].textContent, '99.0%', 'Raw mode retains the old per-process reading');
+});
+
+await check('summary counts roots, application expansion is independent of panel and global controls', async () => {
+  const h = boot(); await h.answer(sample(processFixture(8, 12)));
+  const roots = processGroups(h), first = roots[0], second = roots[1];
+  assert.equal(roots.filter((row) => row.visible).length, 5);
+  assert.match(h.text('process-scope'), /Top 5 of 8 groups/);
+  assert.equal(first.querySelector('.process-group-button').tagName, 'BUTTON');
+  assert.equal(first.querySelector('.process-group-button').getAttribute('type'), 'button');
+  await toggleProcessGroup(h, first);
+  assert.equal(h.state().details.process, true); assert.equal(h.state().details.cpu, false);
+  assert.equal(roots.filter((row) => row.visible).length, 8); assert.equal(groupMembers(h, first).length, 12);
+  assert.equal(first.querySelector('.process-group-button').getAttribute('aria-expanded'), 'true');
+  assert.equal(second.querySelector('.process-group-button').getAttribute('aria-expanded'), 'false');
+  assert.equal(processGroupDetail(h, first).visible, true);
+  await h.click('collapse-all'); assert.equal(processGroupDetail(h, first).visible, false);
+  await h.click('expand-all');
+  assert.equal(processGroupDetail(h, first).visible, true);
+  assert.ok(roots.slice(1).every((row) => row.querySelector('.process-group-button').getAttribute('aria-expanded') === 'false'), 'Global details never expand all application members');
+  await toggleProcessGroup(h, first); assert.equal(processGroupDetail(h, first).visible, false);
+});
+
+await check('authoritative totals preserve partial zero, CPU above 100 and safe integer memory', async () => {
+  const data = processFixture(3), h = boot({ expanded: true });
+  Object.assign(data.process_groups[0], { cpu_pct: 325.5, gpu_pct: 0, gpu_known: 1, mem_bytes: Number.MAX_SAFE_INTEGER + 1 });
+  Object.assign(data.process_groups[1], { cpu_pct: 0, cpu_known: 1, gpu_pct: 700, gpu_known: 3, mem_bytes: 0 });
+  Object.assign(data.process_groups[2], { cpu_pct: 999, cpu_known: 0, gpu_pct: null, gpu_known: 0 });
+  data.processes[0].mem_bytes = Number.MAX_SAFE_INTEGER + 1;
+  await h.answer(sample(data));
+  const high = processNamed(h, 'Test App 0'), zero = processNamed(h, 'Test App 1'), unknown = processNamed(h, 'Test App 2');
+  assert.equal(high.children[1].textContent, '325.5%'); assert.equal(high.children[2].textContent, '≥0.0%1/3 known');
+  assert.equal(high.children[3].textContent, 'Unavailable');
+  assert.equal(zero.children[1].textContent, '≥0.0%1/3 known'); assert.equal(zero.children[2].textContent, '700.0%'); assert.equal(zero.children[3].textContent, '0 B');
+  assert.equal(unknown.children[1].textContent, 'Unavailable0/3 known'); assert.equal(unknown.children[2].textContent, 'Unavailable0/3 known');
+  await toggleProcessGroup(h, high);
+  assert.equal(groupMembers(h, high).find((row) => processName(row) === 'Test App 0').children[3].textContent, 'Unavailable');
+  assert.match(h.text('process-notes'), /not device utilization/); assert.match(h.text('process-notes'), /shared pages/);
+});
+
+await check('invalid group readings remain unavailable instead of becoming measured zero', async () => {
+  for (const invalid of [null, -1, '12', NaN, Infinity]) {
+    const data = processFixture(1, 1), h = boot();
+    Object.assign(data.process_groups[0], { cpu_pct: invalid, gpu_pct: invalid, mem_bytes: invalid });
+    await h.answer(sample(data));
+    assert.deepEqual(processRoots(h)[0].children.slice(1).map((cell) => cell.textContent), ['Unavailable', 'Unavailable', 'Unavailable']);
+  }
+});
+
+await check('filtering groups and child names or PIDs never changes whole-application totals', async () => {
+  const data = processFixture(2, 5), h = boot(); data.process_groups[0].cpu_pct = 900;
+  await h.answer(sample(data)); const app = processNamed(h, 'Test App 0'); await toggleProcessGroup(h, app);
+  const requests = h.requests.length;
+  await processControl(h, 'process-filter', 'TEST APP 0', 'input');
+  assert.equal(processRoots(h).length, 1); assert.equal(groupMembers(h, app).length, 5);
+  await processControl(h, 'process-filter', 'Worker 0-3', 'input');
+  assert.equal(groupMembers(h, app).length, 1); assert.equal(processName(groupMembers(h, app)[0]), 'Worker 0-3');
+  assert.match(app.children[0].textContent, /Application total \/ 1\/5 matching/); assert.equal(app.children[1].textContent, '900.0%');
+  await processControl(h, 'process-filter', '4', 'input');
+  assert.ok(groupMembers(h, app).some((row) => row.children[0].textContent.includes('PID 4')));
+  await processControl(h, 'process-filter', '[.*]', 'input');
+  assert.equal(processRoots(h).length, 0); assert.match(h.text('process-empty'), /No entries match/);
+  await processControl(h, 'process-filter', 'x'.repeat(128) + 'Test App 0', 'input'); assert.equal(processRoots(h).length, 0);
+  await processControl(h, 'process-filter', '', 'input');
+  assert.equal(processGroupDetail(h, app).visible, true); assert.equal(groupMembers(h, app).length, 5);
+  assert.equal(h.requests.length, requests, 'Filtering and expansion do not resample');
+});
+
+await check('equal totals prefer complete knowledge then deterministic names and identities', async () => {
+  const data = processFixture(5, 2), h = boot({ expanded: true });
+  data.process_groups.forEach((group) => Object.assign(group, { cpu_pct: 0, cpu_known: 1 }));
+  Object.assign(data.process_groups[1], { name: 'Z full', cpu_known: 2 });
+  Object.assign(data.process_groups[2], { name: 'A unknown', cpu_pct: 999, cpu_known: 0 });
+  Object.assign(data.process_groups[3], { name: 'A full', cpu_known: 2 });
+  Object.assign(data.process_groups[4], { name: 'A partial' });
+  await h.answer(sample(data));
+  assert.deepEqual(processGroups(h).map(processName), ['A full', 'Z full', 'A partial', 'Test App 0', 'A unknown']);
+  await toggleProcessGroup(h, processNamed(h, 'A full'));
+  assert.deepEqual(groupMembers(h, processNamed(h, 'A full')).map((row) => row.children[0].textContent), ['Worker 3-1PID 302', 'Test App 3PID 301']);
+  const previous = processNamed(h, 'Z full');
+  data.process_groups[1].name = data.process_groups[3].name = 'Same';
+  await nextPoll(h); await h.answer(sample({ ...data, sequence: 2 }));
+  assert.equal(processGroups(h)[0], previous, 'Equal names use the opaque ID as a stable final tie');
+  data.process_groups.forEach((group) => Object.assign(group, { gpu_pct: 0, gpu_known: 1 }));
+  data.process_groups[1].gpu_known = 2; data.process_groups[2].gpu_known = 0; data.process_groups[2].gpu_pct = 999; data.process_groups[3].gpu_known = 2;
+  await nextPoll(h); await h.answer(sample({ ...data, sequence: 3 })); await processControl(h, 'process-sort', 'gpu_pct');
+  assert.equal(processGroups(h)[0], previous); assert.equal(processName(processGroups(h).at(-1)), 'A unknown', 'Unknown GPU shares sort after measured zero');
+});
+
+await check('all group members remain reachable with literal names and internally generated control IDs', async () => {
+  const data = processFixture(1, 81), h = boot(), malicious = '<img onerror="globalThis.pwned=1">';
+  data.process_groups[0].id = '</button><script>globalThis.pwned=2</script>';
+  data.process_groups[0].name = malicious; data.processes[0].name = malicious;
+  await h.answer(sample(data)); const app = processGroups(h)[0]; await toggleProcessGroup(h, app);
+  assert.equal(processName(app), malicious); assert.equal(groupMembers(h, app).length, 81);
+  assert.ok(groupMembers(h, app).every((row) => row.visible));
+  assert.match(app.querySelector('.process-group-button').getAttribute('aria-controls'), /^process-members-\d+$/);
+  assert.ok(groupMembers(h, app).some((row) => processName(row) === malicious)); assert.equal(h.inspect('globalThis.pwned'), undefined);
+  assert.equal(h.elements.get('process-details').getAttribute('tabindex'), '0');
+  assert.ok(groupMembers(h, app).every((row) => row.children.map((cell) => cell.dataset.label).join('|') === 'Application / process|CPU %|GPU %|Memory'));
+});
+
+await check('refresh keeps group buttons, member rows, focused controls and manual expansion stable', async () => {
+  const data = processFixture(2), h = boot(); await h.answer(sample(data));
+  const app = processNamed(h, 'Test App 0'), button = app.querySelector('.process-group-button'), view = h.elements.get('process-view'), filter = h.elements.get('process-filter');
+  await toggleProcessGroup(h, app); const members = groupMembers(h, app).slice(); button.focus();
+  data.process_groups[0].cpu_pct = 999;
+  await nextPoll(h); await h.answer(sample({ ...data, sequence: 2 }));
+  assert.equal(processGroups(h)[0], app); assert.equal(app.querySelector('.process-group-button'), button); assert.equal(h.document.activeElement, button);
+  assert.ok(members.every((row) => groupMembers(h, app).includes(row)), 'Member nodes survive changing totals');
+  view.focus(); await nextPoll(h); await h.answer(sample({ ...data, sequence: 3 }));
+  assert.equal(h.document.activeElement, view); assert.equal(h.elements.get('process-view'), view); assert.equal(h.elements.get('process-filter'), filter);
+  await processControl(h, 'process-view', 'raw'); await processControl(h, 'process-view', 'grouped');
+  assert.equal(processGroupDetail(h, app).visible, true);
+});
+
+await check('refresh anchors the top visible process identity rather than retaining only scrollTop', async () => {
+  const h = boot({ expanded: true }), processes = Array.from({ length: 10 }, (_, i) => ({ pid: i + 1, name: `row ${i}`, cpu_pct: 100 - i, mem_bytes: 1 }));
+  await h.answer(sample({ processes, processes_age_ms: 0 }));
+  const scroll = h.elements.get('process-details'), body = h.elements.get('process-rows');
+  scroll.getBoundingClientRect = () => ({ top: 100, bottom: 400, height: 300 });
+  h.elements.get('process-head').getBoundingClientRect = () => ({ height: 30 });
+  for (const row of body.children) row.getBoundingClientRect = () => {
+    const top = 130 + body.children.indexOf(row) * 30 - scroll.scrollTop; return { top, bottom: top + 30, height: 30 };
+  };
+  scroll.scrollTop = 45; const anchor = body.children[1], before = anchor.getBoundingClientRect().top;
+  processes[1].cpu_pct = 95.5;
+  await nextPoll(h); await h.answer(sample({ sequence: 2, processes, processes_age_ms: 0 }));
+  assert.equal(body.children[4], anchor); assert.equal(scroll.scrollTop, 135);
+  assert.equal(anchor.getBoundingClientRect().top, before, 'The same visible row stays at the same relative offset');
+  await processControl(h, 'process-sort', 'mem_bytes'); assert.equal(scroll.scrollTop, 0, 'Intentional ordering controls reset to the top');
+});
+
+await check('a focused compact root that falls below the top five returns focus to its keyboard scroll region', async () => {
+  const data = processFixture(8, 1), h = boot(); await h.answer(sample(data));
+  const row = processGroups(h)[0], button = row.querySelector('.process-group-button'); button.focus();
+  data.process_groups[7].cpu_pct = 0;
+  await nextPoll(h); await h.answer(sample({ ...data, sequence: 2 }));
+  assert.equal(row.hidden, true); assert.equal(h.document.activeElement, h.elements.get('process-details'));
+  assert.equal(processRoots(h).filter((item) => item.visible).length, 5); assert.equal(h.state().details.process, false);
+  await h.click('process-toggle'); assert.equal(processGroups(h).find((item) => item === row), row);
+});
+
+await check('PID reuse replaces member identity, successful departures clear expansion, offline does not', async () => {
+  const data = processFixture(2), h = boot(); await h.answer(sample(data));
+  const app = processNamed(h, 'Test App 0'); await toggleProcessGroup(h, app);
+  const before = groupMembers(h, app).find((row) => processName(row) === 'Test App 0');
+  data.process_groups[0].members[0].instance = 'new-birth';
+  await nextPoll(h); await h.answer(sample({ ...data, sequence: 2 }));
+  assert.notEqual(groupMembers(h, app).find((row) => processName(row) === 'Test App 0'), before);
+  await nextPoll(h); await h.fail(); assert.equal(processGroupDetail(h, app).visible, true);
+  await nextPoll(h); await h.answer(sample(), 503); assert.equal(processGroupDetail(h, app).visible, true);
+  await nextPoll(h); await h.answer(sample({ ...data, sequence: 3 })); assert.equal(processGroupDetail(h, app).visible, true);
+  const remaining = { processes: data.processes.slice(3), process_groups: data.process_groups.slice(1), processes_age_ms: 0 };
+  await nextPoll(h); await h.answer(sample({ ...remaining, sequence: 4 })); assert.equal(processNamed(h, 'Test App 0'), undefined);
+  await nextPoll(h); await h.answer(sample({ ...data, sequence: 5 }));
+  assert.equal(processNamed(h, 'Test App 0').querySelector('.process-group-button').getAttribute('aria-expanded'), 'false');
+});
+
+await check('group freshness follows the independent process age through expiry and recovery', async () => {
+  const h = boot(), data = processFixture(); await h.answer(sample({ ...data, processes_age_ms: 2999 }));
+  assert.doesNotMatch(h.text('process-status'), /STALE/);
+  await h.advance(2); assert.match(h.text('process-status'), /STALE/); assert.equal(h.status(), 'live');
+  const app = processGroups(h)[0]; await toggleProcessGroup(h, app);
+  await nextPoll(h); await h.fail(); assert.match(h.text('process-status'), /^OFFLINE \/ retained/);
+  await nextPoll(h); await h.answer(sample(), 503); assert.match(h.text('process-status'), /^WAITING \/ retained/);
+  await nextPoll(h); await h.answer(sample({ ...data, sequence: 2 }));
+  assert.doesNotMatch(h.text('process-status'), /STALE|OFFLINE|WAITING/); assert.equal(processGroupDetail(h, app).visible, true);
 });
 
 await check('interval controls use intentional POSTs and show actual effective settings', async () => {
