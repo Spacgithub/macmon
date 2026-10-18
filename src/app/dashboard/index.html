@@ -70,6 +70,24 @@
       </details>
       </div>
     </section>
+    <section class="panel disk" aria-labelledby="disk-title">
+      <div class="panel-head"><div><p class="eyebrow" id="disk-count">PHYSICAL DEVICE TELEMETRY</p><h2 id="disk-title">Disk</h2></div><button id="disk-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="disk-details" aria-label="Show disk details">Details</button></div>
+      <p class="muted" id="disk-empty">Waiting for a sample</p>
+      <p class="muted table-note" id="disk-scope">Top 3 physical devices by current I/O; each disk stays separate.</p>
+      <div id="disk-summary" class="disk-summary"></div>
+      <div id="disk-details" hidden>
+        <p class="muted disk-note">Driver totals count host block I/O since the driver started. NVMe lifetime host totals are separate controller counters (one data unit = 512,000 bytes), not physical NAND writes or wear. Endurance used is a reported estimate, can exceed 100%, and does not guarantee remaining life.</p>
+        <div id="disk-scroll" class="disk-scroll" tabindex="0" role="region" aria-label="Physical disks and NVMe health; scroll to see every device"><div id="disk-rows"></div></div>
+        <div class="disk-history">
+          <label class="motion" for="disk-select">History for <select id="disk-select" disabled aria-label="Disk to display in the history"></select></label>
+          <p class="muted disk-note" id="disk-history-label">Select a reported disk</p>
+          <div class="power-key"><span>Read</span><span>Write</span></div>
+          <canvas id="disk-chart" role="img" aria-label="Selected physical disk read and write rates, separate lines, up to 60 samples" aria-describedby="disk-history-label disk-range"></canvas>
+          <p class="muted" id="disk-range">Scale unavailable</p>
+        </div>
+        <p class="muted disk-note">Health age includes cached health, sample age and elapsed browser time. Readings older than 120 seconds are marked stale; retained samples do not establish current health. Unavailable or unsupported health is not a clean bill of health.</p>
+      </div>
+    </section>
     <div class="detail-grid">
     <section class="panel" aria-labelledby="network-title">
       <div class="panel-head"><div><p class="eyebrow" id="network-count">INTERFACE TELEMETRY</p><h2 id="network-title">Network</h2></div><button id="network-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="network-details" aria-label="Show network details">Details</button></div>

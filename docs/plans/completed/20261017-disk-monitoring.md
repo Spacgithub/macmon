@@ -1,3 +1,5 @@
+Done: 2026-10-17, PR #26
+
 # Disk activity and SSD health
 
 ## Behavior and decisions
@@ -32,6 +34,16 @@
 - [x] Add bounded native NVMe health collection, freshness, identity mapping and failure fallbacks.
 - [x] Publish compatible library/API disk snapshots with precision and legacy-output tests.
 - [x] Add Terminal summary/details, controls and narrow/compact/expanded layout coverage.
-- [ ] Add browser card/history/details with persisted expansion and missing/stale-data coverage.
-- [ ] Run full checks and independent reviews, and compare rootless hardware readings with
+- [x] Add browser card/history/details with persisted expansion and missing/stale-data coverage.
+- [x] Run full checks and independent reviews, and compare rootless hardware readings with
   independent I/O and SMART probes; verify Terminal/Web behavior without changing user settings.
+
+## Result
+
+Delivered physical-device activity and native NVMe health in PR #24, Terminal details in
+PR #25, and browser details and per-device history in PR #26. Existing legacy outputs and
+released settings remain compatible.
+
+Full checks and focused regressions passed. Rootless readings on M2 Max/macOS 15.6.1 matched
+independent I/O and SMART readers; Terminal and browser controls, narrow layouts and terminal
+cleanup were verified without changing user settings.

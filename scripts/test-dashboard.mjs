@@ -225,8 +225,23 @@ function metrics(overrides = {}) {
     network: [{ name: 'en0', rx_bytes_per_sec: 1000, tx_bytes_per_sec: 500, rx_bytes: 4096, tx_bytes: 2048 }],
     fans: [{ name: 'fan0', rpm: 1800, max_rpm: 6800 }, { name: 'fan1', rpm: 2400 }], ...overrides };
 }
-function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, temperatures, memory_activity, thermal_state } = {}) {
-  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, temperatures, memory_activity, thermal_state };
+function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, temperatures, memory_activity, thermal_state, disks } = {}) {
+  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, temperatures, memory_activity, thermal_state, disks };
+}
+function nvme(overrides = {}) {
+  return { critical_warning: 0, percentage_used: 5, available_spare_percent: 100, spare_threshold_percent: 10,
+    temperature_celsius: 38, data_units_read: '1', data_units_written: '2048', power_cycles: '12', power_on_hours: '123',
+    unsafe_shutdowns: '0', media_errors: '0', error_log_entries: '0', ...overrides };
+}
+function disk(overrides = {}) {
+  return { id: '100:101', name: 'disk0', model: 'Test NVMe', internal: true, size_bytes: 1024 ** 4,
+    read_bytes: 4096, write_bytes: 8192, read_operations: 10, write_operations: 20,
+    read_bytes_per_sec: 1024, write_bytes_per_sec: 2048, read_iops: 2, write_iops: 3,
+    health: { state: 'available', age_ms: 50, nvme: nvme() }, ...overrides };
+}
+function diskFields(h, id = '100:101') {
+  return Object.fromEntries(h.state().disks.get(id).detail.querySelector('.disk-data').children
+    .map((group) => [group.children[0].textContent, group.children[1].textContent]));
 }
 const cadence = (requested_ms = 1000, effective_ms = requested_ms) => ({ requested_ms, effective_ms, pending: requested_ms !== effective_ms });
 async function nextPoll(harness) {
@@ -625,7 +640,7 @@ await check('only actual in-flight cadence can extend freshness, never a pending
 });
 
 await check('panels start compact and native buttons expose individual and all detail controls', async () => {
-  const h = boot(), names = ['cpu', 'gpu', 'ram', 'power', 'network', 'cooling', 'process'];
+  const h = boot(), names = ['cpu', 'gpu', 'ram', 'power', 'disk', 'network', 'cooling', 'process'];
   for (const name of names) {
     const button = h.elements.get(`${name}-toggle`), body = h.elements.get(`${name}-details`);
     assert.equal(button.tagName, 'BUTTON'); assert.equal(button.getAttribute('type'), 'button');
@@ -658,6 +673,7 @@ await check('detail preferences reload independently and unavailable or corrupt 
   const second = boot({ storage });
   assert.equal(second.state().details.network, true); assert.equal(second.state().details.cooling, true);
   assert.equal(second.state().details.process, false);
+  assert.equal(second.state().details.disk, false, 'Missing disk preference defaults to compact');
   for (const raw of ['invalid JSON', 'null', '42', '[]', '{"cpu":"true","gpu":true,"unexpected":true}']) {
     const h = boot({ storage: new Map([['macmon.panel-details.v1', raw]]) });
     assert.equal(h.state().details.cpu, false); assert.equal(h.state().details.gpu, raw.includes('"gpu":true'));
@@ -858,6 +874,194 @@ await check('thermal state rejects unknown, unsafe and legacy values and physica
   assert.equal(h.text('thermal-state'), 'Unavailable');
   await nextPoll(h); await h.answer(sample({ sequence: 15, thermal_state: 'fair' }));
   assert.equal(h.text('thermal-state'), 'Fair');
+});
+
+await check('Disk is a full-width card between Power and the detail grid and joins saved detail controls', async () => {
+  assert.ok(html.indexOf('id="power-title"') < html.indexOf('id="disk-title"'));
+  assert.ok(html.indexOf('id="disk-title"') < html.indexOf('class="detail-grid"'));
+  const storage = new Map([['macmon.panel-details.v1', '{"network":true}']]), h = boot({ storage });
+  assert.equal(h.state().details.disk, false); assert.equal(h.state().details.network, true);
+  await h.click('disk-toggle'); assert.equal(h.state().details.disk, true);
+  assert.equal(boot({ storage }).state().details.disk, true);
+  await h.click('collapse-all'); assert.equal(h.state().details.disk, false);
+  await h.click('expand-all'); assert.equal(h.state().details.disk, true);
+  assert.equal(h.pending().url, '/api/sample');
+});
+
+await check('old, unavailable, empty and malformed Disk payloads stay distinct without inventing devices', async () => {
+  const h = boot(); await h.answer(sample());
+  assert.equal(h.text('disk-empty'), 'Disk telemetry unavailable.');
+  assert.equal(h.text('disk-count'), 'DISK TELEMETRY UNAVAILABLE');
+  for (const [index, disks] of [null, {}, [null, {}, disk({ id: 'bad id' }), disk({ name: '\u0000' })], []].entries()) {
+    await nextPoll(h); await h.answer(sample({ sequence: index + 2, disks }));
+    assert.equal(h.state().disks.size, 0);
+    assert.equal(h.text('disk-empty'), Array.isArray(disks) && !disks.length ? 'No physical disks reported.' : 'Disk telemetry unavailable.');
+  }
+  assert.equal(h.text('disk-count'), '0 PHYSICAL DEVICES');
+});
+
+await check('Disk summaries use the reported device count and correct singular or plural labels', async () => {
+  const h = boot();
+  for (const count of [1, 2, 3]) {
+    if (count > 1) await nextPoll(h);
+    await h.answer(sample({ sequence: count, disks: Array.from({ length: count }, (_, index) => disk({ id: `d:${index}`, name: `disk${index}` })) }));
+    assert.equal(h.elements.get('disk-summary').children.filter((row) => row.visible).length, count);
+    assert.equal(h.text('disk-count'), `${count} PHYSICAL ${count === 1 ? 'DEVICE' : 'DEVICES'}`);
+    assert.match(h.text('disk-scope'), new RegExp(`Top ${count} of ${count} physical ${count === 1 ? 'device' : 'devices'} by`));
+  }
+});
+
+await check('Disk first-sample unknowns remain distinct from true zero and invalid numeric fields', async () => {
+  const h = boot(); await h.answer(sample({ disks: [disk({ read_bytes_per_sec: null, write_bytes_per_sec: null, read_iops: null, write_iops: null })] }));
+  let view = h.state().disks.get('100:101');
+  assert.deepEqual(Array.from(view.compact[0], (node) => node.textContent), ['Unavailable', 'Unavailable', 'Unavailable', 'Unavailable']);
+  await nextPoll(h); await h.answer(sample({ sequence: 2, disks: [disk({ read_bytes_per_sec: 0, write_bytes_per_sec: 0, read_iops: 0, write_iops: 0,
+    read_bytes: 0, write_bytes: 0, read_operations: 0, write_operations: 0 })] }));
+  view = h.state().disks.get('100:101');
+  assert.deepEqual(Array.from(view.compact[0], (node) => node.textContent), ['0 B/s', '0 B/s', '0 IOPS', '0 IOPS']);
+  assert.equal(diskFields(h)['Driver read'], '0 B'); assert.equal(diskFields(h)['Read operations'], '0');
+  for (const [index, invalid] of [-1, NaN, Infinity, '1', true, {}, undefined].entries()) {
+    await nextPoll(h); await h.answer(sample({ sequence: index + 3, disks: [disk({ read_bytes_per_sec: invalid, write_bytes_per_sec: invalid,
+      read_iops: invalid, write_iops: invalid, read_bytes: invalid, read_operations: invalid })] }));
+    assert.ok(h.state().disks.get('100:101').compact[0].every((node) => node.textContent === 'Unavailable'));
+    assert.equal(diskFields(h)['Driver read'], 'Unavailable'); assert.equal(diskFields(h)['Read operations'], 'Unavailable');
+  }
+  await nextPoll(h); await h.answer(sample({ sequence: 10, disks: [disk({ read_bytes: Number.MAX_SAFE_INTEGER + 1, write_operations: 1.5,
+    model: 7, internal: 'true', size_bytes: '1024' })] }));
+  assert.equal(diskFields(h)['Driver read'], 'Unavailable'); assert.equal(diskFields(h)['Write operations'], 'Unavailable');
+  assert.equal(diskFields(h).Device, 'Unavailable');
+});
+
+await check('Disk names and models are literal text while identifiers and duplicates are validated', async () => {
+  const h = boot(), name = '<img src=x onerror=alert(1)>', model = '<script>bad()</script>';
+  await h.answer(sample({ disks: [disk({ name, model }), disk({ id: '100:101', name: 'duplicate' }),
+    disk({ id: '<script>', name: 'invalid id' }), disk({ id: 'third', name: 'x'.repeat(161) })] }));
+  assert.equal(h.state().disks.size, 1);
+  assert.equal(h.state().disks.get('100:101').title.textContent, name);
+  assert.equal(h.elements.get('disk-select').children[0].textContent, name);
+  assert.ok(diskFields(h).Device.startsWith(model));
+  assert.equal(h.state().disks.get('100:101').title.children.length, 0, 'No markup was parsed');
+});
+
+await check('eight disks remain reachable with a top-three summary and stable details, selection and scroll on ranking changes', async () => {
+  const h = boot(), items = Array.from({ length: 8 }, (_, index) => disk({ id: `d:${index}`, name: `disk${index}`, read_bytes_per_sec: index * 1024 }));
+  await h.answer(sample({ disks: items }));
+  const visible = () => h.elements.get('disk-summary').children.filter((row) => row.visible);
+  assert.deepEqual(visible().map((row) => row.children[0].textContent), ['disk7', 'disk6', 'disk5']);
+  assert.match(h.text('disk-scope'), /Top 3 of 8/);
+  await h.click('disk-toggle');
+  const rows = h.elements.get('disk-rows'), select = h.elements.get('disk-select'), scroll = h.elements.get('disk-scroll');
+  assert.equal(rows.children.length, 8); assert.equal(scroll.getAttribute('tabindex'), '0');
+  assert.equal(scroll.getAttribute('role'), 'region'); assert.match(h.text('disk-scope'), /All of 8/);
+  const originalRows = [...rows.children], options = [...select.children];
+  select.value = 'd:5'; select.emit('change'); select.focus(); scroll.scrollTop = 340;
+  let optionReplacements = 0, rowReplacements = 0, selectionWrites = 0, scrollWrites = 0;
+  const replaceOptions = select.replaceChildren.bind(select), replaceRows = rows.replaceChildren.bind(rows);
+  select.replaceChildren = (...children) => { optionReplacements++; replaceOptions(...children); };
+  rows.replaceChildren = (...children) => { rowReplacements++; replaceRows(...children); };
+  let selected = select.value, top = scroll.scrollTop;
+  Object.defineProperty(select, 'value', { get: () => selected, set: (value) => { selected = value; selectionWrites++; } });
+  Object.defineProperty(scroll, 'scrollTop', { get: () => top, set: (value) => { top = value; scrollWrites++; } });
+  await nextPoll(h); await h.answer(sample({ sequence: 2, disks: items.map((item, index) => ({ ...item, read_bytes_per_sec: (8 - index) * 1024 })) }));
+  assert.deepEqual([...rows.children], originalRows); assert.deepEqual([...select.children], options);
+  assert.equal(optionReplacements, 0); assert.equal(rowReplacements, 0); assert.equal(selectionWrites, 0); assert.equal(scrollWrites, 0);
+  assert.equal(select.value, 'd:5'); assert.equal(h.document.activeElement, select); assert.equal(scroll.scrollTop, 340);
+  await h.click('disk-toggle');
+  assert.deepEqual(visible().map((row) => row.children[0].textContent), ['disk0', 'disk1', 'disk2']);
+  assert.equal(h.state().diskSelected, 'd:5');
+  await h.click('disk-toggle'); await nextPoll(h); await h.fail();
+  assert.equal(select.value, 'd:5'); assert.equal(scroll.scrollTop, 340); assert.equal(h.document.activeElement, select);
+  assert.match(h.state().disks.get('d:5').detailBadge.textContent, /Retained/);
+});
+
+await check('Disk health distinguishes unsupported, malformed and unknown-age data from a current zero warning', async () => {
+  const h = boot(); await h.answer(sample({ disks: [disk()] }));
+  assert.match(h.state().disks.get('100:101').badge.textContent, /No NVMe warning/);
+  assert.equal(h.state().disks.get('100:101').badge.dataset.state, 'current');
+  assert.match(diskFields(h)['Health age'], /current/);
+  const invalid = [undefined, { state: 'unsupported', age_ms: 0, nvme: nvme() }, { state: 'unavailable', age_ms: 0, nvme: nvme() },
+    { state: '__proto__', age_ms: 0, nvme: nvme() }, { state: 'available', age_ms: null, nvme: nvme() },
+    { state: 'available', age_ms: -1, nvme: nvme() }, { state: 'available', age_ms: '0', nvme: nvme() },
+    { state: 'available', age_ms: Number.MAX_SAFE_INTEGER + 1, nvme: nvme() }, { state: 'available', age_ms: 0, nvme: null },
+    { state: 'available', age_ms: 0, nvme: nvme({ critical_warning: '0' }) }];
+  for (const [index, health] of invalid.entries()) {
+    await nextPoll(h); await h.answer(sample({ sequence: index + 2, disks: [disk({ health })] }));
+    const badge = h.state().disks.get('100:101').badge;
+    assert.notEqual(badge.dataset.state, 'current'); assert.doesNotMatch(badge.textContent, /No NVMe warning/);
+    assert.match(badge.textContent, health?.state === 'unsupported' ? /Unsupported/ : /Unavailable/);
+  }
+});
+
+await check('Disk health age includes sample age and fractional browser elapsed time and expires between long polls', async () => {
+  const h = boot(); await h.answer(sample({ interval_ms: 10000, cadence: cadence(10000), age_ms: 1000,
+    disks: [disk({ health: { state: 'available', age_ms: 118500, nvme: nvme() } })] }));
+  await h.advance(.25); assert.equal(h.state().disks.get('100:101').badge.dataset.state, 'current');
+  assert.match(diskFields(h)['Health age'], /119s old/);
+  await h.advance(600); assert.equal(h.state().disks.get('100:101').badge.dataset.state, 'stale');
+  assert.match(h.state().disks.get('100:101').badge.textContent, /Stale/);
+  assert.match(diskFields(h)['Health age'], /120s old \/ stale/);
+  assert.equal(h.requests.length, 1, 'Health can expire without a new sample or extra fetch');
+  await h.hidden(true); await h.advance(30000); await h.hidden(false);
+  assert.equal(h.state().disks.get('100:101').badge.dataset.state, 'stale');
+});
+
+await check('NVMe health retains used percentages above 100, saturation, raw warnings and real zero fields', async () => {
+  const h = boot(); await h.answer(sample({ disks: [disk({ health: { state: 'available', age_ms: 0,
+    nvme: nvme({ critical_warning: 2, percentage_used: 121, available_spare_percent: 0, spare_threshold_percent: 0, temperature_celsius: 0 }) } })] }));
+  assert.match(h.state().disks.get('100:101').badge.textContent, /Warning 0x02 \/ used 121%/);
+  let fields = diskFields(h);
+  assert.equal(fields['Endurance used'], '121%'); assert.equal(fields['Available spare'], '0%');
+  assert.equal(fields['Spare threshold'], '0%'); assert.equal(fields.Temperature, '0.0 °C');
+  assert.equal(fields['Unsafe shutdowns'], '0'); assert.equal(fields['Media errors'], '0');
+  await nextPoll(h); await h.answer(sample({ sequence: 2, disks: [disk({ health: { state: 'available', age_ms: 0,
+    nvme: nvme({ percentage_used: 255, available_spare_percent: 101, spare_threshold_percent: -1, temperature_celsius: Infinity }) } })] }));
+  fields = diskFields(h);
+  assert.equal(fields['Endurance used'], '>254% (raw 255)');
+  assert.equal(fields['Available spare'], 'Unavailable'); assert.equal(fields['Spare threshold'], 'Unavailable'); assert.equal(fields.Temperature, 'Unavailable');
+  assert.match(html, /does not guarantee remaining life/); assert.doesNotMatch(h.text('disk-details'), /remaining \d+%/);
+});
+
+await check('NVMe u128 counters stay lossless and lifetime units use checked 512000-byte conversion', async () => {
+  const h = boot(), maximum = (1n << 128n) - 1n;
+  await h.answer(sample({ disks: [disk({ health: { state: 'available', age_ms: 0,
+    nvme: nvme({ data_units_read: '1', data_units_written: '0', power_on_hours: maximum.toString() }) } })] }));
+  assert.equal(diskFields(h)['Lifetime host read'], '500.0 KiB'); assert.equal(diskFields(h)['Lifetime host write'], '0 B');
+  assert.equal(diskFields(h)['Driver read'], '4 KiB', 'Driver and NVMe lifetime totals are different counters');
+  assert.equal(diskFields(h)['Power-on hours'], maximum.toLocaleString('en-US'));
+  const tooLarge = (maximum / 512000n + 1n).toString();
+  const invalid = [maximum.toString(), tooLarge, (maximum + 1n).toString(), '9'.repeat(100000), '-1', '+1', '01', '0x10', '1.5', 1, null, {}];
+  for (const [index, value] of invalid.entries()) {
+    await nextPoll(h); await h.answer(sample({ sequence: index + 2, disks: [disk({ health: { state: 'available', age_ms: 0,
+      nvme: nvme({ data_units_read: value, media_errors: value }) } })] }));
+    assert.equal(diskFields(h)['Lifetime host read'], 'Unavailable');
+    if (index > 1) assert.equal(diskFields(h)['Media errors'], 'Unavailable');
+  }
+  await nextPoll(h); await h.answer(sample({ sequence: 20, disks: [disk({ health: { state: 'available', age_ms: 0,
+    nvme: nvme({ data_units_read: (maximum / 512000n).toString() }) } })] }));
+  assert.notEqual(diskFields(h)['Lifetime host read'], 'Unavailable');
+  assert.ok(diskFields(h)['Lifetime host read'].endsWith(' YiB'));
+});
+
+await check('Disk history stays per generation, gaps unknown rates, keeps selection and bounds each series to 60 samples', async () => {
+  const h = boot({ expanded: true });
+  const pair = (read) => [disk({ id: 'a:1', name: 'disk0', read_bytes_per_sec: read, write_bytes_per_sec: 0 }), disk({ id: 'b:1', name: 'disk1', read_bytes_per_sec: 10000, write_bytes_per_sec: 20000 })];
+  await h.answer(sample({ disks: pair(100) }));
+  await nextPoll(h); await h.answer(sample({ sequence: 2, disks: pair(null) }));
+  await nextPoll(h); await h.answer(sample({ sequence: 3, disks: pair(200) }));
+  const select = h.elements.get('disk-select'); select.value = 'a:1'; select.emit('change');
+  let traces = h.elements.get('disk-chart').context.paths;
+  assert.deepEqual(traces[0].points.map((point) => point[0]), ['moveTo', 'moveTo']);
+  select.value = 'b:1'; select.emit('change');
+  assert.match(h.text('disk-history-label'), /^disk1 \/ latest 3 samples/);
+  assert.match(h.text('disk-range'), /19.5 KiB\/s/);
+  for (let sequence = 4; sequence <= 65; sequence++) { await nextPoll(h); await h.answer(sample({ sequence, disks: pair(sequence) })); }
+  assert.equal(h.state().diskHistory.get('a:1').length, 60); assert.equal(h.state().diskHistory.get('b:1').length, 60);
+  assert.equal(h.state().diskSelected, 'b:1');
+  await nextPoll(h); await h.answer(sample({ sequence: 66, disks: [disk({ id: 'a:2', name: 'disk0' })] }));
+  assert.equal(h.state().diskHistory.has('a:1'), false); assert.equal(h.state().diskHistory.get('a:2').length, 1);
+  assert.equal(h.state().diskSelected, 'a:2');
+  await nextPoll(h); await h.answer(sample({ sequence: 67, disks: null }));
+  assert.equal(h.state().diskHistory.size, 0); assert.match(h.text('disk-history-label'), /Select/);
 });
 
 console.log(`${tests.length} dashboard checks passed.`);

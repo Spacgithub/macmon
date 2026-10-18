@@ -77,6 +77,31 @@ h3 { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
 }
 .detail-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(320px, 1fr); gap: 18px; align-items: start; }
 .power { margin-bottom: 18px; }
+.disk { margin-bottom: 18px; }
+.disk-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 14px; }
+.disk-summary-card { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: #0b152044; }
+.disk-health { margin: 6px 0 14px; color: var(--accent); font-size: 11px; overflow-wrap: anywhere; }
+.disk-health[data-warning="true"] { color: #f28a94; }
+.disk-health[data-state="stale"], .disk-health[data-state="retained"] { color: #edb77b; }
+.disk-health[data-state="unsupported"], .disk-health[data-state="unavailable"] { color: var(--muted); }
+.disk-rates, .disk-data { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 0; font-variant-numeric: tabular-nums; }
+.disk-rates dt, .disk-data dt { color: var(--muted); font-size: 10px; }
+.disk-rates dd, .disk-data dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+.disk-rates dd { font-size: 15px; }
+.disk-summary-card:only-child .disk-rates { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.disk-scroll { max-height: 480px; overflow: auto; overflow-anchor: none; scrollbar-color: #3b4e65 transparent; }
+.disk-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
+.disk-device { min-width: 0; padding: 20px 2px; border-bottom: 1px solid var(--line); }
+.disk-device:last-child { border-bottom: 0; }
+.disk-device .disk-rates { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 20px; }
+.disk-data { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px 20px; }
+.disk-data > div { min-width: 0; }
+.disk-data dd { font-size: 12px; }
+.disk-note { margin: 12px 0; line-height: 1.7; overflow-wrap: anywhere; }
+.disk-history { margin-top: 22px; }
+.disk-history .motion { white-space: normal; flex-wrap: wrap; }
+.disk-history select { max-width: 100%; width: min(320px, 100%); }
+#disk-chart { height: 110px; }
 .power-totals { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; align-items: end; }
 #power-details { margin-top: 22px; }
 .power-primary, .power-subtotal { font-variant-numeric: tabular-nums; font-weight: 500; letter-spacing: -.8px; overflow-wrap: anywhere; }
@@ -189,6 +214,9 @@ footer { margin-top: 24px; text-align: center; }
   .power-components { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .power-components > div { padding: 10px; }
   .power-components dd { font-size: 16px; }
+  .disk-summary { grid-template-columns: 1fr; }
+  .disk-summary-card:only-child .disk-rates { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .disk-device .disk-rates, .disk-data { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .fans { grid-template-columns: 1fr; }
 }
 @media (max-width: 520px) {
