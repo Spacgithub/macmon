@@ -1,6 +1,7 @@
 //! Terminal user interface.
 
 mod boxes;
+mod compute;
 mod cooling;
 mod cooling_layout;
 mod disk;
@@ -15,6 +16,7 @@ mod info;
 mod kill;
 mod layout;
 mod memory;
+mod network;
 mod panels;
 mod proc_view;
 mod store;
@@ -437,6 +439,8 @@ pub struct App {
   fan_motion_visible: bool,
   unfocused: bool,
   network: Option<Vec<NetworkMetric>>,
+  network_sampled: bool,
+  compute: compute::Compute,
   panels: PanelState,
   temperatures: Temperatures,
 
@@ -478,6 +482,7 @@ impl App {
   }
 
   fn update_metrics(&mut self, data: Metrics) {
+    self.compute.push(&data, &self.soc);
     self.cpu_power.push(data.cpu_power as f64);
     self.gpu_power.push(data.gpu_power as f64);
     self.ane_power.push(data.ane_power as f64);
@@ -493,13 +498,9 @@ impl App {
     self.cooling.sync(&data.fans);
     self.fans.push(data.fans);
     self.network = data.network;
+    self.network_sampled = true;
     if let Some(metrics) = &mut self.network {
-      let busy =
-        |x: &NetworkMetric| x.rx_bytes_per_sec.unwrap_or(0.0) + x.tx_bytes_per_sec.unwrap_or(0.0);
-      let total = |x: &NetworkMetric| u128::from(x.rx_bytes) + u128::from(x.tx_bytes);
-      metrics.sort_by(|a, b| {
-        busy(b).total_cmp(&busy(a)).then_with(|| total(b).cmp(&total(a))).then(a.name.cmp(&b.name))
-      });
+      network::sort(metrics);
     }
 
     self.mem.push(data.memory);
@@ -858,6 +859,8 @@ impl App {
     }
     let (plan, disk) = self.layout_frame(f.area());
     self.panels.targets = disk.map(|area| (Panel::Disk, area)).into_iter().collect();
+    self.panels.targets.extend(plan.compute.map(|area| (Panel::Compute, area)));
+    self.panels.targets.extend(plan.network.map(|area| (Panel::Network, area)));
     self.fan_motion_visible = self.help.is_none()
       && self.placements.is_empty()
       && self.fans.motion_glyph(0).is_some()
@@ -1013,8 +1016,8 @@ mod tests {
   use std::time::{Duration, Instant};
 
   use macmon::{
-    CpuTierInfo, CpuTierMetrics, FanMetric, MemMetrics, Metrics, NetworkMetric, SocInfo,
-    TempMetrics,
+    CpuTierInfo, CpuTierMetrics, DiskMetric, FanMetric, MemMetrics, MemoryActivity, Metrics,
+    NetworkMetric, SocInfo, TempMetrics, ThermalState,
   };
   use ratatui::Terminal;
   use ratatui::backend::TestBackend;
@@ -1026,10 +1029,11 @@ mod tests {
   use ratatui::layout::{Margin, Rect};
   use ratatui::style::Modifier;
 
+  use super::fan_protocol::Capabilities;
   use super::kill::tests::FakeSys;
   use super::layout::Metric;
   use super::theme::{self, gradient};
-  use super::{App, Event, restore_term_once, run_procs_thread};
+  use super::{App, Event, Panel, restore_term_once, run_procs_thread};
   use crate::config::{Config, ProcSort, RatioMode, TUI_MAX_MS, TUI_MIN_MS, TempConfig, ViewType};
   use crate::fds::{Kind, OpenFile};
   use crate::procs::ProcInfo;
@@ -1402,20 +1406,37 @@ mod tests {
   }
 
   fn test_soc() -> SocInfo {
-    let tier = |label: &str| CpuTierInfo { label: label.to_string(), cores: 6, freqs: vec![] };
+    let tier =
+      |label: &str| CpuTierInfo { label: label.to_string(), cores: 6, freqs: vec![800, 3200] };
     SocInfo {
       chip_name: "Apple M3 Pro".to_string(),
       memory_gb: 36,
       cpu_tiers: vec![tier("E"), tier("P")],
       gpu_cores: 18,
+      gpu_freqs: vec![0, 400, 1400],
       ..Default::default()
     }
   }
 
-  /// Sampled CPU tier `label` with no per-core metrics.
-  fn cpu_tier(label: &str, freq_mhz: u32, scaled_ratio: f32, active_ratio: f32) -> CpuTierMetrics {
+  /// Sampled CPU tier with real core rows matching the fixture's installed count.
+  fn cpu_tier(
+    label: &str,
+    count: usize,
+    freq_mhz: u32,
+    scaled_ratio: f32,
+    active_ratio: f32,
+  ) -> CpuTierMetrics {
     let label = label.to_string();
-    CpuTierMetrics { label, freq_mhz, scaled_ratio, active_ratio, cores: vec![] }
+    let cores = (0..count)
+      .map(|core_id| macmon::CpuCoreMetrics {
+        die_id: 0,
+        core_id,
+        freq_mhz,
+        scaled_ratio,
+        active_ratio,
+      })
+      .collect();
+    CpuTierMetrics { label, freq_mhz, scaled_ratio, active_ratio, cores }
   }
 
   fn test_metrics() -> Metrics {
@@ -1428,7 +1449,9 @@ mod tests {
         swap_usage: 1 << 30,
       },
       fans: vec![FanMetric { name: "fan0".to_string(), rpm: 1200, max_rpm: Some(6000) }],
-      cpu_tiers: vec![cpu_tier("E", 1800, 0.42, 0.5), cpu_tier("P", 3200, 0.77, 0.8)],
+      cpu_scaled_ratio: 0.595,
+      cpu_active_ratio: 0.65,
+      cpu_tiers: vec![cpu_tier("E", 6, 1800, 0.42, 0.5), cpu_tier("P", 6, 3200, 0.77, 0.8)],
       gpu_freq_mhz: 1400,
       gpu_scaled_ratio: 0.23,
       gpu_active_ratio: 0.3,
@@ -1503,9 +1526,9 @@ mod tests {
       }
       assert!(row(&buf, area.y + 3).contains("utun0"));
       assert!(row(&buf, area.y + 3).contains('—'));
-      assert!(row(&buf, area.y + 4).contains("awdl0"));
-      // The unused interface sorts before awdl0 by name, so this proves the history tiebreak.
-      assert!(!screen_text(&buf).contains("anpi0"));
+      assert!(row(&buf, area.y + 4).contains("anpi0"));
+      // Identical pending traffic is tied by name, independently of cumulative counters.
+      assert!(!screen_text(&buf).contains("awdl0"));
     }
   }
 
@@ -1517,7 +1540,7 @@ mod tests {
     let plan = app.layout(buf.area);
     let area = plan.network.unwrap();
     assert!(row(&buf, area.y).contains("Network 3/4"));
-    for (offset, name) in [(2, "en0"), (3, "utun0"), (4, "awdl0")] {
+    for (offset, name) in [(2, "en0"), (3, "utun0"), (4, "anpi0")] {
       assert!(row(&buf, area.y + offset).contains(name));
     }
     assert_eq!(plan.boxes.len(), 4);
@@ -1550,7 +1573,7 @@ mod tests {
 
   #[test]
   fn network_table_distinguishes_unavailable_from_no_active_interfaces() {
-    for (network, status) in [(None, "unavailable"), (Some(vec![]), "no active interfaces")] {
+    for (network, status) in [(None, "unavailable"), (Some(vec![]), "No reported interfaces")] {
       let mut app = test_app();
       app.network = network;
       assert!(render_to_string(&mut app, 80, 24).contains(status));
@@ -2153,6 +2176,113 @@ mod tests {
   }
 
   #[test]
+  fn compact_overview_keeps_compute_network_memory_cooling_disk_and_all_top_five_processes() {
+    let mut app = network_app();
+    app.cfg.panel_details = [false; 6];
+    app.memory_activity = MemoryActivity {
+      pressure: Some(macmon::MemoryPressure::Warning),
+      swap_in_bytes_per_sec: Some(1024.0),
+      swap_out_bytes_per_sec: Some(2048.0),
+    };
+    app.thermal_state = Some(ThermalState::Fair);
+    app
+      .temperatures
+      .push(Vec::new(), &TempMetrics { cpu_temp_avg: Some(45.0), gpu_temp_avg: Some(40.0) });
+    app.disks = Some(vec![DiskMetric {
+      id: "physical-0".into(),
+      name: "disk0".into(),
+      read_bytes_per_sec: Some(12.3 * 1024.0 * 1024.0),
+      ..Default::default()
+    }]);
+    let processes = (0..12)
+      .map(|index| {
+        let mut process = test_procs()[1].clone();
+        process.pid = 1000 + index;
+        process.name = format!("worker{index}");
+        process.cpu_pct = index as f32;
+        process
+      })
+      .collect();
+    let mut app = with_procs(app, processes);
+    let text = render_to_string(&mut app, 80, 24);
+    for expected in [
+      "CPU Weighted 59.5%",
+      "GPU Weighted 23.0%",
+      "OS pressure Warning",
+      "Swap in  1.0 KiB/s",
+      "Swap out 2.0 KiB/s",
+      "4 observed · 2 traffic · 3 pending",
+      "Auto · en0",
+      "1.0 MiB/s",
+      "OS thermal Fair",
+      "1200 rpm",
+      "7 Disk",
+      "disk0",
+      "top 5 / 12",
+      "worker11",
+      "worker7",
+    ] {
+      assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(!text.contains("worker6"));
+    assert!(app.procs_shown.showing().is_some());
+  }
+
+  #[test]
+  fn legacy_disk_then_compute_or_network_click_focuses_full_details_without_changing_preferences() {
+    for native in [false, true] {
+      for width in [120, 140] {
+        for panel in [Panel::Compute, Panel::Network] {
+          let mut app = network_app();
+          let fans =
+            ["fan0", "fan1"].map(|name| FanMetric { name: name.into(), rpm: 1800, max_rpm: None });
+          app.cooling.sync(&fans);
+          app.fans.push(fans.into());
+          app.cell_pixels = Some((9, 18));
+          app.capabilities = native.then_some(Capabilities {
+            foreground: [230; 3],
+            background: [20; 3],
+            accent: None,
+            cell_pixels: (9, 18),
+          });
+          let mut app = with_procs(app, varied_procs());
+          render_buffer(&mut app, width, 40);
+          let disk = app.legacy_layout(Rect::new(0, 0, width, 40)).2.unwrap();
+          click(&mut app, disk.x + 2, disk.y);
+          let choices = (app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs);
+          let session = app.procs_shown.showing();
+          let selected = app.proc_view.selected_pid();
+          render_buffer(&mut app, width, 40);
+          let target = app.panels.targets.iter().find(|(kind, _)| *kind == panel).unwrap().1;
+          click(&mut app, target.x + 2, target.y);
+          assert_eq!(app.panels.focus, panel);
+          assert!(app.panels_legacy());
+          assert_eq!((app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs), choices);
+          assert_eq!(app.procs_shown.showing(), session);
+          assert_eq!(app.proc_view.selected_pid(), selected);
+          assert!(press(&mut app, KeyCode::Char('f')).is_continue());
+          let full = render_to_string(&mut app, width, 40);
+          assert!(app.panels.fullscreen && app.panels.focus == panel);
+          if panel == Panel::Compute {
+            assert!(full.contains("Die 0 / Core 0"));
+          } else {
+            assert!(
+              full.contains("RX total") && full.contains("TX total") && full.contains("awdl0")
+            );
+          }
+          assert!(app.placements.is_empty());
+          assert!(press(&mut app, KeyCode::Esc).is_continue());
+          let buffer = render_buffer(&mut app, width, 40);
+          assert_eq!(app.placements.len(), 2);
+          assert_eq!(app.next_fan_placements(buffer.area), app.placements);
+          assert_eq!((app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs), choices);
+          assert_eq!(app.procs_shown.showing(), session);
+        }
+      }
+    }
+  }
+
+  #[test]
   fn renders_every_box_at_any_size() {
     use Metric::*;
     let every_box = [Cluster(0), Cluster(1), Gpu, Ram, CpuPower, GpuPower, AnePower, TotalPower];
@@ -2238,7 +2368,8 @@ mod tests {
   #[test]
   fn renders_three_cpu_tiers() {
     // M6 of issue #80: 6E + 4P + 2S
-    let tier = |label: &str, cores| CpuTierInfo { label: label.into(), cores, freqs: vec![] };
+    let tier =
+      |label: &str, cores| CpuTierInfo { label: label.into(), cores, freqs: vec![800, 4800] };
     let soc = SocInfo {
       chip_name: "Apple M6".to_string(),
       memory_gb: 32,
@@ -2250,9 +2381,9 @@ mod tests {
     cfg.panel_details = [true; 6];
     let mut app = App::from_parts(soc, cfg);
     let cpu_tiers = vec![
-      cpu_tier("E", 2940, 0.71, 0.71),
-      cpu_tier("P", 2394, 0.25, 0.25),
-      cpu_tier("S", 4776, 0.5, 0.5),
+      cpu_tier("E", 6, 2940, 0.71, 0.71),
+      cpu_tier("P", 4, 2394, 0.25, 0.25),
+      cpu_tier("S", 2, 4776, 0.5, 0.5),
     ];
     app.update_metrics(Metrics { cpu_tiers, ..test_metrics() });
 
@@ -2282,7 +2413,11 @@ mod tests {
     let mut cfg = Config::default();
     cfg.panel_details = [true; 6];
     let mut app = App::from_parts(soc, cfg);
-    let metrics = Metrics { cpu_tiers: vec![cpu_tier("_", 0, 0.63, 0.63)], ..Default::default() };
+    let metrics = Metrics {
+      cpu_active_ratio: 0.63,
+      cpu_tiers: vec![cpu_tier("_", 4, 0, 0.63, 0.63)],
+      ..Default::default()
+    };
     app.update_metrics(Metrics { memory: test_metrics().memory, ..metrics });
     // own processes have an energy counter, but it does not move in a VM; launchd has none
     let app = &mut with_procs(app, varied_procs());
@@ -2294,7 +2429,7 @@ mod tests {
       row(&buf, 0)
     );
     let screen = screen_text(&buf);
-    for title in ["CPU 63% ─", "GPU 0% ─"] {
+    for title in ["CPU Active 63% ─", "GPU Unavailable ─"] {
       assert!(screen.contains(&format!("╭─ {title}")), "missing {title}");
     }
     assert!(!screen.contains("MHz") && !screen.contains("_-CPU"));
