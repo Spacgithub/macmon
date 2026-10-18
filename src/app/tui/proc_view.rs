@@ -2,6 +2,7 @@
 //! driven by keys and the mouse.
 
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -19,6 +20,7 @@ use super::boxes::{
 use super::store::ratio;
 use super::theme::{self, dim, faint, gradient, heading, text};
 use crate::config::{Config, ProcSort};
+use crate::proc_groups::{GroupKind, ProcGroup};
 use crate::procs::ProcInfo;
 
 /// Narrowest NAME column; other columns are dropped to keep it.
@@ -208,13 +210,30 @@ fn compare(a: &ProcInfo, b: &ProcInfo, sort: ProcSort) -> Ordering {
 
 /// Sorts by `sort` in the given direction. Processes without a power reading go last when sorted
 /// by power, ties are ordered by pid.
-fn sort_procs(procs: &mut [ProcInfo], sort: ProcSort, desc: bool) {
-  let missing = |p: &ProcInfo| sort == ProcSort::Power && p.power_w.is_none();
+fn sort_procs(procs: &mut [ProcInfo], sort: ProcSort, desc: bool, grouped: bool) {
+  let missing = |p: &ProcInfo| {
+    if grouped && matches!(sort, ProcSort::Cpu | ProcSort::Gpu | ProcSort::Power) {
+      proc_reading(p, sort).is_none()
+    } else {
+      sort == ProcSort::Power && p.power_w.is_none()
+    }
+  };
   procs.sort_by(|a, b| {
-    let ord = compare(a, b, sort);
+    let ord =
+      if grouped && missing(a) && missing(b) { Ordering::Equal } else { compare(a, b, sort) };
     let ord = if desc { ord.reverse() } else { ord };
     missing(a).cmp(&missing(b)).then(ord).then(a.pid.cmp(&b.pid))
   });
+}
+
+fn proc_reading(proc: &ProcInfo, sort: ProcSort) -> Option<f32> {
+  match sort {
+    ProcSort::Cpu => proc.meta.known.0.then_some(proc.cpu_pct),
+    ProcSort::Gpu => proc.meta.known.1.then_some(proc.gpu_pct),
+    ProcSort::Power => proc.power_w.filter(|_| proc.meta.known.0),
+    _ => None,
+  }
+  .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 /// Sorts group totals like the processes: PID by the process count, NAME by the term. Groups
@@ -469,10 +488,22 @@ fn tail(text: &str, max: usize) -> &str {
 
 // MARK: State
 
-/// Selected process: its pid and its row.
+/// Identity survives sorting and sampling, while an exec or reused PID does not inherit actions.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RowKey {
+  Application(String),
+  Process(i32, String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayRow {
+  Application(usize),
+  Process { index: usize, parent: Option<usize> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Selection {
-  pid: i32,
+  key: RowKey,
   index: usize,
 }
 
@@ -486,6 +517,10 @@ struct Targets {
   headers: Vec<(ProcSort, Rect)>,
   /// Table rows below the header, the first one showing row `offset`.
   body: Rect,
+  /// Only this cell expands a group; selecting the rest of its row never toggles it.
+  arrows: Vec<(String, Rect)>,
+  /// Compact tables show roots, not the flattened detail rows at `offset`.
+  summary_rows: Vec<RowKey>,
 }
 
 /// State of the process panel.
@@ -493,6 +528,7 @@ struct Targets {
 pub(super) struct ProcView {
   pub(super) sort: ProcSort,
   pub(super) sort_desc: bool,
+  pub(super) grouped: bool,
   filter: String,
   /// Filter input mode: keys edit the filter instead of acting as shortcuts.
   typing: bool,
@@ -502,6 +538,13 @@ pub(super) struct ProcView {
   rows: Vec<usize>,
   /// Totals of `rows` for each filter term, sorted like the processes.
   groups: Vec<Group>,
+  /// Immutable full-sample totals. Filtering changes visibility, never these measurements.
+  applications: Vec<ProcGroup>,
+  members: Vec<Vec<usize>>,
+  leaders: Vec<usize>,
+  roots: Vec<DisplayRow>,
+  display: Vec<DisplayRow>,
+  expanded: HashSet<String>,
   selected: Option<Selection>,
   /// First row on screen.
   offset: usize,
@@ -516,20 +559,27 @@ pub(super) struct ProcView {
 impl Default for ProcView {
   fn default() -> Self {
     let cfg = Config::default();
-    Self::new(cfg.proc_sort, cfg.proc_sort_desc)
+    Self::new(cfg.proc_sort, cfg.proc_sort_desc, cfg.proc_grouped)
   }
 }
 
 impl ProcView {
-  pub(super) fn new(sort: ProcSort, sort_desc: bool) -> Self {
+  pub(super) fn new(sort: ProcSort, sort_desc: bool, grouped: bool) -> Self {
     Self {
       sort,
       sort_desc,
+      grouped,
       filter: String::new(),
       typing: false,
       procs: None,
       rows: vec![],
       groups: vec![],
+      applications: vec![],
+      members: vec![],
+      leaders: vec![],
+      roots: vec![],
+      display: vec![],
+      expanded: HashSet::new(),
       selected: None,
       offset: 0,
       page: 0,
@@ -565,7 +615,7 @@ impl ProcView {
   /// would be left on screen.
   pub(super) fn groups_height(&self, height: u16) -> u16 {
     let rows = self.groups.len() as u16 + 1;
-    let shown = !self.groups.is_empty() && !self.rows.is_empty();
+    let shown = !self.grouped && !self.groups.is_empty() && !self.rows.is_empty();
     if shown && height >= rows + GROUPS_MIN_ROWS { rows } else { 0 }
   }
 
@@ -586,14 +636,65 @@ impl ProcView {
     self.targets.area.contains(Position::new(mouse.column, mouse.row))
   }
 
+  pub(super) fn summary_targets(&self) -> bool {
+    !self.targets.summary_rows.is_empty()
+  }
+
+  pub(super) fn selected_application(&self) -> bool {
+    self.grouped && self.selected.as_ref().is_some_and(|s| matches!(s.key, RowKey::Application(_)))
+  }
+
+  /// A compact application summary never inherits a hidden child's PID actions.
+  pub(super) fn compact_selection(&mut self, visible_roots: usize) {
+    if !self.grouped {
+      return;
+    }
+    let Some(selection) = self.selected.clone() else { return };
+    match self.display.get(selection.index).copied() {
+      Some(DisplayRow::Process { parent: Some(parent), .. }) => {
+        if let Some(index) =
+          self.display.iter().position(|row| *row == DisplayRow::Application(parent))
+        {
+          self.select(index);
+        } else {
+          self.selected = None;
+        }
+      }
+      Some(DisplayRow::Process { parent: None, .. }) => {
+        if !self.roots.iter().take(visible_roots).any(|row| self.key(*row) == selection.key) {
+          self.selected = None;
+        }
+      }
+      Some(DisplayRow::Application(_)) => {}
+      None => self.selected = None,
+    }
+  }
+
   #[cfg(test)]
   pub(super) fn selected_pid(&self) -> Option<i32> {
-    self.selected.map(|s| s.pid)
+    self.selected().map(|proc| proc.pid)
   }
 
   /// The selected process.
   pub(super) fn selected(&self) -> Option<&ProcInfo> {
-    self.rows().nth(self.selected?.index)
+    match self.display.get(self.selected.as_ref()?.index)? {
+      DisplayRow::Process { index, .. } => self.procs()?.get(*index),
+      DisplayRow::Application(_) => None,
+    }
+  }
+
+  fn key(&self, row: DisplayRow) -> RowKey {
+    match row {
+      DisplayRow::Application(index) => RowKey::Application(self.applications[index].id.clone()),
+      DisplayRow::Process { index, .. } => {
+        let proc = &self.procs.as_ref().unwrap()[index];
+        RowKey::Process(proc.pid, proc.meta.instance.clone())
+      }
+    }
+  }
+
+  fn anchor(&self) -> Option<RowKey> {
+    self.display.get(self.offset).map(|row| self.key(*row))
   }
 
   /// Columns on screen at the last render; all of them before the first one.
@@ -606,13 +707,22 @@ impl ProcView {
 
   /// Replaces the process list; the selection follows its pid.
   pub(super) fn set_procs(&mut self, procs: Vec<ProcInfo>) {
+    let anchor = self.anchor();
+    self.applications = crate::proc_groups::groups(&procs);
+    let live: HashSet<_> = self.applications.iter().map(|group| group.id.as_str()).collect();
+    self.expanded.retain(|id| live.contains(id.as_str()));
+    self.expand_selected_process();
     self.procs = Some(procs);
-    self.refresh();
+    self.refresh_at(anchor);
   }
 
   /// Drops the list, ends filter input and forgets the mouse targets (the panel got hidden). The
   /// filter and sort stay.
   pub(super) fn clear(&mut self) {
+    self.display.clear();
+    self.roots.clear();
+    self.applications.clear();
+    self.expanded.clear();
     self.procs = None;
     self.typing = false;
     self.targets = Targets::default();
@@ -622,47 +732,207 @@ impl ProcView {
   /// Re-sorts and re-filters the list. The selection stays on its pid, and is dropped when that
   /// process is gone or filtered out.
   fn refresh(&mut self) {
+    self.refresh_at(self.anchor());
+  }
+
+  fn refresh_at(&mut self, anchor: Option<RowKey>) {
     let procs = self.procs.as_deref_mut().unwrap_or_default();
-    sort_procs(procs, self.sort, self.sort_desc);
+    sort_procs(procs, self.sort, self.sort_desc, self.grouped);
 
     let filter = Filter::parse(&self.filter);
     self.rows = (0..procs.len()).filter(|&i| filter.matches(|t| hit(&procs[i], t))).collect();
-    let groups =
-      filter.any.iter().map(|term| Group::sum(term, self.rows().filter(|p| hit(p, term))));
-    self.groups = groups.collect();
+    self.groups = if self.grouped {
+      Vec::new()
+    } else {
+      filter.any.iter().map(|term| Group::sum(term, self.rows().filter(|p| hit(p, term)))).collect()
+    };
     sort_groups(&mut self.groups, self.sort, self.sort_desc);
 
-    let procs = self.procs.as_deref().unwrap_or_default();
-    let rows = &self.rows;
-    self.selected = self.selected.and_then(|sel| {
-      let index = rows.iter().position(|&i| procs[i].pid == sel.pid)?;
+    self.rebuild_display(&filter);
+    self.selected = self.selected.take().and_then(|sel| {
+      let index = self.display.iter().position(|row| self.key(*row) == sel.key)?;
       Some(Selection { index, ..sel })
     });
+    if let Some(index) =
+      anchor.and_then(|key| self.display.iter().position(|row| self.key(*row) == key))
+    {
+      self.offset = index;
+    }
+    self.offset = self.offset.min(self.display.len().saturating_sub(self.page.max(1)));
+  }
+
+  fn rebuild_display(&mut self, filter: &Filter) {
+    self.members.clear();
+    self.leaders.clear();
+    self.roots.clear();
+    self.display.clear();
+    if !self.grouped {
+      self.roots =
+        self.rows.iter().map(|&index| DisplayRow::Process { index, parent: None }).collect();
+    } else {
+      let procs = self.procs.as_deref().unwrap_or_default();
+      let mut positions = HashMap::new();
+      for (index, proc) in procs.iter().enumerate() {
+        positions.entry((proc.pid, proc.meta.instance.as_str())).or_insert(index);
+      }
+      self.rows.clear();
+      for (index, group) in self.applications.iter().enumerate() {
+        let name = group.name.to_lowercase();
+        let all: Vec<_> = group
+          .members
+          .iter()
+          .filter_map(|member| positions.get(&(member.pid, member.instance.as_str())).copied())
+          .collect();
+        self.leaders.push(all.iter().copied().min_by_key(|&index| procs[index].pid).unwrap_or(0));
+        let mut members: Vec<_> = all
+          .into_iter()
+          .filter(|&member| {
+            filter.matches(|term| {
+              (group.kind == GroupKind::Application && name.contains(term))
+                || hit(&procs[member], term)
+            })
+          })
+          .collect();
+        // The immutable membership uses identities; the sorted sample provides child order.
+        members.sort_unstable();
+        self.rows.extend(&members);
+        if !members.is_empty() {
+          if group.kind == GroupKind::Application {
+            self.roots.push(DisplayRow::Application(index));
+          } else {
+            self
+              .roots
+              .extend(members.iter().map(|&index| DisplayRow::Process { index, parent: None }));
+          }
+        }
+        self.members.push(members);
+      }
+      let mut roots = std::mem::take(&mut self.roots);
+      roots.sort_by(|a, b| self.compare_roots(*a, *b));
+      self.roots = roots;
+    }
+    for &row in &self.roots {
+      self.display.push(row);
+      if let DisplayRow::Application(index) = row
+        && self.expanded.contains(&self.applications[index].id)
+      {
+        self.display.extend(
+          self.members[index]
+            .iter()
+            .map(|&member| DisplayRow::Process { index: member, parent: Some(index) }),
+        );
+      }
+    }
+  }
+
+  fn compare_roots(&self, a: DisplayRow, b: DisplayRow) -> Ordering {
+    let procs = self.procs.as_deref().unwrap_or_default();
+    let group = |row| match row {
+      DisplayRow::Application(index) => Some(&self.applications[index]),
+      _ => None,
+    };
+    let first = |row| match row {
+      DisplayRow::Process { index, .. } => &procs[index],
+      DisplayRow::Application(index) => &procs[self.leaders[index]],
+    };
+    let metric = |row| {
+      group(row)
+        .map_or_else(
+          || proc_reading(first(row), self.sort),
+          |g| match self.sort {
+            ProcSort::Cpu => g.cpu_pct,
+            ProcSort::Gpu => g.gpu_pct,
+            ProcSort::Power => g.power_w,
+            _ => None,
+          },
+        )
+        .map(f64::from)
+    };
+    let a_proc = first(a);
+    let b_proc = first(b);
+    let number = |value: Option<u64>, other: Option<u64>| {
+      let order = value.unwrap_or(0).cmp(&other.unwrap_or(0));
+      value.is_none().cmp(&other.is_none()).then(if self.sort_desc {
+        order.reverse()
+      } else {
+        order
+      })
+    };
+    let (missing, order) = match self.sort {
+      ProcSort::Cpu | ProcSort::Gpu | ProcSort::Power => {
+        let (a, b) = (metric(a), metric(b));
+        (a.is_none().cmp(&b.is_none()), a.unwrap_or(0.0).total_cmp(&b.unwrap_or(0.0)))
+      }
+      ProcSort::Time => {
+        return number(
+          group(a).map_or(Some(a_proc.cpu_time_ns), |g| g.cpu_time_ns),
+          group(b).map_or(Some(b_proc.cpu_time_ns), |g| g.cpu_time_ns),
+        )
+        .then_with(|| self.key(a).cmp(&self.key(b)));
+      }
+      ProcSort::Mem => {
+        return number(
+          group(a).map_or(Some(a_proc.mem_bytes), |g| g.mem_bytes),
+          group(b).map_or(Some(b_proc.mem_bytes), |g| g.mem_bytes),
+        )
+        .then_with(|| self.key(a).cmp(&self.key(b)));
+      }
+      ProcSort::Pid => (Ordering::Equal, a_proc.pid.cmp(&b_proc.pid)),
+      ProcSort::Name => (
+        Ordering::Equal,
+        group(a)
+          .map_or(&a_proc.name, |g| &g.name)
+          .to_lowercase()
+          .cmp(&group(b).map_or(&b_proc.name, |g| &g.name).to_lowercase()),
+      ),
+      ProcSort::User => {
+        (Ordering::Equal, a_proc.user.to_lowercase().cmp(&b_proc.user.to_lowercase()))
+      }
+    };
+    let order = if self.sort_desc { order.reverse() } else { order };
+    missing.then(order).then_with(|| self.key(a).cmp(&self.key(b)))
   }
 
   /// Fits the scroll position to a table body `height` rows high, keeping the selection visible
   /// and no blank rows below the last process.
   pub(super) fn fit(&mut self, height: usize) {
     self.page = height;
-    self.offset =
-      scroll_offset(self.offset, self.selected.map(|s| s.index), height, self.rows.len());
+    self.offset = scroll_offset(
+      self.offset,
+      self.selected.as_ref().map(|s| s.index),
+      height.max(1),
+      self.display.len(),
+    );
   }
 
   /// Rows on screen after `fit`, with a flag for the selected one.
-  pub(super) fn page_rows(&self) -> impl Iterator<Item = (bool, &ProcInfo)> {
-    let selected = self.selected.map(|s| s.index);
-    let rows = self.rows().enumerate().skip(self.offset).take(self.page);
-    rows.map(move |(i, proc)| (Some(i) == selected, proc))
+  fn page_display_rows(&self) -> impl Iterator<Item = (bool, DisplayRow)> + '_ {
+    let selected = self.selected.as_ref().map(|s| s.index);
+    self
+      .display
+      .iter()
+      .copied()
+      .enumerate()
+      .skip(self.offset)
+      .take(self.page)
+      .map(move |(i, row)| (Some(i) == selected, row))
+  }
+
+  #[cfg(test)]
+  fn page_rows(&self) -> impl Iterator<Item = (bool, &ProcInfo)> {
+    self.page_display_rows().filter_map(|(selected, row)| match row {
+      DisplayRow::Process { index, .. } => Some((selected, &self.procs.as_ref().unwrap()[index])),
+      _ => None,
+    })
   }
 
   fn select(&mut self, index: usize) {
-    let procs = self.procs.as_deref().unwrap_or_default();
-    self.selected = self.rows.get(index).map(|&i| Selection { pid: procs[i].pid, index });
+    self.selected = self.display.get(index).map(|&row| Selection { key: self.key(row), index });
   }
 
   /// Scrolls the table to show row `offset` first, without blank rows below the last process.
   fn scroll_to(&mut self, offset: usize) {
-    self.offset = offset.min(self.rows.len().saturating_sub(self.page));
+    self.offset = offset.min(self.display.len().saturating_sub(self.page.max(1)));
   }
 
   /// Moves the selection for a navigation key (↑ / ↓, PgUp / PgDn, Home / End), as `step` does.
@@ -670,7 +940,7 @@ impl ProcView {
   /// Returns `false` for other keys.
   fn navigate(&mut self, code: KeyCode) -> bool {
     let page = self.page.max(1);
-    let Some(selected) = self.selected.map(|s| s.index) else {
+    let Some(selected) = self.selected.as_ref().map(|s| s.index) else {
       match code {
         KeyCode::Up | KeyCode::Down => self.select(self.offset),
         KeyCode::PageUp => self.scroll_to(self.offset.saturating_sub(page)),
@@ -682,7 +952,7 @@ impl ProcView {
       return true;
     };
 
-    let Some(index) = step(code, selected, page, self.rows.len()) else { return false };
+    let Some(index) = step(code, selected, page, self.display.len()) else { return false };
     self.select(index);
     true
   }
@@ -703,6 +973,14 @@ impl ProcView {
         }
       }
       KeyCode::Char('/') => self.typing = true,
+      KeyCode::Char('g')
+        if !key
+          .modifiers
+          .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+      {
+        self.toggle_grouped()
+      }
+      KeyCode::Left | KeyCode::Right if self.grouped => self.tree_key(key.code == KeyCode::Right),
       KeyCode::Char('S') => self.reverse_sort(),
       KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::SHIFT) => self.reverse_sort(),
       KeyCode::Char('s') => self.next_sort(),
@@ -710,12 +988,56 @@ impl ProcView {
         self.selected = None;
         self.filter.clear();
         self.offset = 0;
-        self.refresh();
+        self.refresh_at(None);
       }
       _ => return false,
     }
 
     true
+  }
+
+  fn toggle_grouped(&mut self) {
+    self.grouped = !self.grouped;
+    if self.grouped {
+      self.expand_selected_process();
+    } else if self.selected.as_ref().is_some_and(|s| matches!(s.key, RowKey::Application(_))) {
+      self.selected = None;
+    }
+    self.refresh();
+  }
+
+  fn expand_selected_process(&mut self) {
+    if !self.grouped {
+      return;
+    }
+    if let Some(Selection { key: RowKey::Process(pid, instance), .. }) = &self.selected {
+      for group in &self.applications {
+        if group.kind == GroupKind::Application
+          && group.members.iter().any(|member| member.pid == *pid && member.instance == *instance)
+        {
+          self.expanded.insert(group.id.clone());
+        }
+      }
+    }
+  }
+
+  fn tree_key(&mut self, expand: bool) {
+    let Some(row) = self.selected.as_ref().and_then(|s| self.display.get(s.index)).copied() else {
+      return;
+    };
+    let index = match row {
+      DisplayRow::Application(index) => index,
+      DisplayRow::Process { parent: Some(index), .. } if !expand => index,
+      _ => return,
+    };
+    let id = self.applications[index].id.clone();
+    self.selected = Some(Selection { key: RowKey::Application(id.clone()), index: 0 });
+    if expand {
+      self.expanded.insert(id);
+    } else {
+      self.expanded.remove(&id);
+    }
+    self.refresh();
   }
 
   fn reverse_sort(&mut self) {
@@ -765,14 +1087,32 @@ impl ProcView {
   fn click(&mut self, at: Position) {
     self.end_typing();
     let targets = &self.targets;
-    if let Some(&(column, _)) = targets.headers.iter().find(|(_, cells)| cells.contains(at)) {
+    if let Some((id, _)) = targets.arrows.iter().find(|(_, cells)| cells.contains(at)) {
+      let id = id.clone();
+      let expand = !self.expanded.contains(&id);
+      self.selected = Some(Selection { key: RowKey::Application(id.clone()), index: 0 });
+      if expand {
+        self.expanded.insert(id);
+      } else {
+        self.expanded.remove(&id);
+      }
+      self.refresh();
+    } else if let Some(&(column, _)) = targets.headers.iter().find(|(_, cells)| cells.contains(at))
+    {
       self.sort_by(column);
     } else if targets.body.contains(at) {
       // blank rows below the last process select nothing
-      let index = self.offset + usize::from(at.y - targets.body.y);
-      if self.selected.is_some_and(|s| s.index == index) {
+      let relative = usize::from(at.y - targets.body.y);
+      let key = if self.summary_targets() {
+        targets.summary_rows.get(relative).cloned()
+      } else {
+        self.display.get(self.offset + relative).map(|row| self.key(*row))
+      };
+      if self.selected.as_ref().is_some_and(|s| Some(&s.key) == key.as_ref()) {
         self.selected = None;
-      } else if index < self.rows.len() {
+      } else if let Some(key) = key
+        && let Some(index) = self.display.iter().position(|row| self.key(*row) == key)
+      {
         self.select(index);
       }
     }
@@ -782,11 +1122,11 @@ impl ProcView {
   /// selected row keeps its place on screen until the table hits its top or end. Without a
   /// selection it only scrolls.
   fn wheel(&mut self, rows: isize) {
-    let Some(from) = self.selected.map(|s| s.index) else {
+    let Some(from) = self.selected.as_ref().map(|s| s.index) else {
       self.scroll_to(self.offset.saturating_add_signed(rows));
       return;
     };
-    let Some(last) = self.rows.len().checked_sub(1) else { return };
+    let Some(last) = self.display.len().checked_sub(1) else { return };
     let index = from.saturating_add_signed(rows).min(last);
     self.offset = (self.offset + index).saturating_sub(from);
     self.select(index);
@@ -797,6 +1137,31 @@ impl ProcView {
   /// `filter_titles` shows it, then `sort`, and `info | finder | copy | kill` on the
   /// right with a process selected (neither while typing: keys are text then).
   fn titles(&self, width: u16) -> Titles<'_> {
+    if self.grouped {
+      let name = format!(
+        "App totals {} · {}/{} procs",
+        self.roots.len(),
+        self.row_count(),
+        self.procs().map_or(0, <[_]>::len)
+      );
+      let titles =
+        filter_titles(vec![theme::value(name, theme::SECTION)], &self.filter, self.typing, width);
+      return if self.typing {
+        titles
+      } else {
+        let titles = titles.left(hint("g", "raw")).left(hint("s", "sort"));
+        if self.selected().is_some() {
+          titles.right(join([
+            hint("i", "info"),
+            hint("e", "finder"),
+            hint("c", "copy"),
+            hint("k", "kill"),
+          ]))
+        } else {
+          titles.left(hint("←/→", "members"))
+        }
+      };
+    }
     let mut name = vec![theme::value("proc", theme::SECTION)];
     if let Some(procs) = self.procs() {
       let total = procs.len().to_string();
@@ -827,6 +1192,18 @@ impl ProcView {
     let power = |known: bool| procs.iter().any(|p| p.power_w.is_some() == known);
     if self.copied {
       vec![faint("copied")]
+    } else if self.grouped {
+      let coverage = self
+        .selected
+        .as_ref()
+        .and_then(|s| self.display.get(s.index))
+        .and_then(|row| {
+          let DisplayRow::Application(index) = row else { return None };
+          let group = &self.applications[*index];
+          Some(format!(" · {}/{} matching", self.members[*index].len(), group.members.len()))
+        })
+        .unwrap_or_default();
+      vec![dim(format!("Application total{coverage} · memory sum · ≥ partial"))]
     } else if power_shown && power(true) && power(false) {
       vec![dim("POWER: own processes only")]
     } else {
@@ -842,7 +1219,20 @@ impl App {
   pub(super) fn render_proc_summary(&mut self, f: &mut Frame, area: Rect) {
     let view = &self.proc_view;
     let count = view.procs().map_or(0, <[_]>::len);
-    let title = if view.typing() || !view.filter().is_empty() {
+    let title = if view.grouped {
+      let name = if area.height < 5 {
+        format!("6 Processes · App totals {}", view.roots.len())
+      } else {
+        format!("6 Processes · apps · top 5 / {}", view.roots.len())
+      };
+      filter_titles(
+        vec![theme::value(name, theme::SECTION)],
+        view.filter(),
+        view.typing(),
+        area.width,
+      )
+      .right(hint("f", "full"))
+    } else if view.typing() || !view.filter().is_empty() {
       view.titles(area.width).right(hint("f", "full"))
     } else if area.height < 5 {
       Titles::new(theme::value(format!("6 Processes · {count}"), theme::SECTION))
@@ -870,20 +1260,46 @@ impl App {
       .map(|(column, _)| text(column.header_text(self.proc_view.sort, self.proc_view.sort_desc)))
       .collect();
     draw_row(f.buffer_mut(), Rect { height: 1, ..inner }, &columns, header.into_iter());
-    let rows = self.proc_view.rows().take(5).take(inner.height.saturating_sub(1) as usize);
-    for (index, proc) in rows.enumerate() {
-      let row = columns.iter().map(|(column, _)| self.proc_cell(*column, proc));
+    let rows =
+      self.proc_view.roots.iter().copied().take(5).take(inner.height.saturating_sub(1) as usize);
+    for (index, entry) in rows.enumerate() {
+      let row = columns.iter().map(|(column, _)| self.display_cell(*column, entry, true));
       let area = Rect { y: inner.y + index as u16 + 1, height: 1, ..inner };
       draw_row(f.buffer_mut(), area, &columns, row);
-      if self.proc_view.selected().is_some_and(|selected| selected.pid == proc.pid) {
+      if self
+        .proc_view
+        .selected
+        .as_ref()
+        .is_some_and(|selected| selected.key == self.proc_view.key(entry))
+      {
         f.buffer_mut().set_style(area, theme::SELECTED);
       }
     }
-    if self.proc_view.row_count() > 5 && area.height > 1 {
-      let shown = inner.height.saturating_sub(1).min(5);
-      let label =
-        Line::from(dim(format!(" {shown}/{} matched · f full ", self.proc_view.row_count())))
-          .right_aligned();
+    if self.proc_view.grouped {
+      let shown = (inner.height.saturating_sub(1) as usize).min(5).min(self.proc_view.roots.len());
+      let summary_rows =
+        self.proc_view.roots.iter().take(shown).map(|row| self.proc_view.key(*row)).collect();
+      self.proc_view.targets = Targets {
+        area,
+        headers: column_areas(Rect { height: 1, ..inner }, &columns),
+        body: Rect { y: inner.y + 1, height: shown as u16, ..inner },
+        arrows: Vec::new(),
+        summary_rows,
+      };
+    }
+    if (self.proc_view.grouped || self.proc_view.row_count() > 5) && area.height > 1 {
+      let shown = (inner.height.saturating_sub(1) as usize).min(5).min(self.proc_view.roots.len());
+      let label = if self.proc_view.grouped {
+        let scope = if self.proc_view.filter.is_empty() { "procs" } else { "matching" };
+        format!(
+          " {shown}/{} entries · {} {scope} · g raw ",
+          self.proc_view.roots.len(),
+          self.proc_view.row_count()
+        )
+      } else {
+        format!(" {shown}/{} matched · f full ", self.proc_view.row_count())
+      };
+      let label = Line::from(dim(label)).right_aligned();
       f.render_widget(
         label,
         Rect {
@@ -907,18 +1323,25 @@ impl App {
       titles.left(hint("6", "detail")).left(hint("f", "full"))
     };
     let inner = draw_box(f, area, titles);
-    let (headers, body) = self.render_proc_table(f, inner);
-    let power_shown = headers.iter().any(|&(column, _)| column == ProcSort::Power);
-    self.proc_view.targets = Targets { area, headers, body };
+    let mut targets = self.render_proc_table(f, inner);
+    let power_shown = targets.headers.iter().any(|&(column, _)| column == ProcSort::Power);
+    let body = targets.body;
+    targets.area = area;
+    self.proc_view.targets = targets;
 
     let view = &self.proc_view;
-    draw_scrollbar(f, area, body, view.row_count(), view.offset);
-    render_bottom_border(f, area, self.footer_hints(), |_| view.border_text(power_shown));
+    draw_scrollbar(f, area, body, view.display.len(), view.offset);
+    let hints = if view.grouped {
+      vec![hint("g", "raw"), hint("←/→", "members"), hint("?", "")]
+    } else {
+      self.footer_hints()
+    };
+    render_bottom_border(f, area, hints, |_| view.border_text(power_shown));
   }
 
   /// Header row and process rows in `inner`, or "collecting…" until the first sample. Returns the
   /// header cells of the columns and the area of the process rows.
-  fn render_proc_table(&mut self, f: &mut Frame, inner: Rect) -> (Vec<(ProcSort, Rect)>, Rect) {
+  fn render_proc_table(&mut self, f: &mut Frame, inner: Rect) -> Targets {
     if self.proc_view.procs().is_none() {
       let row = inner.centered_vertically(Constraint::Length(1));
       f.render_widget(Line::from(dim("collecting…")).centered(), row);
@@ -971,10 +1394,15 @@ impl App {
       buf.set_string(table.x, body.y - 1, line, Style::new().fg(theme::BORDER));
     }
 
-    for (i, (selected, proc)) in self.proc_view.page_rows().enumerate() {
+    let mut arrows = Vec::new();
+    let name = column_areas(header_row, &columns)
+      .into_iter()
+      .find(|(column, _)| *column == ProcSort::Name)
+      .map(|(_, area)| area);
+    for (i, (selected, row)) in self.proc_view.page_display_rows().enumerate() {
       let y = body.y + i as u16;
       let cells = columns.iter().map(|&(column, _)| {
-        let cell = self.proc_cell(column, proc);
+        let cell = self.display_cell(column, row, false);
         if column == sort {
           cell.patch_style(Style::new().add_modifier(Modifier::BOLD))
         } else {
@@ -982,13 +1410,69 @@ impl App {
         }
       });
       draw_row(buf, Rect { y, height: 1, ..table }, &columns, cells);
+      if let (DisplayRow::Application(index), Some(name)) = (row, name) {
+        arrows.push((self.proc_view.applications[index].id.clone(), Rect { y, width: 1, ..name }));
+      }
       // from border to border, so the row reads as one bar
       if selected {
         buf.set_style(Rect { y, height: 1, ..inner }, theme::SELECTED);
       }
     }
 
-    (column_areas(header_row, &columns), body)
+    Targets { headers: column_areas(header_row, &columns), body, arrows, ..Default::default() }
+  }
+
+  fn display_cell(&self, column: ProcSort, row: DisplayRow, summary: bool) -> Span<'static> {
+    let view = &self.proc_view;
+    match row {
+      DisplayRow::Process { index, parent } => {
+        let proc = &view.procs.as_ref().unwrap()[index];
+        match column {
+          ProcSort::Cpu | ProcSort::Gpu if view.grouped => {
+            grouped_rate(proc_reading(proc, column), false, column)
+          }
+          ProcSort::Power if view.grouped => {
+            grouped_rate(proc_reading(proc, column), false, column)
+          }
+          ProcSort::Mem if view.grouped => self.grouped_mem(proc.mem_bytes),
+          ProcSort::Time if view.grouped => text(grouped_time(proc.cpu_time_ns)),
+          ProcSort::Name if parent.is_some() => heading(format!("  {}", proc.name)),
+          _ => self.proc_cell(column, proc),
+        }
+      }
+      DisplayRow::Application(index) => {
+        let group = &view.applications[index];
+        let count = group.members.len();
+        match column {
+          ProcSort::Pid => text(format!("×{count}")),
+          ProcSort::Name => {
+            let arrow = if summary {
+              "Σ"
+            } else if view.expanded.contains(&group.id) {
+              "▼"
+            } else {
+              "▶"
+            };
+            let matching = if view.filter.is_empty() {
+              String::new()
+            } else {
+              format!("{}/{count} ", view.members[index].len())
+            };
+            heading(format!("{arrow} {matching}{}", group.name))
+          }
+          ProcSort::User => dim(view.procs.as_ref().unwrap()[view.leaders[index]].user.clone()),
+          ProcSort::Cpu => grouped_rate(group.cpu_pct, group.cpu_known < count, column),
+          ProcSort::Gpu => grouped_rate(group.gpu_pct, group.gpu_known < count, column),
+          ProcSort::Time => {
+            group.cpu_time_ns.map_or_else(|| dim("-"), |value| text(grouped_time(value)))
+          }
+          ProcSort::Mem => {
+            group.mem_bytes.map_or_else(|| dim("-"), |bytes| self.grouped_mem(bytes))
+          }
+          ProcSort::Power => grouped_rate(group.power_w, group.power_known < count, column),
+        }
+      }
+    }
   }
 
   /// Text of one table cell. Load values are colored by the gradient, zeros are dim and missing
@@ -1025,6 +1509,21 @@ impl App {
     let mem = bytes as f64;
     load_cell(mem, ratio(mem, self.mem.ram_total as f64), format_mem(bytes))
   }
+
+  fn grouped_mem(&self, bytes: u64) -> Span<'static> {
+    let mut value = bytes as f64;
+    let units = ["B", "K", "M", "G", "T", "P", "E"];
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < units.len() {
+      value /= 1024.0;
+      unit += 1;
+    }
+    load_cell(
+      bytes as f64,
+      ratio(bytes as f64, self.mem.ram_total as f64),
+      bounded_number(value, false, 6, 1, units[unit]),
+    )
+  }
 }
 
 /// A load value colored by the gradient at `ratio`; zero is dim.
@@ -1036,6 +1535,43 @@ fn load_cell(value: f64, ratio: f64, text: String) -> Span<'static> {
 fn pct_cell(pct: f32) -> Span<'static> {
   let pct = f64::from(pct);
   load_cell(pct, pct / 100.0, format!("{pct:.1}"))
+}
+
+/// Rounded values always retain the partial marker and unit inside their numeric column.
+fn bounded_number(value: f64, partial: bool, width: usize, decimals: usize, unit: &str) -> String {
+  let prefix = if partial { "≥" } else { "" };
+  let room = width.saturating_sub(usize::from(partial) + unit.len());
+  for decimals in (0..=decimals).rev() {
+    let number = format!("{value:.decimals$}");
+    if number.len() <= room {
+      return format!("{prefix}{number}{unit}");
+    }
+  }
+  for decimals in [1, 0] {
+    let number = format!("{value:.decimals$e}");
+    if number.len() <= room {
+      return format!("{prefix}{number}{unit}");
+    }
+  }
+  "-".into()
+}
+
+fn grouped_rate(value: Option<f32>, partial: bool, column: ProcSort) -> Span<'static> {
+  let Some(value) = value.map(f64::from) else { return dim("-") };
+  let power = column == ProcSort::Power;
+  let label = bounded_number(
+    value,
+    partial,
+    column.width() as usize,
+    if power { 2 } else { 1 },
+    if power { "W" } else { "" },
+  );
+  load_cell(value, value / if power { POWER_HOT_W } else { 100.0 }, label)
+}
+
+fn grouped_time(ns: u64) -> String {
+  let time = format_time(ns);
+  if time.len() <= 8 { time } else { format!("{}d", ns / 1_000_000_000 / 86400) }
 }
 
 /// CPU time; zero is dim.
@@ -1129,7 +1665,7 @@ mod tests {
   }
 
   fn view() -> ProcView {
-    let mut view = ProcView::default();
+    let mut view = ProcView::new(ProcSort::Cpu, true, false);
     view.set_procs(sample());
     view
   }
@@ -1146,6 +1682,389 @@ mod tests {
     for c in text.chars() {
       assert!(press(view, KeyCode::Char(c)), "{c:?} not used");
     }
+  }
+
+  fn grouped_sample() -> Vec<ProcInfo> {
+    let mut sample = sample();
+    for proc in &mut sample {
+      proc.meta.instance = format!("instance-{}", proc.pid);
+      proc.meta.known = (true, true);
+      if [2301, 77].contains(&proc.pid) {
+        proc.meta.app = Some(crate::proc_groups::AppIdentity {
+          id: "app-safari".into(),
+          name: "Safari 浏览器".into(),
+        });
+      }
+    }
+    sample[4].name = "Bookmarks XPC".into();
+    sample
+  }
+
+  fn grouped_view() -> ProcView {
+    let mut view = ProcView::new(ProcSort::Cpu, true, true);
+    view.set_procs(grouped_sample());
+    view
+  }
+
+  fn safari(view: &ProcView) -> usize {
+    view.applications.iter().position(|group| group.id == "app-safari").unwrap()
+  }
+
+  #[test]
+  fn application_totals_are_filter_independent_and_member_matches_are_explicit() {
+    for (filter, matched) in
+      [("safari", 2), ("浏览器", 2), ("bookmarks", 1), ("2301", 1), ("safari,!bookmarks", 1)]
+    {
+      let mut view = grouped_view();
+      let initial = view.applications[safari(&view)].clone();
+      press(&mut view, KeyCode::Char('/'));
+      type_str(&mut view, filter);
+      assert!(press(&mut view, KeyCode::Enter));
+      assert_eq!(view.roots.len(), 1, "{filter}");
+      assert_eq!(view.row_count(), matched, "{filter}");
+      assert!(view.groups().is_empty());
+      let group = &view.applications[safari(&view)];
+      assert_eq!(
+        (group.cpu_pct, group.mem_bytes, group.members.len()),
+        (initial.cpu_pct, initial.mem_bytes, 2)
+      );
+      view.select(0);
+      assert!(view.selected().is_none());
+      assert!(press(&mut view, KeyCode::Right));
+      assert_eq!(view.display.len(), matched + 1);
+      assert_eq!(view.row_count(), matched);
+    }
+    let mut view = grouped_view();
+    press(&mut view, KeyCode::Char('/'));
+    type_str(&mut view, "!Safari");
+    assert_eq!(
+      view.row_count(),
+      3,
+      "excluding an application also excludes its differently named helper"
+    );
+  }
+
+  #[test]
+  fn grouped_navigation_never_arms_a_pid_on_an_application_summary() {
+    let mut view = grouped_view();
+    let root =
+      view.roots.iter().position(|row| matches!(row, super::DisplayRow::Application(_))).unwrap();
+    view.select(root);
+    assert_eq!(view.selected_pid(), None);
+    press(&mut view, KeyCode::Right);
+    assert_eq!(view.selected_pid(), None);
+    view.fit(3);
+    press(&mut view, KeyCode::Down);
+    assert_eq!(view.selected_pid(), Some(2301));
+    press(&mut view, KeyCode::Left);
+    assert_eq!(view.selected_pid(), None);
+    assert_eq!(view.display.len(), 4);
+    press(&mut view, KeyCode::Char('g'));
+    assert!(!view.grouped && view.selected_pid().is_none());
+    assert_eq!(view.display.len(), 5);
+    view.select(2); // Safari in the raw CPU order.
+    assert_eq!(view.selected_pid(), Some(2301));
+    press(&mut view, KeyCode::Char('g'));
+    assert_eq!(view.selected_pid(), Some(2301));
+    assert!(view.expanded.contains("app-safari"));
+  }
+
+  #[test]
+  fn refresh_preserves_instances_expansion_and_scroll_but_reuse_and_exec_do_not_inherit_selection()
+  {
+    let mut view = grouped_view();
+    view.expanded.insert("app-safari".into());
+    view.refresh();
+    let index = view.display.iter().position(|row| matches!(row, super::DisplayRow::Process { index, .. } if view.procs.as_ref().unwrap()[*index].pid == 2301)).unwrap();
+    view.select(index);
+    view.fit(2);
+    let mut sample = grouped_sample();
+    sample[2].cpu_pct = 900.0;
+    view.set_procs(sample.clone());
+    assert_eq!(view.selected_pid(), Some(2301));
+    view.fit(2);
+    assert!(view.selected.as_ref().unwrap().index >= view.offset);
+    assert!(view.selected.as_ref().unwrap().index < view.offset + 2);
+    sample[2].meta.instance = "new-exec-or-reused-pid".into();
+    view.set_procs(sample);
+    assert_eq!(view.selected_pid(), None);
+    assert!(view.expanded.contains("app-safari"));
+    view.set_procs(Vec::new());
+    assert!(view.expanded.is_empty());
+    view.set_procs(grouped_sample());
+    assert!(view.selected.is_none() && view.expanded.is_empty());
+
+    view.fit(1);
+    view.scroll_to(2);
+    let anchor = view.anchor();
+    let mut sample = grouped_sample();
+    sample[2].cpu_pct = 999.0;
+    view.set_procs(sample);
+    assert_eq!(view.anchor(), anchor, "an unselected scroll position follows its identity");
+  }
+
+  #[test]
+  fn late_attribution_keeps_the_same_instance_and_respects_manual_collapse() {
+    let attributed = grouped_sample();
+    for changed_instance in [false, true] {
+      let mut initial = attributed.clone();
+      for proc in &mut initial {
+        proc.meta.app = None;
+      }
+      let mut view = ProcView::new(ProcSort::Cpu, true, true);
+      view.set_procs(initial);
+      view.select(2);
+      assert_eq!(view.selected_pid(), Some(2301));
+      let mut next = attributed.clone();
+      if changed_instance {
+        next[2].meta.instance = "exec-before-attribution".into();
+      }
+      view.set_procs(next.clone());
+      if changed_instance {
+        assert!(view.selected.is_none() && view.expanded.is_empty());
+      } else {
+        assert_eq!(view.selected_pid(), Some(2301));
+        assert!(view.expanded.contains("app-safari"));
+        press(&mut view, KeyCode::Left);
+        view.set_procs(next);
+        assert!(view.selected_application() && view.expanded.is_empty());
+      }
+    }
+  }
+
+  #[test]
+  fn grouped_sort_preserves_all_columns_and_unknown_totals_go_last_in_both_directions() {
+    let mut sample = grouped_sample();
+    sample[2].cpu_pct = 250.0;
+    sample[4].mem_bytes = u64::MAX;
+    sample[4].cpu_time_ns = u64::MAX;
+    sample[0].meta.known = (false, false);
+    let mut view = ProcView::new(ProcSort::Cpu, true, true);
+    view.set_procs(sample);
+    assert_eq!(view.applications[safari(&view)].cpu_pct, Some(250.0));
+    for sort in [ProcSort::Time, ProcSort::Mem] {
+      for desc in [false, true] {
+        view.sort = sort;
+        view.sort_desc = desc;
+        view.refresh();
+        assert!(
+          matches!(view.roots.last(), Some(super::DisplayRow::Application(_))),
+          "{sort:?} {desc}"
+        );
+      }
+    }
+    for sort in [ProcSort::Cpu, ProcSort::Gpu, ProcSort::Power] {
+      for desc in [false, true] {
+        view.sort = sort;
+        view.sort_desc = desc;
+        view.refresh();
+        let last = *view.roots.last().unwrap();
+        assert!(
+          matches!(last, super::DisplayRow::Process { index, .. } if view.procs.as_ref().unwrap()[index].pid == 1)
+        );
+      }
+    }
+    for sort in [ProcSort::Pid, ProcSort::Name, ProcSort::User] {
+      view.sort = sort;
+      view.refresh();
+      assert_eq!(view.roots.len(), 4);
+    }
+    view.sort = ProcSort::Pid;
+    view.sort_desc = false;
+    view.refresh();
+    assert!(
+      matches!(view.roots[1], super::DisplayRow::Application(_)),
+      "Safari sorts by its helper's PID 77"
+    );
+  }
+
+  #[test]
+  fn group_mode_is_text_while_filtering_and_arrows_do_not_toggle_a_panel() {
+    let mut view = grouped_view();
+    press(&mut view, KeyCode::Char('/'));
+    type_str(&mut view, "g");
+    assert_eq!(view.filter(), "g");
+    press(&mut view, KeyCode::Right);
+    assert!(view.grouped && view.typing() && view.expanded.is_empty());
+  }
+
+  fn grouped_app() -> crate::tui::App {
+    let mut app =
+      crate::tui::App::from_parts(Default::default(), crate::config::Config::load_from(None));
+    app.proc_view = grouped_view();
+    app.panels.fullscreen = true;
+    app.set_procs_visible(true);
+    app
+  }
+
+  fn draw(app: &mut crate::tui::App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    term.backend().buffer().clone()
+  }
+
+  fn screen(buf: &ratatui::buffer::Buffer) -> String {
+    buf.content.iter().map(|cell| cell.symbol()).collect()
+  }
+
+  #[test]
+  fn only_the_arrow_toggles_members_and_all_other_cells_only_select() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = grouped_app();
+    let before = draw(&mut app, 100, 24);
+    let text = screen(&before);
+    assert!(
+      text.contains("Safari") && ['浏', '览', '器'].iter().all(|letter| text.contains(*letter))
+    );
+    let (_, arrow) = app.proc_view.targets.arrows[0].clone();
+    let click = |app: &mut crate::tui::App, column| {
+      app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row: arrow.y,
+        modifiers: KeyModifiers::NONE,
+      })
+    };
+    click(&mut app, arrow.x + 2);
+    assert!(app.proc_view.selected().is_none());
+    assert!(app.proc_view.expanded.is_empty());
+    click(&mut app, arrow.x);
+    assert!(app.proc_view.expanded.contains("app-safari"));
+    assert_eq!(app.proc_view.display.len(), 6);
+    draw(&mut app, 100, 24);
+    click(&mut app, arrow.x + 2);
+    assert!(
+      app.proc_view.expanded.contains("app-safari"),
+      "a second row click only changes selection"
+    );
+    click(&mut app, arrow.x);
+    assert!(app.proc_view.expanded.is_empty());
+    assert_eq!(app.cfg.panel_details, [false; 6]);
+  }
+
+  #[test]
+  fn grouped_table_shows_matching_totals_partial_readings_and_unknown_standalone_rates() {
+    let mut app = grouped_app();
+    let mut sample = grouped_sample();
+    sample[2].cpu_pct = 250.0;
+    sample[4].meta.known = (false, false);
+    sample[0].meta.known = (false, false);
+    app.proc_view.set_procs(sample);
+    let _ = app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    for code in "bookmarks".chars() {
+      let _ = app.handle_key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE));
+    }
+    let _ = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let _ = app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert!(
+      app.proc_view.selected.is_some(),
+      "pre-render navigation still selects the only summary"
+    );
+    let buf = draw(&mut app, 120, 24);
+    let text = screen(&buf);
+    for expected in ["1/2", "Application total", "1/2 matching", "≥250.0", "≥5.0", "≥0.80W", "×2"]
+    {
+      assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(!text.contains("POWER: own processes only"));
+    let _ = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)); // full view returns first
+    let _ = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)); // selection/filter
+    let view = &app.proc_view;
+    let index = view.procs().unwrap().iter().position(|proc| proc.pid == 1).unwrap();
+    for column in [ProcSort::Cpu, ProcSort::Gpu, ProcSort::Power] {
+      assert_eq!(
+        app.display_cell(column, super::DisplayRow::Process { index, parent: None }, false).content,
+        "-"
+      );
+    }
+  }
+
+  #[test]
+  fn large_application_totals_keep_complete_numbers_markers_and_units_in_real_columns() {
+    for partial in [false, true] {
+      let mut app = grouped_app();
+      let mut sample = grouped_sample();
+      sample[2].cpu_pct = if partial { 1250.0 } else { f32::MAX };
+      sample[2].gpu_pct = f32::MAX;
+      sample[2].power_w = Some(f32::MAX);
+      sample[2].mem_bytes = u64::MAX;
+      sample[2].cpu_time_ns = u64::MAX;
+      sample[4].meta.known = (!partial, !partial);
+      sample[4].mem_bytes = 0;
+      sample[4].cpu_time_ns = 0;
+      app.proc_view.set_procs(sample);
+      let buf = draw(&mut app, 140, 24);
+      let y = app.proc_view.targets.body.y;
+      for (column, expected) in [
+        (ProcSort::Cpu, if partial { "≥1250" } else { "3.4e38" }),
+        (ProcSort::Gpu, if partial { "≥3e38" } else { "3.4e38" }),
+        (ProcSort::Power, if partial { "≥3e38W" } else { "3.4e38W" }),
+        (ProcSort::Mem, "16.0E"),
+        (ProcSort::Time, "213503d"),
+      ] {
+        let (_, area) =
+          app.proc_view.targets.headers.iter().find(|(key, _)| *key == column).unwrap();
+        let cells: String = (area.x..area.right()).map(|x| buf[(x, y)].symbol()).collect();
+        assert_eq!(cells.trim(), expected, "{column:?} partial={partial}; buffer={}", screen(&buf));
+      }
+    }
+  }
+
+  #[test]
+  fn root_summary_and_expanded_pagination_keep_separate_counts_across_narrow_resizes() {
+    let mut app = grouped_app();
+    let mut sample = grouped_sample();
+    for index in 0..12 {
+      let mut proc = sample[2].clone();
+      proc.pid = 5000 + index;
+      proc.meta.instance = format!("helper-{index}");
+      proc.name = format!("Renderer {index}");
+      sample.push(proc);
+    }
+    app.proc_view.set_procs(sample);
+    let group = safari(&app.proc_view);
+    app.proc_view.expanded.insert(app.proc_view.applications[group].id.clone());
+    app.proc_view.refresh();
+    assert_eq!(
+      (app.proc_view.roots.len(), app.proc_view.row_count(), app.proc_view.display.len()),
+      (4, 17, 18)
+    );
+    for (width, height) in [(28, 12), (80, 24), (5, 3), (0, 0), (80, 24)] {
+      draw(&mut app, width, height);
+      app.proc_view.select(0);
+      press(&mut app.proc_view, KeyCode::End);
+      draw(&mut app, width, height);
+      if width >= 28 && height >= 12 {
+        assert_eq!(app.proc_view.selected.as_ref().unwrap().index, 17);
+      } else {
+        assert_eq!(app.proc_view.selected_pid(), None, "no hidden PID in {width}×{height}");
+      }
+      press(&mut app.proc_view, KeyCode::Home);
+      if width >= 28 && height >= 12 {
+        assert_eq!(app.proc_view.selected.as_ref().unwrap().index, 0);
+      } else {
+        assert_eq!(app.proc_view.selected_pid(), None);
+        assert_eq!(app.proc_view.offset, 0);
+      }
+    }
+    app.panels.fullscreen = false;
+    let text = screen(&draw(&mut app, 80, 24));
+    assert!(text.contains("top 5 / 4"), "{text}");
+    assert!(text.contains("4/4 entries") && text.contains("17 procs"), "{text}");
+    assert!(!text.contains("Renderer 11"), "summary shows roots, not expanded children");
+  }
+
+  #[test]
+  fn a_filtered_compact_summary_reports_the_actual_one_visible_root() {
+    let mut app = grouped_app();
+    let _ = app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    for character in "bookmarks".chars() {
+      let _ = app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    let _ = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.panels.fullscreen = false;
+    let text = screen(&draw(&mut app, 80, 24));
+    assert!(text.contains("1/1 entries") && !text.contains("5/1 entries"), "{text}");
   }
 
   #[test]
@@ -1165,11 +2084,11 @@ mod tests {
     ];
 
     for (sort, desc, asc) in cases {
-      let mut view = ProcView::new(sort, true);
+      let mut view = ProcView::new(sort, true, false);
       view.set_procs(sample());
       assert_eq!(pids(&view), desc, "{sort:?} desc");
 
-      let mut view = ProcView::new(sort, false);
+      let mut view = ProcView::new(sort, false, false);
       view.set_procs(sample());
       assert_eq!(pids(&view), asc, "{sort:?} asc");
     }
@@ -1551,7 +2470,7 @@ mod tests {
     let names = [("one", 1), ("two", 29), ("three", 294)];
     let procs = names.iter().flat_map(|&(name, n)| (0..n).map(move |_| name));
     let procs = procs.enumerate().map(|(i, name)| proc(i as i32 + 1, name, 0.0, 1, None, 0.0));
-    let mut view = ProcView::default();
+    let mut view = ProcView::new(ProcSort::Cpu, true, false);
     view.set_procs(procs.collect());
 
     // the top border of a box 80 cells wide, and the cell where the filter starts

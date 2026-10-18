@@ -91,6 +91,10 @@ pub struct Config {
   #[serde_inline_default(true)]
   pub proc_sort_desc: bool,
 
+  /// Application summaries (`g`); expansion is kept only for this run.
+  #[serde_inline_default(true)]
+  pub proc_grouped: bool,
+
   /// Interval from `-i` for this run only: used instead of the saved one, never saved. `-` / `+`
   /// replace both.
   #[serde(skip)]
@@ -267,6 +271,11 @@ impl Config {
   pub fn set_proc_sort(&mut self, sort: ProcSort, desc: bool) {
     self.proc_sort = sort;
     self.proc_sort_desc = desc;
+    self.save();
+  }
+
+  pub fn set_proc_grouped(&mut self, grouped: bool) {
+    self.proc_grouped = grouped;
     self.save();
   }
 }
@@ -463,6 +472,29 @@ mod tests {
     cfg.set_proc_sort(ProcSort::Time, true);
     assert_eq!(file.saved()["proc_sort"], "Time");
     assert_eq!(Config::load_from(Some(file.path())).proc_sort, ProcSort::Time);
+  }
+
+  #[test]
+  fn grouped_process_preference_is_additive_and_does_not_persist_application_ids() {
+    let old = r#"{"view_type":"Gauge","panel_details":[true,false,true,false,true,false],"disk_details":true,"proc_sort":"Time"}"#;
+    let cfg = parse(old);
+    assert!(cfg.proc_grouped);
+    let original = cfg.panel_details;
+    for invalid in ["null", "1", "\"false\"", "[]"] {
+      assert!(parse(&format!(r#"{{"proc_grouped":{invalid}}}"#)).proc_grouped);
+    }
+    let file = TempConfig::new("proc_grouped");
+    let mut cfg = Config::load_from(Some(file.path()));
+    cfg.panel_details = original;
+    cfg.disk_details = true;
+    cfg.set_proc_grouped(false);
+    let saved = file.saved();
+    assert_eq!(saved["proc_grouped"], false);
+    assert_eq!(saved["panel_details"].as_array().unwrap().len(), 6);
+    assert!(saved.get("expanded").is_none());
+    let loaded = Config::load_from(Some(file.path()));
+    assert!(!loaded.proc_grouped && loaded.disk_details);
+    assert_eq!(loaded.panel_details, original);
   }
 
   #[test]

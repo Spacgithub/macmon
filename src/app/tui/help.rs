@@ -38,6 +38,8 @@ const HELP: &[Row] = &[
   Key("- / +", "update interval"),
   Key("/", "filter the processes"),
   Key("s / S", "sort by the next column / reverse"),
+  Key("g", "application groups / individual processes"),
+  Key("← / →", "collapse / expand an application; child left returns to its group"),
   Key("↑ ↓", "select a process"),
   Key("i", "open files and sockets of the selected process"),
   Key("e", "show the selected process in Finder"),
@@ -55,6 +57,10 @@ const HELP: &[Row] = &[
   Section("Notes"),
   Term("CPU%", "100% is one fully busy core"),
   Term("TIME", "CPU time used since the process started"),
+  Term("Application", "summary totals include all members, even while filtering"),
+  Term("App memory", "sum of process memory, not deduplicated physical memory"),
+  Term("App GPU%", "sum of process shares, not device utilization; ≥ is partial"),
+  Term("App PID sort", "groups use the lowest member PID; ×N is a count, not a PID"),
   Term("freq", "usage weighted by frequency; raw: share of time busy"),
   Term("POWER -", "not available for other users' processes"),
   Term("Network", "per-interface counters; tunnels are never added together"),
@@ -172,11 +178,11 @@ mod tests {
 
   #[test]
   fn keys_are_cyan_and_terms_bold() {
-    let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(80, 54)).unwrap();
     term.draw(|f| _ = render(f, f.area(), 0)).unwrap();
     let buf = term.backend().buffer();
     let rows: Vec<String> =
-      (0..40).map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect()).collect();
+      (0..54).map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect()).collect();
     // `(fg, modifier)` of each cell of `text` on the row that says `what`
     let style = |what: &str, text: &str| {
       let y = rows.iter().position(|row| row.contains(what)).unwrap();
@@ -192,6 +198,7 @@ mod tests {
     assert_eq!(style("fan motion", "a"), [key]);
     assert_eq!(style("update interval", "- / +"), [key, faint, faint, faint, key]);
     assert_eq!(style("select a process", "↑ ↓"), [key; 3]);
+    assert_eq!(style("application groups", "g"), [key]);
     assert_eq!(style("clear the selection", "Esc"), [key; 3]);
     assert_eq!(style("update interval", "update"), [plain; 6]);
     // the mouse and the notes bold, not keys

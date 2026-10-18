@@ -451,6 +451,8 @@ pub struct App {
 
   /// Process panel state with the latest process list (none until the first sample with rates).
   proc_view: ProcView,
+  /// Last physical frame; density changes use current settings, never stale mouse targets.
+  screen_area: Rect,
   /// Whether processes are requested; folding and resizing retain the sampling session.
   procs_shown: Arc<ProcsShown>,
   /// The last window has cells; `p` remains usable when only the focused table can fit.
@@ -473,7 +475,7 @@ impl App {
   /// first frame already has their boxes and the chip title its core counts.
   fn from_parts(soc: SocInfo, cfg: Config) -> Self {
     let clusters = CpuClusters::from_soc(&soc);
-    let proc_view = ProcView::new(cfg.proc_sort, cfg.proc_sort_desc);
+    let proc_view = ProcView::new(cfg.proc_sort, cfg.proc_sort_desc, cfg.proc_grouped);
     let mut panels = PanelState::default();
     if !cfg.show_procs {
       panels.focus = Panel::Compute;
@@ -531,7 +533,9 @@ impl App {
       procs.iter_mut().for_each(|proc| proc.power_w = None);
     }
     if self.procs_shown.showing() == Some(showing) {
+      self.normalize_proc_selection();
       self.proc_view.set_procs(procs);
+      self.normalize_proc_selection();
       if let Some(info) = &mut self.info {
         info.update_proc(self.proc_view.procs().unwrap_or_default());
         info.refresh(&*self.kill.sys);
@@ -628,6 +632,7 @@ impl App {
     if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
       return ControlFlow::Break(());
     }
+    self.normalize_proc_selection();
     // `copied` shows until the next key
     self.proc_view.copied = false;
 
@@ -663,6 +668,14 @@ impl App {
     }
     if self.handle_panel_key(key) {
       return ControlFlow::Continue(());
+    }
+    if self.procs_visible()
+      && self.panels.focus == Panel::Processes
+      && key.code == KeyCode::Right
+      && self.proc_view.summary_targets()
+      && self.proc_view.selected_application()
+    {
+      self.panels.fullscreen = true;
     }
     if self.procs_visible()
       && self.panels.focus == Panel::Processes
@@ -721,6 +734,11 @@ impl App {
       self.kill.handle_mouse(mouse);
     } else if self.handle_panel_mouse(mouse) {
     } else if self.wants_mouse() && self.panels.focus == Panel::Processes {
+      if self.proc_view.summary_targets()
+        && matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+      {
+        self.panels.fullscreen = true;
+      }
       self.update_proc_view(|view| view.handle_mouse(mouse));
     }
   }
@@ -728,10 +746,15 @@ impl App {
   /// Runs `f` on the process panel state and saves a changed sort order.
   fn update_proc_view<R>(&mut self, f: impl FnOnce(&mut ProcView) -> R) -> R {
     let sort = (self.proc_view.sort, self.proc_view.sort_desc);
+    let grouped = self.proc_view.grouped;
     let result = f(&mut self.proc_view);
     if (self.proc_view.sort, self.proc_view.sort_desc) != sort {
       self.cfg.set_proc_sort(self.proc_view.sort, self.proc_view.sort_desc);
     }
+    if self.proc_view.grouped != grouped {
+      self.cfg.set_proc_grouped(self.proc_view.grouped);
+    }
+    self.normalize_proc_selection();
     result
   }
 
@@ -849,6 +872,8 @@ impl App {
   }
 
   fn render(&mut self, f: &mut Frame) {
+    self.screen_area = f.area();
+    self.normalize_proc_selection();
     #[cfg(test)]
     {
       self.widget_frames += 1;
@@ -1469,6 +1494,7 @@ mod tests {
     // Existing metric/table regressions exercise the all-expanded advanced layout.
     let mut cfg = Config::default();
     cfg.panel_details = [true; 6];
+    cfg.proc_grouped = false;
     let mut app = App::from_parts(test_soc(), cfg);
     // Legacy metric/process tests exercise the compact RPM path. Complete native/text fans
     // and their adaptive placement are covered with valid cell geometry in fan_preview.
@@ -1883,7 +1909,7 @@ mod tests {
     let mut app = with_procs(test_app(), varied_procs());
     assert!(app.handle_key(key('?')).is_continue());
 
-    let buf = render_buffer(&mut app, 200, 50);
+    let buf = render_buffer(&mut app, 200, 60);
     let at = buf.content.iter().position(|cell| cell.symbol() == link).expect("no link");
     assert_eq!(
       buf.content[at].diff_option,
@@ -1899,9 +1925,9 @@ mod tests {
     assert!(left.abs_diff(right) <= 1, "{left} blank cells on the left, {right} on the right");
 
     // still whole in a 60 cells window; cut in a narrower one: plain text, no link
-    let buf = render_buffer(&mut app, 60, 50);
+    let buf = render_buffer(&mut app, 60, 60);
     assert!(buf.content.iter().any(|cell| cell.symbol() == link));
-    let buf = render_buffer(&mut app, 40, 50);
+    let buf = render_buffer(&mut app, 40, 60);
     assert!(screen_text(&buf).contains("Like macmon"));
     assert!(!buf.content.iter().any(|cell| cell.symbol().contains("\x1b]8")));
   }
@@ -2415,6 +2441,7 @@ mod tests {
     };
     let mut cfg = Config::default();
     cfg.panel_details = [true; 6];
+    cfg.proc_grouped = false;
     let mut app = App::from_parts(soc, cfg);
     let metrics = Metrics {
       cpu_active_ratio: 0.63,
@@ -2458,6 +2485,7 @@ mod tests {
       let soc = SocInfo { vm, ..test_soc() };
       let mut cfg = Config::default();
       cfg.panel_details = [true; 6];
+      cfg.proc_grouped = false;
       let app = &mut with_procs(App::from_parts(soc, cfg), varied_procs());
       let buf = render_buffer(app, 200, 50);
       assert_eq!(app.layout(buf.area).boxes.len(), boxes, "vm {vm}");
@@ -2887,6 +2915,310 @@ mod tests {
       OpenFile { fd: Some(3), kind: Kind::File, text: "/var/log/system.log".into(), mode: "r-" };
     fake.0.borrow_mut().files.insert(631, Ok(vec![cwd, log]));
     (app, fake)
+  }
+
+  #[test]
+  fn application_summaries_never_trigger_pid_actions_and_explicit_children_keep_existing_actions() {
+    let (mut app, fake) = info_app();
+    let mut procs = varied_procs();
+    for proc in &mut procs {
+      proc.meta.instance = format!("instance-{}", proc.pid);
+      proc.meta.known = (true, true);
+      if proc.pid > 100 {
+        proc.meta.app = Some(crate::proc_groups::AppIdentity {
+          id: "example-app".into(),
+          name: "Example App".into(),
+        });
+      }
+    }
+    put_procs(&mut app, procs);
+    assert!(app.handle_key(key('g')).is_continue());
+    assert!(app.cfg.proc_grouped && app.proc_view.grouped);
+    let _ = press(&mut app, KeyCode::Down);
+    assert_eq!(app.proc_view.selected_pid(), None);
+    for action in ['i', 'e', 'c', 'k'] {
+      assert!(app.handle_key(key(action)).is_continue());
+    }
+    assert!(app.info.is_none() && !app.kill.is_open());
+    assert!(fake.calls().is_empty());
+    assert!(fake.0.borrow().revealed.is_empty() && fake.0.borrow().copied.is_empty());
+    let _ = press(&mut app, KeyCode::Right);
+    let _ = press(&mut app, KeyCode::Down);
+    assert_eq!(app.proc_view.selected_pid(), Some(631));
+    let _ = app.handle_key(key('i'));
+    assert!(app.info.is_some());
+    let _ = app.handle_key(key('g'));
+    assert!(app.cfg.proc_grouped, "the info overlay owns its keys");
+    let _ = app.handle_key(key('q'));
+    let _ = app.handle_key(key('e'));
+    let _ = app.handle_key(key('c'));
+    assert_eq!(fake.0.borrow().revealed, [WINDOW_SERVER]);
+    assert_eq!(fake.0.borrow().copied, [WINDOW_SERVER]);
+    let _ = app.handle_key(key('k'));
+    assert!(app.kill.is_open());
+    let _ = app.handle_key(key('g'));
+    assert!(app.cfg.proc_grouped, "the kill popup owns its keys");
+    let _ = app.handle_key(key('t'));
+    assert_eq!(fake.calls(), [(631, 0), (631, libc::SIGTERM)]);
+    let _ = press(&mut app, KeyCode::Left);
+    assert_eq!(app.proc_view.selected_pid(), None);
+    let _ = app.handle_key(key('g'));
+    assert!(!app.cfg.proc_grouped && app.proc_view.selected_pid().is_none());
+  }
+
+  #[test]
+  fn grouping_keys_preserve_panel_preferences_and_sampling_in_compact_and_dual_fan_legacy_layouts()
+  {
+    for width in [80, 120, 140] {
+      let mut app = test_app_with(|metrics| {
+        metrics.fans = ["fan0", "fan1"]
+          .map(|name| FanMetric { name: name.into(), rpm: 1800, max_rpm: None })
+          .into();
+      });
+      app.cell_pixels = Some((9, 18));
+      let mut procs = varied_procs();
+      for proc in &mut procs {
+        proc.meta.instance = format!("instance-{}", proc.pid);
+        proc.meta.known = (true, true);
+        if proc.pid > 100 {
+          proc.meta.app = Some(crate::proc_groups::AppIdentity {
+            id: "example-app".into(),
+            name: "Example App".into(),
+          });
+        }
+      }
+      let mut app = with_procs(app, procs);
+      let height = if width == 80 { 24 } else { 40 };
+      render_buffer(&mut app, width, height);
+      let showing = app.procs_shown.showing();
+      let preferences = (app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs);
+      let _ = app.handle_key(key('g'));
+      let text = render_to_string(&mut app, width, height);
+      assert_eq!(app.placements.len(), 2);
+      assert!(text.contains("App totals"));
+      assert_eq!(app.procs_shown.showing(), showing);
+      let _ = app.handle_key(key('f'));
+      let _ = press(&mut app, KeyCode::Down);
+      let _ = press(&mut app, KeyCode::Right);
+      let text = render_to_string(&mut app, width, height);
+      assert!(text.contains("WindowServer") && text.contains("Safari"));
+      let _ = app.handle_key(key('f'));
+      render_buffer(&mut app, width, height);
+      assert_eq!(app.placements.len(), 2);
+      assert_eq!((app.cfg.panel_details, app.cfg.disk_details, app.cfg.show_procs), preferences);
+      assert_eq!(app.procs_shown.showing(), showing);
+      let _ = app.handle_key(key('/'));
+      let _ = app.handle_key(key('g'));
+      assert_eq!(app.proc_view.filter(), "g");
+      assert!(app.cfg.proc_grouped);
+    }
+  }
+
+  #[test]
+  fn grouped_summary_clicks_select_roots_without_inheriting_hidden_child_actions() {
+    let (mut app, fake) = info_app();
+    let mut procs = varied_procs();
+    for proc in &mut procs {
+      proc.meta.instance = format!("instance-{}", proc.pid);
+      proc.meta.known = (true, true);
+      if proc.pid > 100 {
+        proc.meta.app = Some(crate::proc_groups::AppIdentity {
+          id: "example-app".into(),
+          name: "Example App".into(),
+        });
+      }
+    }
+    let mut other = procs[2].clone();
+    other.pid = 9000;
+    other.name = "Other main".into();
+    other.cpu_pct = 3.0;
+    other.meta.instance = "other-instance".into();
+    other.meta.app =
+      Some(crate::proc_groups::AppIdentity { id: "other-app".into(), name: "Other App".into() });
+    procs.push(other);
+    put_procs(&mut app, procs.clone());
+    let showing = app.procs_shown.showing();
+    app.cfg.panel_details = [false; 6];
+    let _ = app.handle_key(key('g'));
+    let _ = app.handle_key(key('f'));
+    let _ = press(&mut app, KeyCode::Down);
+    let _ = press(&mut app, KeyCode::Right);
+    let _ = press(&mut app, KeyCode::Down);
+    assert_eq!(app.proc_view.selected_pid(), Some(631));
+    let _ = app.handle_key(key('f'));
+    let buf = render_buffer(&mut app, 80, 24);
+    let proc =
+      app.panels.targets.iter().find(|(panel, _)| *panel == super::Panel::Processes).unwrap().1;
+    assert!(screen_text(&buf).contains("Other App"));
+    // The second root follows two expanded children in the detail model.
+    click(&mut app, proc.x + 10, proc.y + 3);
+    assert!(app.proc_view.selected_application());
+    assert_eq!(app.proc_view.selected_pid(), None);
+    for action in ['i', 'e', 'c', 'k'] {
+      let _ = app.handle_key(key(action));
+    }
+    assert!(app.info.is_none() && !app.kill.is_open());
+    assert!(
+      fake.calls().is_empty()
+        && fake.0.borrow().revealed.is_empty()
+        && fake.0.borrow().copied.is_empty()
+    );
+    let _ = press(&mut app, KeyCode::Right);
+    assert!(app.panels.fullscreen);
+    assert!(screen_text(&render_buffer(&mut app, 80, 24)).contains("Other main"));
+    let _ = app.handle_key(key('f'));
+    procs.last_mut().unwrap().cpu_pct = 500.0;
+    put_procs(&mut app, procs);
+    render_buffer(&mut app, 80, 24);
+    click(&mut app, proc.x + 10, proc.y + 3); // after refresh the second root is Example App
+    assert!(app.proc_view.selected_application() && app.proc_view.selected_pid().is_none());
+    click(&mut app, proc.x + 10, proc.y + 4); // ungrouped launchd remains a real PID
+    assert_eq!(app.proc_view.selected_pid(), Some(1));
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, proc.x + 10, proc.y + 3));
+    assert!(app.panels.fullscreen);
+    assert_eq!(app.cfg.panel_details, [false; 6]);
+    assert_eq!(app.procs_shown.showing(), showing);
+  }
+
+  #[test]
+  fn every_compact_transition_removes_hidden_child_actions_before_another_key() {
+    for transition in ['f', '6', 'd', 'R'] {
+      let (mut app, fake) = info_app();
+      let mut procs = varied_procs();
+      for proc in &mut procs {
+        proc.meta.instance = format!("instance-{}", proc.pid);
+        proc.meta.known = (true, true);
+        if proc.pid > 100 {
+          proc.meta.app = Some(crate::proc_groups::AppIdentity {
+            id: "example-app".into(),
+            name: "Example App".into(),
+          });
+        }
+      }
+      app.update_metrics(Metrics {
+        fans: ["fan0", "fan1"]
+          .map(|name| FanMetric { name: name.into(), rpm: 1800, max_rpm: None })
+          .into(),
+        ..test_metrics()
+      });
+      app.cell_pixels = Some((9, 18));
+      put_procs(&mut app, procs);
+      if transition == 'f' {
+        app.cfg.panel_details = [false; 6];
+      }
+      if transition == '6' {
+        app.cfg.panel_details = [false; 6];
+        app.cfg.panel_details[5] = true;
+      }
+      if transition == 'd' {
+        app.cfg.disk_details = true;
+      }
+      let _ = app.handle_key(key('g'));
+      let _ = app.handle_key(key('f'));
+      let _ = press(&mut app, KeyCode::Down);
+      let _ = press(&mut app, KeyCode::Right);
+      let _ = press(&mut app, KeyCode::Down);
+      assert_eq!(app.proc_view.selected_pid(), Some(631));
+      render_buffer(&mut app, 120, 40);
+      if transition != 'f' {
+        let _ = app.handle_key(key('f'));
+        render_buffer(&mut app, 120, 40);
+        assert_eq!(app.proc_view.selected_pid(), Some(631));
+      }
+      if transition == 'R' {
+        render_buffer(&mut app, 80, 24);
+      } else {
+        let _ = app.handle_key(key(transition));
+      }
+      // No draw between a density key and these actions: stale targets cannot authorize them.
+      assert!(app.proc_view.selected_application(), "transition={transition}");
+      assert_eq!(app.proc_view.selected_pid(), None);
+      for action in ['i', 'e', 'c', 'k'] {
+        let _ = app.handle_key(key(action));
+      }
+      assert!(app.info.is_none() && !app.kill.is_open(), "transition={transition}");
+      assert!(
+        fake.calls().is_empty()
+          && fake.0.borrow().revealed.is_empty()
+          && fake.0.borrow().copied.is_empty()
+      );
+      let _ = app.handle_key(key('f'));
+      render_buffer(&mut app, 80, 24);
+      let _ = press(&mut app, KeyCode::Down);
+      assert_eq!(app.proc_view.selected_pid(), Some(631));
+      let _ = app.handle_key(key('k'));
+      assert!(app.kill.is_open(), "an explicitly selected visible child remains actionable");
+      assert_eq!(fake.calls(), [(631, 0)]);
+    }
+  }
+
+  #[test]
+  fn compact_standalone_actions_require_a_visible_root_after_passive_reordering() {
+    let (mut app, fake) = info_app();
+    let mut own = varied_procs()[1].clone();
+    own.cpu_pct = 0.0;
+    own.meta.instance = "single-631".into();
+    own.meta.known = (true, true);
+    let mut procs = vec![own.clone()];
+    for index in 0..8 {
+      let mut proc = own.clone();
+      proc.pid = 9000 + index;
+      proc.name = format!("worker{index}");
+      proc.cpu_pct = index as f32 + 1.0;
+      proc.meta.instance = format!("single-{}", proc.pid);
+      procs.push(proc);
+    }
+    put_procs(&mut app, procs.clone());
+    app.cfg.panel_details = [false; 6];
+    let _ = app.handle_key(key('g'));
+    let _ = app.handle_key(key('f'));
+    let _ = press(&mut app, KeyCode::Down);
+    let _ = press(&mut app, KeyCode::End);
+    assert_eq!(app.proc_view.selected_pid(), Some(631));
+    let _ = app.handle_key(key('f'));
+    assert_eq!(app.proc_view.selected_pid(), None, "the ninth root is hidden in compact mode");
+    for action in ['i', 'e', 'c', 'k'] {
+      let _ = app.handle_key(key(action));
+    }
+    assert!(app.info.is_none() && !app.kill.is_open() && fake.calls().is_empty());
+    procs[0].cpu_pct = 100.0;
+    put_procs(&mut app, procs.clone());
+    render_buffer(&mut app, 80, 24);
+    let area =
+      app.panels.targets.iter().find(|(panel, _)| *panel == super::Panel::Processes).unwrap().1;
+    click(&mut app, area.x + 10, area.y + 2);
+    assert_eq!(app.proc_view.selected_pid(), Some(631));
+    let _ = app.handle_key(key('k'));
+    assert!(app.kill.is_open());
+    let _ = app.handle_key(key('q'));
+    let calls = fake.calls();
+    let _ = app.handle_key(key('S'));
+    assert_eq!(app.proc_view.selected_pid(), None, "a sort cannot retain actions on a hidden root");
+    let _ = app.handle_key(key('S'));
+    render_buffer(&mut app, 80, 24);
+    click(&mut app, area.x + 10, area.y + 2);
+    assert_eq!(app.proc_view.selected_pid(), Some(631));
+    procs[0].cpu_pct = 0.0;
+    put_procs(&mut app, procs);
+    assert_eq!(app.proc_view.selected_pid(), None, "a passive sample moved it outside Top 5");
+    for action in ['i', 'e', 'c', 'k'] {
+      let _ = app.handle_key(key(action));
+    }
+    assert!(app.info.is_none() && !app.kill.is_open());
+    assert_eq!(fake.calls(), calls);
+    let mut promoted = own;
+    promoted.cpu_pct = 100.0;
+    put_procs(&mut app, vec![promoted]);
+    render_buffer(&mut app, 80, 24);
+    click(&mut app, area.x + 10, area.y + 2);
+    assert_eq!(app.proc_view.selected_pid(), Some(631));
+    render_buffer(&mut app, 80, 3);
+    assert_eq!(app.proc_view.selected_pid(), None, "a one-line area cannot retain PID actions");
+    for action in ['i', 'e', 'c', 'k'] {
+      let _ = app.handle_key(key(action));
+    }
+    assert!(app.info.is_none() && !app.kill.is_open());
+    assert_eq!(fake.calls(), calls);
   }
 
   #[test]
