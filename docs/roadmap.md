@@ -233,7 +233,7 @@ what we need.
       Terminal/browser layouts that preserve all disk and existing monitoring features.
       Plan: [docs/plans/completed/20261017-overview-details-layout.md](plans/completed/20261017-overview-details-layout.md).
 
-- [ ] **36. Group applications and their helper processes.** Share confirmed application
+- [x] **36. Group applications and their helper processes.** Share confirmed application
       membership and honest totals across Terminal and Web, with independent expansion,
       a per-process view and safe actions on explicitly selected process members.
-      Plan: [docs/plans/20261018-process-grouping.md](plans/20261018-process-grouping.md).
+      Plan: [docs/plans/completed/20261018-process-grouping.md](plans/completed/20261018-process-grouping.md).
