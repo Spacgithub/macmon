@@ -11,6 +11,7 @@ use serde::Serialize;
 
 /// Traffic on one up, non-loopback network interface, including VPNs and bridges.
 #[derive(Debug, Default, Clone, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 pub struct NetworkMetric {
   /// Kernel interface name, such as `en0` or `utun0`.
   pub name: String,

@@ -15,6 +15,7 @@ mod find_clpc;
 mod proc_groups;
 mod procs;
 mod serve;
+mod source;
 mod stress;
 mod tui;
 mod web;
@@ -61,6 +62,11 @@ enum StressMode {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+  #[command(name = "__collector", hide = true)]
+  Collector {
+    #[arg(long, default_value_t = 1000)]
+    initial_ms: u32,
+  },
   /// Output metrics in JSON format (suitable for piping)
   #[command(alias = "raw")]
   Pipe {
@@ -253,8 +259,11 @@ fn run_stress(
 
 fn main() -> Result<(), Box<dyn Error>> {
   let args = Cli::parse();
+  let explicit_interval =
+    Cli::command().get_matches().value_source("interval") == Some(ValueSource::CommandLine);
 
   match &args.command {
+    Some(Commands::Collector { initial_ms }) => source::run(*initial_ms)?,
     Some(Commands::Pipe { samples, soc_info }) => {
       // Debug override: require CLPC CPU/GPU/ANE counters without fallback.
       let force_clpc = std::env::var("MACMON_FORCE_CLPC").is_ok_and(|x| x == "1");
@@ -286,42 +295,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         serve::launchd(host, *port, *install)?;
         return Ok(());
       }
-      let mut sampler = Sampler::new()?;
-      let mut processes = procs::ProcSampler::new();
-      let _ = processes.sample(); // Prime counters before the first complete sampling interval.
-      let soc = Arc::new(sampler.get_soc_info().clone());
-      let shared: serve::SharedMetrics = Arc::new(RwLock::new(None));
-      let cadence = Arc::new(RwLock::new(serve::Cadence::new(args.interval.max(100))));
-
-      let shared_http = Arc::clone(&shared);
-      let soc_http = Arc::clone(&soc);
-      let host = host.clone();
-      let port = *port;
-      let cadence_http = Arc::clone(&cadence);
+      // Bind first: an occupied HTTP port must not leave a hidden sampling owner behind.
+      let listener = std::net::TcpListener::bind((host.as_str(), *port))?;
+      let client = Arc::new(source::Client::connect_server(
+        explicit_interval.then_some(args.interval.max(100)),
+      )?);
+      let first = client
+        .wait_after(None, Duration::from_secs(10))?
+        .ok_or("sampling source did not become ready")?;
+      let soc = Arc::new(first.soc.clone());
+      let shared: serve::SharedMetrics = Arc::new(RwLock::new(Some(first)));
+      let cadence = Arc::new(RwLock::new(serve::Cadence::with_source(Arc::clone(&client))));
+      let shared_frames = Arc::clone(&shared);
       thread::spawn(move || {
-        if let Err(e) = serve::run(&host, port, shared_http, soc_http, cadence_http) {
-          eprintln!("server error: {e}");
+        let mut previous = None::<(String, u64)>;
+        loop {
+          let key = previous.as_ref().map(|(session, sequence)| (session.as_str(), *sequence));
+          match client.wait_after(key, Duration::from_secs(1)) {
+            Ok(Some(frame)) => {
+              previous = Some((frame.session.clone(), frame.revision));
+              *shared_frames.write().unwrap() = Some(frame);
+            }
+            Ok(None) => {}
+            Err(error) => {
+              eprintln!("sampling source error: {error}");
+              return;
+            }
+          }
         }
       });
-
-      loop {
-        let window = cadence.write().unwrap().begin();
-        match sampler.get_metrics(window) {
-          Ok(m) => {
-            let time = serve::sample_time();
-            let temperatures = sampler.temperature_details().to_vec();
-            let details = serve::SampleDetails {
-              temperatures,
-              memory_activity: *sampler.memory_activity(),
-              thermal_state: sampler.thermal_state(),
-              disks: sampler.disks().map(<[_]>::to_vec),
-            };
-            let processes = processes.sample_dashboard();
-            serve::publish_sample(&shared, m, details, window, Some(processes), time);
-          }
-          Err(e) => eprintln!("sampling error: {e}"),
-        }
-      }
+      serve::run(listener, shared, soc, cadence)?;
     }
     Some(Commands::Web { action }) => web::run(*action)?,
     Some(Commands::Debug) => print_debug()?,

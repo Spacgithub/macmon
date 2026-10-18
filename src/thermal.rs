@@ -11,6 +11,7 @@ use serde::Serialize;
 /// This is not a temperature threshold or proof of CPU/GPU throttling. Apple also
 /// reports `Nominal` when the platform's thermal state is unknown or unsupported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 #[serde(rename_all = "lowercase")]
 pub enum ThermalState {
   /// The OS reports that no corrective action is needed.

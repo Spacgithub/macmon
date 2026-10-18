@@ -7,6 +7,7 @@ use serde::Serialize;
 /// SMC groups follow macmon's historical key-prefix rules; they do not identify
 /// individual cores or establish a sensor's exact physical location.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 #[serde(rename_all = "lowercase")]
 pub enum TemperatureGroup {
   /// A reading included in the CPU average.
@@ -17,6 +18,7 @@ pub enum TemperatureGroup {
 
 /// macOS interface that supplied a temperature reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 #[serde(rename_all = "lowercase")]
 pub enum TemperatureSource {
   /// Apple System Management Controller.
@@ -27,6 +29,7 @@ pub enum TemperatureSource {
 
 /// One valid reading from the same acquisition as the reported temperature averages.
 #[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(feature = "app", derive(serde::Deserialize))]
 pub struct TemperatureReading {
   /// Original SMC key or IOHID Product name, without an inferred physical location.
   pub name: String,

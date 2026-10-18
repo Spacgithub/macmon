@@ -86,6 +86,15 @@ Network observation, five sorted application/process entries, current CPU/GPU te
 busiest physical disk visible. Disk keeps read/write rates separate; IOPS appears when the
 whole field fits.
 
+Terminal windows and HTTP backends share one rootless system and process sampling source for
+this user. A standalone terminal needs no login service: the temporary collector exits after
+its final consumer closes. An existing web backend keeps collecting until it is stopped,
+including while browser tabs are closed. `pipe` keeps its independent sampling behavior.
+Changing the sampling interval in either interface updates the shared source and other
+connected views; only the initiating terminal saves its preference. A reconnect waits for a
+fresh source instead of opening a second sampler, and source restarts reset rate baselines.
+After updating macmon, restart existing monitors and the web backend together.
+
 Use `1`–`7` to toggle a panel, `Tab` / `Shift-Tab` to select one, and `Enter` to toggle the
 selected panel. `d` expands all panels or returns them to summaries. `f` opens the selected
 panel in a full-screen detail view; `f` / `Esc` returns. Use arrows, Page Up/Down or Home/End
@@ -298,7 +307,8 @@ Process sampling runs once per completed
 metrics cycle, independently of browsers. Only loopback clients with a matching loopback Host
 receive process names and PIDs; other requests get `processes: null`. Snapshot age is reported
 as `processes_age_ms`, and all processes remain accessible in the scrollable table.
-System metric timestamps and age include the time spent collecting the separate process snapshot.
+System and process collection run independently. Their separate timestamps and ages retain
+the actual completion time; a slower process read does not delay publication of system metrics.
 
 The same local snapshot includes `process_groups`: application summaries and unassigned
 individual processes, with opaque group IDs and `{pid, instance}` member identities. Confirmed

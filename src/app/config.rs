@@ -1,7 +1,8 @@
 //! Persistent terminal UI settings.
 
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -179,6 +180,10 @@ impl Config {
 
   /// Writes the settings to their file.
   pub fn save(&self) {
+    self.save_preferences(false);
+  }
+
+  fn save_preferences(&self, interval_change: bool) {
     let Some(path) = &self.path else { return };
     let owner = sudo_owner();
     if let Some(dir) = path.parent().filter(|dir| !dir.exists())
@@ -187,8 +192,26 @@ impl Config {
       give_to(dir, owner);
     }
 
-    if let Ok(file) = File::create(path) {
-      let _ = serde_json::to_writer_pretty(BufWriter::new(file), self);
+    if let Ok(mut file) =
+      OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
+    {
+      // Cooperating Terminal instances merge while holding the same inode lock.
+      if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return;
+      }
+      let mut value = serde_json::to_value(self).unwrap_or_default();
+      if !interval_change
+        && let Ok(latest) = serde_json::from_reader::<_, serde_json::Value>(BufReader::new(&file))
+        && let Some(interval) = latest.get("interval").and_then(serde_json::Value::as_u64)
+      {
+        value["interval"] = interval.into();
+      }
+      if let Ok(bytes) = serde_json::to_vec_pretty(&value) {
+        let _ = file
+          .seek(SeekFrom::Start(0))
+          .and_then(|_| file.write_all(&bytes))
+          .and_then(|_| file.set_len(bytes.len() as u64));
+      }
       give_to(path, owner);
     }
   }
@@ -207,7 +230,16 @@ impl Config {
   fn set_interval(&mut self, msec: u32) {
     self.interval = msec;
     self.run_interval = None;
-    self.save();
+    self.save_preferences(true);
+  }
+
+  /// The shared owner changes runtime cadence without saving another consumer's preference.
+  pub(crate) fn adopt_interval(&mut self, msec: u32) {
+    self.run_interval = Some(msec);
+  }
+
+  pub(crate) fn save_interval(&mut self, msec: u32) {
+    self.set_interval(msec);
   }
 
   pub fn dec_interval(&mut self) {
@@ -517,5 +549,23 @@ mod tests {
     // `-` / `+` step from the interval in use and save it
     cfg.dec_interval();
     assert_eq!((file.saved()["interval"].clone(), cfg.interval()), (250.into(), 250));
+  }
+  #[test]
+  fn passive_shared_interval_never_overwrites_another_terminals_saved_preference() {
+    let file = TempConfig::new("shared_interval");
+    let mut first = Config::load_from(Some(file.path()));
+    first.save_interval(5000);
+    let mut second = Config::load_from(Some(file.path()));
+    first.save_interval(750);
+    let before = std::fs::read(file.path()).unwrap();
+    second.adopt_interval(2500);
+    assert_eq!(std::fs::read(file.path()).unwrap(), before);
+    second.toggle_ratio_mode();
+    assert_eq!(file.saved()["interval"], 750);
+    assert_eq!(second.interval(), 2500);
+    second.save_interval(2750);
+    first.toggle_ratio_mode();
+    assert_eq!(file.saved()["interval"], 2750);
+    assert_eq!(first.interval(), 750);
   }
 }
