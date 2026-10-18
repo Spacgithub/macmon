@@ -1,5 +1,8 @@
 # Roadmap
 
+Items labelled **Upstream** retain the original repository's plans. Completed personal-fork
+features, including Network Monitoring, memory pressure and disk health, are recorded below.
+
 Work on one item at a time, each through its own PR. When an item is taken, its plan goes to
 `docs/plans/yyyymmdd-<name>.md` and is linked here. Tick an item in the PR that finishes it.
 
@@ -76,6 +79,35 @@ POWER does today.
 - [ ] **Upstream 13. Social preview card.** The repository still shows GitHub's template image. A
       1280×640 card from a real TUI screenshot of the current release (HTML rendered to PNG),
       uploaded by hand in the repository settings.
+- [ ] **Upstream 14. `serve` as a LaunchDaemon.** For the next minor release. `serve --install` creates a
+      LaunchAgent, which starts only after login; an always-on Mac scraped by Prometheus needs it
+      at boot with nobody logged in (asked on Reddit). An install option for a LaunchDaemon in
+      `/Library/LaunchDaemons` (needs sudo). Tested by hand in the VM: a daemon running `macmon
+      serve` starts at boot without a login, as root and with `UserName`; with `UserName` the
+      `StandardErrorPath` file must be writable by that user.
+- [ ] **Upstream 15. Disk and network metrics.** What node exporter has and macmon doesn't (asked on
+      Reddit): disk read / write and network in / out, system-wide, in the TUI, JSON and
+      Prometheus. Decision point before the plan: which of them, and where they fit in the TUI.
+- [ ] **Upstream 16. App totals with their helpers.** Asked on Reddit: a filter term totals only the
+      processes whose name matches, so Safari's `com.apple.WebKit.WebContent` tabs are left out.
+      Group an app's helper processes under it, expandable to show which ones are counted. Until
+      then, the total row could say it covers matching processes only.
+- [ ] **Upstream 17. Memory pressure.** Asked on Reddit: RAM use on a Mac is nearly always 70%+ and says
+      little; memory pressure, as Activity Monitor shows it, tells whether the Mac is short of
+      memory. Read it without root (sysctl `kern.memorystatus_vm_pressure_level` and
+      `kern.memorystatus_level`, to verify), color the RAM box by it and add it to JSON and
+      Prometheus. Decision point before the plan: next to RAM use or instead of it in the title.
+- [ ] **Upstream 18. Where a process works.** With agents building and testing in several projects at
+      once, the busiest process is often just `rustc`, `cargo` or `node`, and the name doesn't
+      say which project it belongs to. Show the working directory in the list (a column, or the
+      NAME cell for such tools, `~` for home, cut from the left), so the project is visible while
+      scrolling, without opening `i`. Other users' processes show no directory (libproc needs
+      root). Decision point before the plan: a column, a second line, or a toggle.
+- [ ] **Upstream 19. Who is busy lately.** CPU% is one sample and jumps; TIME covers the whole life of a
+      process. To find what loads the Mac right now (a runaway process, an agent's test run, a
+      build), show CPU used over a recent window, e.g. the last 15 s or 1 min, from the CPU time
+      already sampled, and sort by it. Decision point before the plan: a new column or a switch
+      of TIME between "total" and "recent", and the window length.
 
 Order for 0.11: 10, then 5 (decide which columns fit 80 cells; 6 only if too many), the second
 PR of 7, the third PR of 12. Items 11 and 4 need their decision first. Items 10, 12 and 13 are
