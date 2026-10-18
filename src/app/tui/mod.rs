@@ -396,7 +396,7 @@ fn source_events(
   mut previous: Option<(String, u64)>,
 ) {
   thread::spawn(move || {
-    let mut status = client.status();
+    let mut status = None;
     let mut last_cadence = client.cadence();
     loop {
       match commands.try_recv() {
@@ -411,9 +411,9 @@ fn source_events(
         _ => {}
       }
       let current = client.status();
-      if current != status {
-        status = current;
-        if tx.send(Event::SourceState(status)).is_err() {
+      if status != Some(current) {
+        status = Some(current);
+        if tx.send(Event::SourceState(current)).is_err() {
           break;
         }
       }
@@ -570,7 +570,7 @@ impl App {
       self.source_process = None;
       self.source_sequence = 0;
     }
-    self.source_state = Some(ConnectionState::Live);
+    self.source_state.get_or_insert(ConnectionState::Live);
     self.source_sampled = Some(frame.sampled);
     self.source_fresh = self.source_live();
     self.cfg.adopt_interval(frame.cadence.effective_ms);
@@ -3161,6 +3161,44 @@ mod tests {
     assert!(app.handle_key(key('t')).is_continue());
     assert!(!app.kill.is_open());
     assert_eq!(fake.calls(), [(631, 0), (631, libc::SIGTERM)]);
+  }
+
+  #[test]
+  fn cached_frame_after_disconnect_cannot_reenable_actions_until_a_live_state_event() {
+    use crate::source::ConnectionState;
+    for disconnected in [ConnectionState::Disconnected, ConnectionState::Incompatible] {
+      let (mut app, fake) = kill_app();
+      let (commands, _receiver) = std::sync::mpsc::channel();
+      let slot = std::sync::Arc::new(super::SourceSlot::default());
+      let (tx, rx) = std::sync::mpsc::channel();
+      app.source_commands = Some(commands);
+      app.source_frames = Some(std::sync::Arc::clone(&slot));
+      app.source_session = "fixture".into();
+      app.source_state = Some(ConnectionState::Live);
+      app.source_sampled = Some(Instant::now());
+      let _ = press(&mut app, KeyCode::Char('k'));
+      assert!(app.kill.is_open());
+      let before = fake.calls();
+      let interval = RwLock::new(1000);
+      let _ = app.apply_event(Event::SourceState(disconnected), &interval).unwrap();
+      assert!(!app.kill.is_open());
+      assert!(slot.put(std::sync::Arc::new(crate::source::Frame::fixture(1, 1)), &tx));
+      let _ = app.apply_event(rx.recv().unwrap(), &interval).unwrap();
+      assert_eq!(app.source_state, Some(disconnected));
+      assert!(!app.source_live());
+      let _ = press(&mut app, KeyCode::Char('k'));
+      assert!(!app.kill.is_open());
+      assert_eq!(fake.calls(), before);
+      let _ = app.apply_event(Event::SourceState(ConnectionState::Live), &interval).unwrap();
+      assert!(app.source_live());
+      let _ = press(&mut app, KeyCode::Char('k'));
+      assert!(app.kill.is_open());
+      assert_eq!(
+        fake.calls().last(),
+        Some(&(631, 0)),
+        "only a fake permission probe, never a signal"
+      );
+    }
   }
 
   #[test]

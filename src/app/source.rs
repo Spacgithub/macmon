@@ -480,6 +480,10 @@ fn spawn_owner(runtime: &Runtime, initial_ms: u32) -> io::Result<()> {
   });
   Ok(())
 }
+fn replacement_interval(shared: u32, explicit: Option<u32>, fallback: u32) -> u32 {
+  if shared >= 100 { shared } else { explicit.filter(|value| *value >= 100).unwrap_or(fallback) }
+}
+
 fn client_worker(inner: Arc<ClientInner>, mut initial_ms: Option<u32>) {
   while !inner.stopped.load(Ordering::Acquire) {
     let result = (|| -> io::Result<()> {
@@ -488,7 +492,8 @@ fn client_worker(inner: Arc<ClientInner>, mut initial_ms: Option<u32>) {
         Err(error)
           if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) =>
         {
-          spawn_owner(&inner.runtime, inner.default_ms)?;
+          let shared = inner.data.lock().unwrap().cadence.requested_ms;
+          spawn_owner(&inner.runtime, replacement_interval(shared, initial_ms, inner.default_ms))?;
           let deadline = Instant::now() + Duration::from_secs(5);
           loop {
             match inner.runtime.connect() {
@@ -676,6 +681,14 @@ impl Owner {
   }
 }
 
+fn bind_private_socket(runtime: &Runtime) -> io::Result<UnixListener> {
+  // Only the hidden owner (or an isolated test child) calls this, before starting worker threads.
+  unsafe {
+    libc::umask(0o077);
+  }
+  UnixListener::bind(runtime.socket())
+}
+
 /// Hidden owner command; the lock is acquired before any hardware sampler is constructed.
 pub(crate) fn run(initial_ms: u32) -> io::Result<()> {
   let runtime = Runtime::open()?;
@@ -694,7 +707,7 @@ pub(crate) fn run(initial_ms: u32) -> io::Result<()> {
     }
     fs::remove_file(runtime.socket())?;
   }
-  let listener = UnixListener::bind(runtime.socket())?;
+  let listener = bind_private_socket(&runtime)?;
   use std::os::unix::fs::PermissionsExt;
   fs::set_permissions(runtime.socket(), fs::Permissions::from_mode(0o600))?;
   listener.set_nonblocking(true)?;
@@ -1258,6 +1271,36 @@ mod tests {
   }
 
   #[test]
+  fn replacement_seed_prefers_shared_cadence_then_explicit_cli_then_default() {
+    assert_eq!(replacement_interval(500, Some(5000), 1000), 500);
+    assert_eq!(replacement_interval(0, Some(5000), 1000), 5000);
+    assert_eq!(replacement_interval(0, None, 1000), 1000);
+  }
+
+  #[test]
+  fn private_socket_birth_child() {
+    let Some(path) = std::env::var_os("MACMON_TEST_PRIVATE_BIND") else { return };
+    unsafe {
+      libc::umask(0o022);
+    }
+    let runtime = Runtime::at(path.into()).unwrap();
+    let _listener = bind_private_socket(&runtime).unwrap();
+    // Check birth permissions before run() gets a chance to apply chmod.
+    assert_eq!(fs::symlink_metadata(runtime.socket()).unwrap().mode() & 0o077, 0);
+  }
+
+  #[test]
+  fn socket_is_private_from_bind_even_when_the_callers_umask_is_public() {
+    let directory = Directory::new();
+    let output = Command::new(std::env::current_exe().unwrap())
+      .args(["--exact", "source::tests::private_socket_birth_child", "--nocapture"])
+      .env("MACMON_TEST_PRIVATE_BIND", &directory.0)
+      .output()
+      .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  }
+
+  #[test]
   fn new_consumers_adopt_existing_cadence_and_explicit_intervals_are_active() {
     let dir = Directory::new();
     let owner = dir.owner();
@@ -1401,6 +1444,10 @@ mod tests {
       thread::sleep(Duration::from_millis(20));
     };
     assert_ne!(replacement.collector_pid, pid);
+    assert_eq!(
+      replacement.cadence.requested_ms, 500,
+      "recovery preserves the last shared interval"
+    );
     let replacement_pid = replacement.collector_pid;
     drop(second);
     until(|| !dir.runtime().socket().exists());

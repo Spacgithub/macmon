@@ -398,6 +398,23 @@ await check('real fan identities retain node and phase through reordering', asyn
   assert.equal(h.state().fans.get('fan0').node.querySelector('.fan-rpm').textContent, '0 RPM');
 });
 
+await check('process-only snapshots refresh rows and freshness without appending system history', async () => {
+  const h = boot({ expanded: true }), original = processFixture();
+  await h.answer(sample({ sequence: 4, ...original }));
+  const root = processNamed(h, 'Test App 0'); await toggleProcessGroup(h, root);
+  const updated = processFixture();
+  updated.processes[0].name = 'New member reading'; updated.processes[0].cpu_pct = 175.25;
+  updated.process_groups[0].name = 'Updated application'; updated.process_groups[0].cpu_pct = 178.25;
+  await nextPoll(h);
+  await h.answer(sample({ sequence: 4, age_ms: 1000, ...updated, data: metrics({ sys_power: 1000000 }) }));
+  assert.equal(h.state().history.length, 1); assert.equal(h.text('system-power'), '20 W');
+  assert.equal(processNamed(h, 'Updated application'), root, 'Stable group retains its DOM identity');
+  assert.match(root.children[1].textContent, /^178.3%/);
+  const child = groupMembers(h, root).find((row) => row.children[0].textContent.includes('New member reading'));
+  assert.ok(child); assert.equal(child.children[1].textContent, '175.3%');
+  assert.match(h.text('process-status'), /^0s old/);
+});
+
 await check('same identity does not append history; a restart with the same sequence does', async () => {
   const h = boot({ expanded: true }); await h.answer(sample({ sequence: 4 }));
   await nextPoll(h); await h.answer(sample({ sequence: 4, age_ms: 1000, data: metrics({ sys_power: 1000000 }) }));
