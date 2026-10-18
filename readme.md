@@ -274,6 +274,17 @@ receive process names and PIDs; other requests get `processes: null`. Snapshot a
 as `processes_age_ms`, and all processes remain accessible in the scrollable table.
 System metric timestamps and age include the time spent collecting the separate process snapshot.
 
+The same local snapshot includes `process_groups`: application summaries and unassigned
+individual processes, with opaque group IDs and `{pid, instance}` member identities. Confirmed
+application packages include their embedded helpers; standalone XPC services join only when
+verified system grouping metadata matches one observed application for the same user. Ambiguous
+or unsupported ownership stays independent. Full application totals include every member;
+`cpu_known` and `gpu_known`
+distinguish partial totals from measured zero. Memory is the sum of reported process memory,
+not deduplicated physical memory; GPU totals sum process shares rather than device utilization.
+The existing five-field `processes` rows and their age stay compatible. Both arrays are `null`
+outside the loopback privacy gate; executable paths and command lines are never included.
+
 `/api/sample` also includes a top-level `temperatures` array from the same successful hardware
 sample, for example `{"name":"Tp01","group":"cpu","source":"smc","celsius":45.0}`.
 Each entry retains its original sensor name, the existing CPU/GPU group and SMC/HID source.

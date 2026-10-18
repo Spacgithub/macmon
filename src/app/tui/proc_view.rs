@@ -1103,6 +1103,7 @@ mod tests {
 
   fn proc(pid: i32, name: &str, cpu: f32, mem_mb: u64, power: Option<f32>, gpu: f32) -> ProcInfo {
     ProcInfo {
+      meta: Default::default(),
       pid,
       name: name.to_string(),
       path: format!("/usr/bin/{name}"),

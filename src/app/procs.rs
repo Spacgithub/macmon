@@ -16,6 +16,8 @@ use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 
+use crate::proc_groups::{self, Identity, Ownership, ProcGroup, ProcMeta};
+
 const RUSAGE_INFO_V4: c_int = 4;
 const RUSAGE_INFO_V6: c_int = 6;
 
@@ -132,6 +134,7 @@ pub struct ProcInfo {
   /// Start time in seconds and microseconds, tells the process from a later one with the same
   /// pid; `None` for other users' processes (`ps` has no exact start time).
   pub started: Option<(u64, u64)>,
+  pub meta: ProcMeta,
 }
 
 /// Minimal dashboard rows; unavailable interval rates remain distinct from measured idle.
@@ -146,6 +149,7 @@ pub struct DashboardProc {
 
 pub struct ProcessSnapshot {
   pub rows: Vec<DashboardProc>,
+  pub groups: Vec<ProcGroup>,
   pub sampled: Instant,
 }
 
@@ -167,6 +171,8 @@ struct Counters {
 #[derive(Debug, Clone, PartialEq)]
 struct Raw {
   pid: i32,
+  identity: Option<Identity>,
+  coalition: Option<proc_groups::Coalition>,
   uid: u32,
   mem_bytes: u64,
   counters: Counters,
@@ -181,6 +187,16 @@ struct Raw {
   ps: bool,
   /// Start time in seconds and microseconds of `proc_bsdinfo`; `None` from `ps`.
   started: Option<(u64, u64)>,
+}
+
+fn finish_identity(raw: &mut Raw, before: Option<Identity>, after: Option<Identity>) -> bool {
+  match proc_groups::consistent(before, after) {
+    Ok(identity) => {
+      raw.identity = identity;
+      true
+    }
+    Err(()) => false,
+  }
 }
 
 // MARK: Rates
@@ -296,6 +312,8 @@ fn read_libproc(pid: i32, flavor: c_int, (numer, denom): (u32, u32)) -> Option<R
 
   Some(Raw {
     pid,
+    identity: None,
+    coalition: None,
     uid: info.pbi_uid,
     mem_bytes: ru.ri_phys_footprint,
     counters: Counters {
@@ -365,6 +383,8 @@ fn parse_ps_line(line: &str) -> Option<Raw> {
 
   Some(Raw {
     pid,
+    identity: None,
+    coalition: None,
     uid,
     mem_bytes: rss_kib.saturating_mul(1024),
     // ps has no start time, a reused pid is told apart by its command.
@@ -641,6 +661,8 @@ fn averaged_cpu_pct(history: &[(u64, u64)], now_ns: u64, cpu_ns: u64) -> f32 {
 
 /// A process seen on the previous tick.
 struct Known {
+  identity: Option<Identity>,
+  instance: String,
   counters: Counters,
   /// Changes on exec (unless cut to the same 15 bytes), invalidates `name` and `path`.
   comm: String,
@@ -649,11 +671,11 @@ struct Known {
   path: String,
   /// `ps` rows: `(time, CPU time)` of the last `PS_CPU_INTERVALS` ticks, oldest first.
   cpu_history: VecDeque<(u64, u64)>,
-  available: (bool, bool),
 }
 
 /// Samples every process: libproc for those it can read, `ps` for the rest.
 pub struct ProcSampler {
+  ownership: Ownership,
   timebase: (u32, u32),
   flavor: c_int,
   pids: Vec<i32>,
@@ -678,6 +700,7 @@ impl ProcSampler {
       if rusage(own_pid, RUSAGE_INFO_V6).is_some() { RUSAGE_INFO_V6 } else { RUSAGE_INFO_V4 };
 
     Self {
+      ownership: Ownership::new(),
       timebase,
       flavor,
       pids: Vec::new(),
@@ -693,9 +716,12 @@ impl ProcSampler {
     let now = Instant::now();
     let elapsed_ns = self.last.map_or(0, |last| now.duration_since(last).as_nanos() as u64);
     self.last = Some(now);
-    let (gpu, unreadable_gpu) = gpu_times(); // Read next to `now`: no counter timestamps.
-
     list_pids(&mut self.pids);
+    // Bracket every source (including ps and GPU clients) to avoid attaching a new PID's
+    // executable to the previous process's UID/counters. An unsupported ABI remains unowned.
+    let identities: HashMap<_, _> =
+      self.pids.iter().map(|&pid| (pid, proc_groups::identity(pid))).collect();
+    let (gpu, unreadable_gpu) = gpu_times();
     let mut rows = Vec::with_capacity(self.pids.len());
     let mut unreadable = Vec::new();
     for &pid in &self.pids {
@@ -710,35 +736,41 @@ impl ProcSampler {
       let name = |uid| users.entry(uid).or_insert_with(|| user_name(uid)).clone();
       rows = merge(rows, run_ps(&ps_selection(&unreadable, unsafe { libc::getuid() }, name)));
     }
-    for raw in &mut rows {
+    rows.retain_mut(|raw| {
       raw.counters.gpu_ns = gpu.get(&raw.pid).copied();
       raw.counters.gpu_readable =
         raw.counters.gpu_ns.is_some() && !unreadable_gpu.contains(&raw.pid);
       // every tick, not only for new pids: the start time and `comm` can stay the same across an
       // exec (about 1 ms for 800 processes)
       raw.path = exe_path(raw.pid);
-    }
+      let before = identities.get(&raw.pid).copied().flatten();
+      let candidate =
+        raw.path.as_deref().map_or(before.is_some(), |path| self.ownership.candidate(path));
+      raw.coalition = candidate.then(|| proc_groups::coalition(raw.pid)).flatten();
+      finish_identity(raw, before, proc_groups::identity(raw.pid))
+    });
     self.update(rows, elapsed_ns)
   }
 
   pub fn sample_dashboard(&mut self) -> ProcessSnapshot {
     let rows = self.sample();
     ProcessSnapshot {
-      rows: self.dashboard_rows(rows),
+      groups: proc_groups::groups(&rows),
+      rows: Self::dashboard_rows(rows),
       sampled: self.last.unwrap_or_else(Instant::now),
     }
   }
 
-  fn dashboard_rows(&self, rows: Vec<ProcInfo>) -> Vec<DashboardProc> {
+  pub(crate) fn dashboard_rows(rows: Vec<ProcInfo>) -> Vec<DashboardProc> {
     rows
       .into_iter()
       .map(|row| {
-        let (cpu, gpu) = self.known.get(&row.pid).map_or((false, false), |known| known.available);
+        let (cpu, gpu) = row.meta.known;
         DashboardProc {
           pid: row.pid,
           name: row.name,
-          cpu_pct: cpu.then_some(row.cpu_pct),
-          gpu_pct: gpu.then_some(row.gpu_pct),
+          cpu_pct: cpu.then_some(row.cpu_pct).and_then(proc_groups::measured),
+          gpu_pct: gpu.then_some(row.gpu_pct).and_then(proc_groups::measured),
           mem_bytes: row.mem_bytes,
         }
       })
@@ -753,9 +785,26 @@ impl ProcSampler {
     let mut procs = Vec::with_capacity(rows.len());
     self.clock_ns += elapsed_ns;
 
-    for raw in rows {
-      let prev = self.known.remove(&raw.pid).filter(|prev| {
+    let observations: Vec<_> = rows
+      .iter()
+      .map(|raw| {
+        let path = raw.identity.and(raw.path.as_deref());
+        (raw.uid, path, raw.coalition)
+      })
+      .collect();
+    let apps = self.ownership.applications(&observations);
+
+    for (raw, app) in rows.into_iter().zip(apps) {
+      let previous = self.known.remove(&raw.pid);
+      // Lifetime identity survives a temporary libproc/ps switch even when its rate baseline
+      // cannot.
+      let instance = previous
+        .as_ref()
+        .filter(|prev| raw.identity.is_some() && prev.identity == raw.identity)
+        .map_or_else(|| self.ownership.fresh(), |prev| prev.instance.clone());
+      let prev = previous.filter(|prev| {
         prev.counters.start == raw.counters.start
+          && prev.identity == raw.identity
           && prev.comm == raw.comm
           && raw.path.as_ref().is_none_or(|path| *path == prev.path)
       });
@@ -804,9 +853,25 @@ impl ProcSampler {
         power_w: usage.power_w,
         gpu_pct: usage.gpu_pct,
         started: raw.started,
+        meta: ProcMeta {
+          instance: instance.clone(),
+          app,
+          known: if raw.identity.is_some() { available } else { (false, false) },
+        },
       });
       let counters = raw.counters;
-      known.insert(raw.pid, Known { counters, comm: raw.comm, name, path, cpu_history, available });
+      known.insert(
+        raw.pid,
+        Known {
+          identity: raw.identity,
+          instance,
+          counters,
+          comm: raw.comm,
+          name,
+          path,
+          cpu_history,
+        },
+      );
     }
 
     self.known = known;
@@ -953,6 +1018,8 @@ mod tests {
   fn row(pid: i32, cpu_ns: u64, energy_nj: Option<u64>, comm: &str) -> Raw {
     Raw {
       pid,
+      identity: Some(Identity { unique: pid as u64, version: 1 }),
+      coalition: None,
       uid: 0,
       mem_bytes: 1024,
       counters: Counters { start: 0, cpu_ns, energy_nj, gpu_ns: None, gpu_readable: false },
@@ -1086,7 +1153,7 @@ mod tests {
     let tick = |sampler: &mut ProcSampler, raw, elapsed| {
       let rows = sampler.update(vec![raw], elapsed);
       let old_gpu = rows[0].gpu_pct;
-      (sampler.dashboard_rows(rows).remove(0), old_gpu)
+      (ProcSampler::dashboard_rows(rows).remove(0), old_gpu)
     };
     let (first, _) = tick(&mut sampler, raw(0, Some(0), true), 0);
     assert_eq!((first.cpu_pct, first.gpu_pct), (None, None));
@@ -1118,14 +1185,182 @@ mod tests {
     for (index, expected) in [None, None, Some(100.0)].into_iter().enumerate() {
       let rows =
         sampler.update(vec![ps_row(A, index as u64 * SEC, "a")], if index == 0 { 0 } else { SEC });
-      let row = sampler.dashboard_rows(rows).remove(0);
+      let row = ProcSampler::dashboard_rows(rows).remove(0);
       assert_eq!((row.cpu_pct, row.gpu_pct), (expected, None));
     }
     let rows = sampler.update(vec![ps_row(B, 10 * SEC, "new")], SEC);
-    let row = sampler.dashboard_rows(rows).remove(0);
+    let row = ProcSampler::dashboard_rows(rows).remove(0);
     assert_eq!((row.cpu_pct, row.gpu_pct), (None, None));
     let rows = sampler.update(vec![ps_row(B, 11 * SEC, "new")], SEC);
-    assert_eq!(sampler.dashboard_rows(rows)[0].cpu_pct, Some(100.0));
+    assert_eq!(ProcSampler::dashboard_rows(rows)[0].cpu_pct, Some(100.0));
+  }
+
+  #[test]
+  fn changing_native_identity_drops_a_raced_row_and_resets_same_path_exec() {
+    let mut raced = row(A, SEC, None, "same");
+    let before = raced.identity;
+    let changed = Some(Identity { version: 2, ..before.unwrap() });
+    let mut rows = vec![raced.clone()];
+    rows.retain_mut(|raw| finish_identity(raw, before, changed));
+    assert!(rows.is_empty(), "old UID/counters must not be paired with the new executable");
+    assert!(finish_identity(&mut raced, before, None));
+    assert!(raced.identity.is_none(), "an incomplete identity read is unowned");
+
+    let mut sampler = ProcSampler::new();
+    let input = |identity, cpu| Raw {
+      identity,
+      path: Some("/Apps/Browser.app/Contents/MacOS/Browser".into()),
+      ..row(A, cpu, None, "same")
+    };
+    let first = sampler.update(vec![input(before, 0)], 0).remove(0);
+    let next = sampler.update(vec![input(before, SEC)], SEC).remove(0);
+    assert_eq!(first.meta.instance, next.meta.instance);
+    assert_eq!(first.meta.app, next.meta.app);
+    assert_eq!(next.meta.known, (true, false));
+    let exec = sampler.update(vec![input(changed, 2 * SEC)], SEC).remove(0);
+    assert_ne!(next.meta.instance, exec.meta.instance);
+    assert_eq!(exec.meta.known, (false, false));
+    assert_eq!(exec.cpu_pct, 0.0);
+    let reused = Some(Identity { unique: before.unwrap().unique + 1, version: 3 });
+    let reused = sampler.update(vec![input(reused, 4 * SEC)], SEC).remove(0);
+    assert_ne!(exec.meta.instance, reused.meta.instance);
+    assert_eq!(reused.meta.known, (false, false));
+  }
+
+  #[test]
+  fn unreadable_identity_and_fresh_path_do_not_reuse_cached_ownership() {
+    let mut sampler = ProcSampler::new();
+    let input = |identity, path: Option<&str>, cpu| Raw {
+      identity,
+      path: path.map(str::to_string),
+      ..row(A, cpu, None, "same")
+    };
+    let native = row(A, 0, None, "same").identity;
+    let path = "/Apps/Browser.app/Contents/MacOS/Browser";
+    let first = sampler.update(vec![input(native, Some(path), 0)], 0).remove(0);
+    assert!(first.meta.app.is_some());
+    let unavailable = sampler.update(vec![input(native, None, SEC)], SEC).remove(0);
+    assert_eq!(unavailable.path, path, "old display-path behavior remains compatible");
+    assert!(unavailable.meta.app.is_none(), "ownership requires this tick's path evidence");
+    let first = sampler.update(vec![input(None, Some(path), 2 * SEC)], SEC).remove(0);
+    let second = sampler.update(vec![input(None, Some(path), 3 * SEC)], SEC).remove(0);
+    assert_ne!(first.meta.instance, second.meta.instance);
+    assert!(second.meta.app.is_none());
+    assert_eq!(second.meta.known, (false, false));
+    assert_eq!(second.cpu_pct, 100.0, "the raw TUI fallback still has its prior rate semantics");
+    let grouped = proc_groups::groups(std::slice::from_ref(&second));
+    let flat = ProcSampler::dashboard_rows(vec![second]).remove(0);
+    assert_eq!((flat.cpu_pct, flat.gpu_pct), (grouped[0].cpu_pct, grouped[0].gpu_pct));
+    assert_eq!((grouped[0].cpu_known, grouped[0].gpu_known), (0, 0));
+  }
+
+  #[test]
+  fn review_regression_source_fallback_keeps_instance_but_resets_rate_baselines() {
+    let path = "/Apps/Browser.app/Contents/MacOS/Browser";
+    let input = |cpu| Raw {
+      path: Some(path.into()),
+      counters: Counters { start: 42, ..row(A, cpu, Some(cpu), "Browser").counters },
+      ..row(A, cpu, Some(cpu), "Browser")
+    };
+    let fallback = |cpu| Raw {
+      ps: true,
+      comm: path.into(),
+      counters: Counters { start: 0, energy_nj: None, ..input(cpu).counters },
+      ..input(cpu)
+    };
+    let mut sampler = ProcSampler::new();
+    let first = sampler.update(vec![input(0)], 0).remove(0);
+    let busy = sampler.update(vec![input(SEC)], SEC).remove(0);
+    assert_eq!(first.meta.instance, busy.meta.instance);
+    assert!(busy.meta.known.0);
+    let ps = sampler.update(vec![fallback(2 * SEC)], SEC).remove(0);
+    assert_eq!(busy.meta.instance, ps.meta.instance);
+    assert!(!ps.meta.known.0 && ps.cpu_pct == 0.0);
+    let back = sampler.update(vec![input(3 * SEC)], SEC).remove(0);
+    assert_eq!(ps.meta.instance, back.meta.instance);
+    assert_eq!(first.meta.app, back.meta.app);
+    assert!(!back.meta.known.0 && back.cpu_pct == 0.0);
+    let busy = sampler.update(vec![input(4 * SEC)], SEC).remove(0);
+    assert_eq!(back.meta.instance, busy.meta.instance);
+    assert!(busy.meta.known.0);
+  }
+
+  #[test]
+  fn unconfirmed_sampler_observations_do_not_assign_xpc_and_recovery_is_local() {
+    let app = "/Apps/Browser.app/Contents/MacOS/Browser";
+    let other = "/Apps/Other.app/Contents/MacOS/Other";
+    let xpc = "/System/Services/worker.xpc/Contents/MacOS/worker";
+    let input = |pid, path: Option<&str>| Raw {
+      path: path.map(str::to_string),
+      coalition: Some([30, 31]),
+      ..row(pid, 0, None, "worker")
+    };
+    let mut sampler = ProcSampler::new();
+    sampler.ownership.set_default_for_test(Some([1, 3]));
+    for unavailable in [None, Some(other)] {
+      let mut unknown = input(B, unavailable);
+      if unavailable.is_some() {
+        let before = unknown.identity;
+        assert!(finish_identity(&mut unknown, before, None));
+      }
+      let rows = sampler.update(vec![input(A, Some(app)), unknown, input(B + 1, Some(xpc))], SEC);
+      assert!(rows[0].meta.app.is_some());
+      assert!(rows[1].meta.app.is_none() && rows[2].meta.app.is_none());
+    }
+    let recovered = sampler.update(vec![input(A, Some(app)), input(B + 1, Some(xpc))], SEC);
+    assert_eq!(recovered[0].meta.app, recovered[1].meta.app);
+  }
+
+  #[test]
+  #[ignore = "opt-in rootless process ownership probe; prints only application names and PIDs"]
+  fn rootless_process_grouping_probe() {
+    let mut sampler = ProcSampler::new();
+    let own = std::process::id() as i32;
+    assert!(
+      proc_groups::identity(own).is_some(),
+      "optional identity ABI is unavailable on this host"
+    );
+    let _ = sampler.sample();
+    std::thread::sleep(Duration::from_millis(250));
+    let rows = sampler.sample();
+    let grouped = proc_groups::groups(&rows);
+    let members: Vec<_> = grouped.iter().flat_map(|group| &group.members).collect();
+    assert_eq!(members.len(), rows.len());
+    assert_eq!(members.iter().map(|member| member.pid).collect::<HashSet<_>>().len(), rows.len());
+    assert!(members.iter().all(|member| !member.instance.is_empty()));
+    let flat = ProcSampler::dashboard_rows(rows);
+    let flat = serde_json::to_value(flat).unwrap();
+    for group in &grouped {
+      let member_rows: Vec<_> = flat
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| {
+          group.members.iter().any(|member| row["pid"].as_i64() == Some(i64::from(member.pid)))
+        })
+        .collect();
+      assert_eq!(
+        group.cpu_known,
+        member_rows.iter().filter(|row| !row["cpu_pct"].is_null()).count()
+      );
+      assert_eq!(
+        group.gpu_known,
+        member_rows.iter().filter(|row| !row["gpu_pct"].is_null()).count()
+      );
+      if group.kind == proc_groups::GroupKind::Application {
+        eprintln!(
+          "app={:?} members={:?}",
+          group.name,
+          group.members.iter().map(|member| member.pid).collect::<Vec<_>>()
+        );
+      }
+    }
+    eprintln!(
+      "uid={} processes={} groups={}",
+      unsafe { libc::geteuid() },
+      members.len(),
+      grouped.len()
+    );
   }
 
   #[test]
