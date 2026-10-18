@@ -294,6 +294,24 @@ mod fan_preview {
     std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
   }
 
+  #[test]
+  fn selected_fan_rate_is_visible_without_displacing_rpm_or_narrow_cooling_status() {
+    for fps in crate::config::FAN_FPS_OPTIONS {
+      let mut app = graphical_app("two", true);
+      app.cfg.fan_fps = fps;
+      let text = render_to_string(&mut app, 120, 40);
+      assert!(text.contains("1800 RPM") && text.contains("2400 RPM"));
+      assert!(text.contains(&format!("{fps}fps")), "{text}");
+      app.cfg.panel_details = [false; 6];
+      let text = render_to_string(&mut app, 80, 24);
+      assert!(text.contains(&format!("{fps}fps")) && text.contains("Cooling"));
+      app.panels.focus = super::super::Panel::Cooling;
+      app.panels.fullscreen = true;
+      let text = render_to_string(&mut app, 28, 12);
+      assert!(text.contains(&format!("{fps}fps")) && text.contains("Cooling"), "{text}");
+    }
+  }
+
   /// Opt-in synthetic terminal fixture; never samples hardware or saves the user's settings.
   /// --nocapture --test-threads=1. All readings are synthetic; no real sampler runs here.
   #[test]
@@ -325,6 +343,11 @@ mod fan_preview {
       });
     assert!(path.starts_with("/private/tmp") || path.starts_with("/tmp"));
     let mut app = preview_app(&mode, animate);
+    if let Ok(value) = std::env::var("MACMON_FAN_PREVIEW_FPS") {
+      let fps = value.parse::<u16>().unwrap();
+      assert!(crate::config::FAN_FPS_OPTIONS.contains(&fps));
+      app.cfg.fan_fps = fps;
+    }
     let mut report = serde_json::json!({
       "synthetic": true,
       "hardware_sampling": false,
@@ -334,7 +357,7 @@ mod fan_preview {
       "exit_mode": exit,
       "animation_initially_enabled": animate,
       "sample_interval_msec": SAMPLE_MSEC,
-      "target_submission_fps": 60,
+      "target_submission_fps": app.cfg.fan_fps,
       "measured_display_fps": null,
       "frame_measurement": "count image commands in the external private PTY",
       "seconds_limit": seconds,

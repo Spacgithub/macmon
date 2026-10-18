@@ -49,7 +49,7 @@ h3 { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
 .thermal-key { display: flex; gap: 20px; margin-top: 22px; font-size: 11px; color: var(--muted); }
 .thermal-key span::before { content: ""; display: inline-block; width: 18px; margin-right: 6px; vertical-align: middle; border-top: 2px solid var(--accent); }
 .thermal-key span:last-child::before { border-top: 2px dashed var(--power-subtotal); }
-.fan-motion { margin: 24px 0 16px; }
+.fan-motion { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 24px; margin: 24px 0 16px; }
 .eyebrow, .tag {
   color: var(--accent);
   font-size: 10px;

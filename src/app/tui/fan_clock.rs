@@ -2,24 +2,46 @@
 
 use std::time::{Duration, Instant};
 
+use crate::config::{DEFAULT_FAN_FPS, normalize_fan_fps};
+
 /// Target period; this does not measure the terminal's presentation rate.
-pub(super) const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+pub(super) const FRAME_INTERVAL: Duration =
+  Duration::from_nanos(1_000_000_000 / DEFAULT_FAN_FPS as u64);
 
 /// Pauses without preserving elapsed time; delayed frames are skipped.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct FrameClock {
   next: Option<Instant>,
   previous: Option<Instant>,
+  interval: Duration,
+}
+
+impl Default for FrameClock {
+  fn default() -> Self {
+    Self { next: None, previous: None, interval: FRAME_INTERVAL }
+  }
 }
 
 impl FrameClock {
+  /// A rate change replaces the deadline, without catching up or retaining elapsed pause time.
+  pub(super) fn set_fps(&mut self, fps: u16, now: Instant) {
+    let interval = Duration::from_nanos(1_000_000_000 / u64::from(normalize_fan_fps(fps)));
+    if interval != self.interval {
+      self.interval = interval;
+      if self.next.is_some() {
+        self.next = Some(now + interval);
+        self.previous = Some(now);
+      }
+    }
+  }
+
   /// Repeated activation keeps the deadline; deactivation discards pause time.
   pub(super) fn set_active(&mut self, active: bool, now: Instant) {
     if !active {
       self.next = None;
       self.previous = None;
     } else if self.next.is_none() {
-      self.next = Some(now + FRAME_INTERVAL);
+      self.next = Some(now + self.interval);
       self.previous = Some(now);
     }
   }
@@ -37,8 +59,8 @@ impl FrameClock {
     }
     let elapsed =
       now.saturating_duration_since(self.previous.unwrap()).min(Duration::from_millis(100));
-    let missed = now.saturating_duration_since(deadline).as_nanos() / FRAME_INTERVAL.as_nanos();
-    self.next = Some(deadline + FRAME_INTERVAL.mul_f64((missed + 1) as f64));
+    let missed = now.saturating_duration_since(deadline).as_nanos() / self.interval.as_nanos();
+    self.next = Some(deadline + self.interval.mul_f64((missed + 1) as f64));
     self.previous = Some(now);
     Some(elapsed)
   }
@@ -119,18 +141,46 @@ mod tests {
   }
 
   #[test]
-  fn sixty_frames_are_scheduled_independently_of_five_second_sampling() {
+  fn target_rates_schedule_fewer_wakeups_independently_of_sampling() {
+    let now = Instant::now();
+    for fps in crate::config::FAN_FPS_OPTIONS {
+      let mut clock = FrameClock::default();
+      clock.set_fps(fps, now);
+      clock.set_active(true, now);
+      let period = Duration::from_nanos(1_000_000_000 / u64::from(fps));
+      assert_eq!(clock.wait(now), Some(period));
+      let mut count = 0;
+      for millis in 1..=1000 {
+        let time = now + Duration::from_millis(millis);
+        clock.set_fps(fps, time);
+        clock.set_active(true, time);
+        count += usize::from(clock.frame(time).is_some());
+      }
+      assert_eq!(count, usize::from(fps));
+      clock.set_active(false, now + Duration::from_secs(1));
+      assert!(clock.wait(now + Duration::from_secs(9)).is_none());
+    }
+  }
+
+  #[test]
+  fn rate_changes_reset_only_active_deadlines_and_invalid_rates_use_default() {
     let now = Instant::now();
     let mut clock = FrameClock::default();
     clock.set_active(true, now);
-    let mut count = 0;
-    for tick in 1..=60 {
-      let frame = now + FRAME_INTERVAL * tick;
-      assert!(clock.frame(frame).is_some());
-      count += 1;
-    }
-    assert_eq!(count, 60);
-    assert!(FRAME_INTERVAL * 60 < Duration::from_secs(5));
+    let changed = now + Duration::from_millis(15);
+    clock.set_fps(15, changed);
+    let slow = Duration::from_nanos(1_000_000_000 / 15);
+    assert_eq!(clock.wait(changed), Some(slow));
+    assert!(clock.frame(now + FRAME_INTERVAL).is_none());
+    assert_eq!(clock.frame(changed + slow), Some(slow));
+    clock.set_active(false, changed);
+    clock.set_fps(60, now + Duration::from_secs(20));
+    assert!(clock.wait(now + Duration::from_secs(20)).is_none());
+    clock.set_fps(0, now);
+    clock.set_active(true, now);
+    assert_eq!(clock.wait(now), Some(FRAME_INTERVAL));
+    assert_eq!(clock.frame(now + Duration::from_secs(1)), Some(Duration::from_millis(100)));
+    assert!(clock.wait(now + Duration::from_secs(1)).unwrap() > Duration::ZERO);
   }
 
   #[test]

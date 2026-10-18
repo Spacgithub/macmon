@@ -35,6 +35,7 @@ const HELP: &[Row] = &[
   Key("v", "graph / gauge"),
   Key("r", "CPU and GPU usage: freq / raw"),
   Key("a", "fan motion on / off"),
+  Key("⇧A", "fan animation target: 15 / 30 / 60 FPS (default 30)"),
   Key("- / +", "update interval"),
   Key("/", "filter the processes"),
   Key("s / S", "sort by the next column / reverse"),

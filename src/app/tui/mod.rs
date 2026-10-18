@@ -986,6 +986,14 @@ impl App {
       KeyCode::Char('q') => return ControlFlow::Break(()),
       KeyCode::Char('?') => self.help = Some(0),
       KeyCode::Char('r') => self.cfg.toggle_ratio_mode(),
+      KeyCode::Char('A')
+        if !key
+          .modifiers
+          .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+      {
+        self.cfg.cycle_fan_fps()
+      }
+      KeyCode::Char('a') if key.modifiers == KeyModifiers::SHIFT => self.cfg.cycle_fan_fps(),
       KeyCode::Char('a') => self.cfg.toggle_animate_fans(),
       KeyCode::Char('+') => self.adjust_source_interval(true),
       KeyCode::Char('=') => self.adjust_source_interval(true), // fallback to press without shift
@@ -1205,7 +1213,7 @@ impl App {
 
     // the key hints go on the lowest box: the process box, or the metrics box without it
     self.render_metrics_box(f, &plan);
-    self.cooling.render(f, &self.placements);
+    self.cooling.render(f, &self.placements, self.cfg.fan_fps);
     if let Some(r) = plan.proc {
       if r.height < 6 {
         self.panels.targets.push((Panel::Processes, r));
@@ -1344,6 +1352,7 @@ impl App {
         }
       }
       let active = self.fan_frames_active();
+      clock.set_fps(self.cfg.fan_fps, Instant::now());
       clock.set_active(active, Instant::now());
       if let Some(delta) = clock.frame(Instant::now()) {
         self.cooling.frame(delta);
@@ -3642,6 +3651,41 @@ mod tests {
       assert_eq!(app.proc_view.filter(), "g");
       assert!(app.cfg.proc_grouped);
     }
+  }
+
+  #[test]
+  fn fan_rate_keys_are_independent_of_pause_sampling_and_filter_or_overlay_input() {
+    let mut app = app_with_procs(varied_procs());
+    let interval = app.cfg.interval();
+    for (event, expected) in [
+      (key('A'), 60),
+      (KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT), 15),
+      (KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT), 30),
+    ] {
+      let _ = app.handle_key(event);
+      assert_eq!(app.cfg.fan_fps, expected);
+      assert!(app.cfg.animate_fans);
+    }
+    let _ = app.handle_key(key('a'));
+    let _ = app.handle_key(key('A'));
+    assert_eq!(app.cfg.fan_fps, 60);
+    assert!(!app.cfg.animate_fans);
+    assert_eq!(app.cfg.interval(), interval);
+    let _ = app.handle_key(key('/'));
+    let _ = app.handle_key(key('A'));
+    assert_eq!(app.proc_view.filter(), "A");
+    assert_eq!(app.cfg.fan_fps, 60);
+    let _ = press(&mut app, KeyCode::Enter);
+    let _ = app.handle_key(key('?'));
+    let _ = app.handle_key(key('A'));
+    assert_eq!(app.cfg.fan_fps, 60);
+    let _ = app.handle_key(key('q'));
+    let _ = app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::CONTROL));
+    assert_eq!(app.cfg.fan_fps, 60);
+    let (mut app, _) = info_app();
+    let _ = app.handle_key(key('i'));
+    let _ = app.handle_key(key('A'));
+    assert_eq!(app.cfg.fan_fps, 30);
   }
 
   #[test]

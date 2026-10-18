@@ -11,6 +11,12 @@ use serde_json::{Map, Value};
 
 pub(crate) const TUI_MIN_MS: u32 = 250;
 pub(crate) const TUI_MAX_MS: u32 = 10_000;
+pub(crate) const FAN_FPS_OPTIONS: [u16; 3] = [15, 30, 60];
+pub(crate) const DEFAULT_FAN_FPS: u16 = 30;
+
+pub(crate) fn normalize_fan_fps(fps: u16) -> u16 {
+  if FAN_FPS_OPTIONS.contains(&fps) { fps } else { DEFAULT_FAN_FPS }
+}
 
 /// Look of the CPU cluster, GPU and RAM boxes (`v`). Saved under the names of released versions,
 /// so their configs keep the user's choice and they read ours.
@@ -78,6 +84,10 @@ pub struct Config {
   #[serde_inline_default(true)]
   pub animate_fans: bool,
 
+  /// Target fan-animation rate; independent of sampling and the pause choice.
+  #[serde_inline_default(DEFAULT_FAN_FPS)]
+  pub fan_fps: u16,
+
   /// Compute, memory, power, network, cooling and processes: independently detailed (`1`–`6`).
   #[serde_inline_default([false; 6])]
   pub panel_details: [bool; 6],
@@ -135,6 +145,7 @@ fn give_to(path: &Path, owner: Option<(u32, u32)>) {
 impl Config {
   fn normalize(mut self) -> Self {
     self.interval = self.interval.clamp(TUI_MIN_MS, TUI_MAX_MS);
+    self.fan_fps = normalize_fan_fps(self.fan_fps);
     self
   }
 
@@ -275,6 +286,13 @@ impl Config {
 
   pub fn toggle_animate_fans(&mut self) {
     self.animate_fans = !self.animate_fans;
+    self.save();
+  }
+
+  pub fn cycle_fan_fps(&mut self) {
+    let current = normalize_fan_fps(self.fan_fps);
+    let index = FAN_FPS_OPTIONS.iter().position(|fps| *fps == current).unwrap();
+    self.fan_fps = FAN_FPS_OPTIONS[(index + 1) % FAN_FPS_OPTIONS.len()];
     self.save();
   }
 
@@ -480,6 +498,8 @@ mod tests {
     assert_eq!(saved("show_procs"), false);
     cfg.toggle_animate_fans();
     assert_eq!(saved("animate_fans"), false);
+    cfg.cycle_fan_fps();
+    assert_eq!(saved("fan_fps"), 60);
     cfg.toggle_view_type();
     assert_eq!(saved("view_type"), "Gauge");
     cfg.toggle_ratio_mode();
@@ -495,6 +515,36 @@ mod tests {
     assert_eq!((cfg.ratio_mode, cfg.interval), (RatioMode::Active, 1250));
     assert_eq!((cfg.proc_sort, cfg.proc_sort_desc), (ProcSort::Name, false));
     assert!(!cfg.animate_fans);
+    assert_eq!(cfg.fan_fps, 60);
+  }
+
+  #[test]
+  fn fan_rates_default_independently_and_cycle_without_resuming_animation() {
+    for value in [
+      serde_json::json!(0),
+      14.into(),
+      45.into(),
+      61.into(),
+      (-1).into(),
+      "60".into(),
+      true.into(),
+      serde_json::Value::Null,
+    ] {
+      let cfg = Config::from_reader(
+        format!(r#"{{"fan_fps":{value},"interval":500,"animate_fans":false,"view_type":"Gauge"}}"#)
+          .as_bytes(),
+      );
+      assert_eq!(cfg.fan_fps, super::DEFAULT_FAN_FPS);
+      assert_eq!((cfg.interval(), cfg.animate_fans, cfg.view_type), (500, false, ViewType::Gauge));
+    }
+    let mut cfg = Config::from_reader(br#"{"animate_fans":false}"#.as_slice());
+    assert_eq!(cfg.fan_fps, 30);
+    for fps in [60, 15, 30] {
+      cfg.cycle_fan_fps();
+      assert_eq!(cfg.fan_fps, fps);
+      assert!(!cfg.animate_fans);
+      assert_eq!(Config::from_reader(serde_json::to_vec(&cfg).unwrap().as_slice()).fan_fps, fps);
+    }
   }
 
   #[test]
