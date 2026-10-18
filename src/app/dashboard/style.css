@@ -145,6 +145,16 @@ h3 { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
 .processes { margin-top: 18px; }
 .process-scroll th:first-child { width: 40%; }
 .process-scroll td:first-child small { display: block; color: var(--muted); font-size: 11px; }
+.process-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; }
+.process-filter { flex: 1; min-width: min(240px, 100%); }
+.process-filter input { min-width: 0; width: 100%; padding: 7px; border: 1px solid var(--line); border-radius: 6px; background: #101925; color: inherit; font: inherit; }
+.process-group-button { display: flex; align-items: baseline; gap: 8px; max-width: 100%; padding: 3px 0; border: 0; background: none; color: var(--accent); font: inherit; text-align: left; cursor: pointer; }
+.process-group-button span:last-child { overflow-wrap: anywhere; }
+.process-metric-note { display: block; color: var(--muted); font-size: 10px; }
+.process-members-row > td { padding: 0 4px 16px 20px; }
+.process-members-table { border-left: 2px solid var(--line); background: #0b152044; }
+.process-members-table thead { position: static; }
+.process-members-table td:first-child, .process-members-table th:first-child { width: 40%; }
 .readings { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .temperature { display: grid; color: var(--muted); font-size: 10px; letter-spacing: 1px; }
 .temperature strong { color: var(--accent); font-size: 20px; font-weight: 500; letter-spacing: 0; }
@@ -248,5 +258,8 @@ footer { margin-top: 24px; text-align: center; }
   td:not(:first-child)::before { content: attr(data-label); display: block; color: var(--muted); font-size: 10px; }
   .panel-head { gap: 12px; align-items: flex-start; }
   .panel-actions { gap: 12px; }
+  .process-members-row { display: block; padding: 0; }
+  .process-members-row > td { display: block; padding: 0 0 12px 12px; }
+  .process-members-table td:first-child { width: auto; }
   .fan-card { gap: 16px; }
 }

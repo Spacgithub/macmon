@@ -227,7 +227,8 @@ cards keep CPU/GPU activity, their temperatures and RAM/OS pressure visible. Eac
 CPU, GPU or memory detail section gets the full width below these cards. Memory details add
 Swap-in/out rates and history. Network and Cooling also use the full width when either is
 expanded. Disk summaries retain the three busiest physical devices; Processes retains five
-rows in the selected sort order. Folding a panel keeps live sampling and summaries running.
+application or process entries in the selected sort order. Folding a panel keeps live sampling
+and summaries running.
 
 CPU details retain the reported overall activity, core-type breakdown, reported/installed
 core counts and each reported die/core's activity. GPU details show reported activity, core
@@ -266,9 +267,18 @@ The browser validates the lossless 128-bit decimal counters with bounded `BigInt
 overflowing byte totals and driver integers beyond JavaScript's exact range stay unavailable.
 Older backends without `disks` remain usable and show disk telemetry as unavailable.
 
-Named CPU and GPU temperature readings show Celsius or `Unavailable`. The Processes table
-includes names/PIDs, CPU, GPU and memory, sortable by usage; CPU 100% means one busy core.
-New processes and unavailable rates show a dash. Process sampling runs once per completed
+Named CPU and GPU temperature readings show Celsius or `Unavailable`. Applications & processes
+defaults to application totals, with a button on each application to expand its real member
+processes and PIDs. Use View to switch to individual Processes; the browser remembers this
+choice. Each application's expansion lasts for the current page and survives live refresh,
+sorting and filtering. Details shows every root entry, while the compact view keeps the top
+five; panel/global expansion does not automatically open every application's members.
+Filter searches application names, process names and PIDs. A member-only match shows the
+matching/total count; application totals still include all members. Unknown ownership stays
+as an individual process. Older backends without grouping data retain the individual list.
+CPU, GPU and memory are sortable by usage; CPU 100% means one busy core. New processes and
+unavailable rates show `Unavailable`; partial totals show `≥` and known-member coverage.
+Process sampling runs once per completed
 metrics cycle, independently of browsers. Only loopback clients with a matching loopback Host
 receive process names and PIDs; other requests get `processes: null`. Snapshot age is reported
 as `processes_age_ms`, and all processes remain accessible in the scrollable table.

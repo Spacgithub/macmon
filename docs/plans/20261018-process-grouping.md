@@ -49,7 +49,7 @@
   application processes, including unreadable, ambiguous and restarted processes.
 - [x] Implement shared group identity, unique membership, totals and compatible loopback
   dashboard metadata with focused regression tests.
-- [ ] Add Web grouped/raw views, independent expansion and refresh/accessibility regressions.
+- [x] Add Web grouped/raw views, independent expansion and refresh/accessibility regressions.
 - [ ] Add Terminal grouped/raw views, navigation, filtering and safe real-process actions.
 - [ ] Complete focused and full checks, independent reviews and real rootless private-PTY
   and browser validation; retain disk, Network, temperature, pressure/Swap and panel controls.

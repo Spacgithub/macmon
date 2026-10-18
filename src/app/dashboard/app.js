@@ -16,6 +16,12 @@ function loadDetails() {
   return Object.fromEntries(Object.keys(panelNames).map((name) => [name, saved?.[name] === true]));
 }
 const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], disks: new Map(), diskHistory: new Map(), diskSelected: null, cpuTierRows: new Map(), cpuCoreRows: new Map(), networkRows: new Map(), networkStatus: "Waiting for rates", frame: 0, last: 0, cadence: null, changing: false, intervalError: false, details: loadDetails() };
+const processViewKey = "macmon.process-view.v1";
+function loadProcessView() {
+  try { const value = localStorage.getItem(processViewKey); if (["grouped", "raw"].includes(value)) return value; } catch { /* Storage is optional. */ }
+  return "grouped";
+}
+const procView = { mode: loadProcessView(), open: new Set(), groups: new Map(), raw: new Map(), anchors: [], nextId: 0 };
 const motion = $("motion");
 const reduced = matchMedia("(prefers-reduced-motion: reduce)");
 motion.checked = !reduced.matches;
@@ -290,11 +296,6 @@ async function adjustInterval(adjustment) {
 }
 function live() { return state.online && !state.waiting && state.sample && age() <= limit(); }
 function moving() { return state.details.cooling && live() && !document.hidden && motion.checked && [...state.fans.values()].some((fan) => fan.rpm > 0); }
-function rowDetails(name, limit) {
-  const rows = [...$(`${name}-rows`).children], all = state.details[name];
-  rows.forEach((row, index) => { row.hidden = !all && index >= limit; });
-  put(`${name}-scope`, `${all ? "All" : `Top ${Math.min(limit, rows.length)}`} of ${rows.length} processes in the selected order.`);
-}
 function applyDetails() {
   for (const [name, label] of Object.entries(panelNames)) {
     const all = state.details[name], button = $(`${name}-toggle`), body = $(`${name}-details`);
@@ -304,12 +305,12 @@ function applyDetails() {
     body.dataset.expanded = String(all);
     if (name === "process") {
       body.setAttribute("aria-label", `Processes; ${all ? "scroll to see all" : "expand details to see all"}`);
-      rowDetails(name, 5);
     } else body.hidden = !all;
   }
   $("compute-details").hidden = !["cpu", "gpu", "ram"].some((name) => state.details[name]);
   $("detail-grid").dataset.expanded = String(state.details.network || state.details.cooling);
   diskScope();
+  processes();
   drawCharts();
   settle();
 }
@@ -329,7 +330,8 @@ function settle() {
   put("process-status", Array.isArray(state.sample?.processes) ? `${processState}${finite(processAge) ? `${Math.floor(processAge / 1000)}s old` : "Age unavailable"} / CPU 100% = one core` : "Unavailable for this request");
   const diskDelay = refreshDiskHealth();
   if (!document.hidden) {
-    const delay = Math.min(live() ? Math.max(1, limit() - age() + 1) : Infinity, diskDelay);
+    const processDelay = Array.isArray(state.sample?.processes) && processAge <= limit() ? Math.max(1, limit() - processAge + 1) : Infinity;
+    const delay = Math.min(live() ? Math.max(1, limit() - age() + 1) : Infinity, diskDelay, processDelay);
     if (Number.isFinite(delay)) staleTimer = setTimeout(settle, delay);
   }
   if (moving()) {
@@ -524,27 +526,162 @@ function cooling(metrics) {
   put("fan-empty", metrics.soc?.vm ? "Fan telemetry unavailable in a virtual machine." : "No fan telemetry reported.");
   put("fan-summary", next.size ? [...next.values()].map((fan) => `${fan.node.querySelector(".fan-name").textContent} ${number(fan.rpm, 0)} RPM`).join(" / ") : $("fan-empty").textContent);
 }
-function processes() {
-  const items = state.sample?.processes;
-  const rows = Array.isArray(items) ? items.filter((row) => row && typeof row.name === "string" && Number.isSafeInteger(row.pid) && row.pid > 0) : [];
-  const key = $("process-sort").value || "cpu_pct";
-  rows.sort((a, b) => Number(finite(b[key])) - Number(finite(a[key])) || (finite(a[key]) ? b[key] - a[key] : 0) || a.pid - b.pid);
-  $("process-table").hidden = !rows.length;
-  $("process-empty").hidden = !!rows.length;
-  put("process-empty", Array.isArray(items) ? "No processes reported." : "Process telemetry requires a local loopback request.");
-  put("process-count", `${rows.length} PROCESSES`);
-  $("process-rows").replaceChildren(...rows.map((item) => {
-    const row = document.createElement("tr");
-    [item.name, finite(item.cpu_pct) ? `${number(item.cpu_pct)}%` : unknown, finite(item.gpu_pct) ? `${number(item.gpu_pct)}%` : unknown, bytes(item.mem_bytes)].forEach((value, index) => {
-      const cell = document.createElement("td");
-      cell.textContent = value;
-      cell.dataset.label = ["Process / PID", "CPU %", "GPU %", "Memory"][index];
-      if (!index) { const pid = document.createElement("small"); pid.textContent = `PID ${item.pid}`; cell.append(pid); }
-      row.append(cell);
-    });
-    return row;
-  }));
-  rowDetails("process", 5);
+function processChildren(parent, nodes) {
+  const wanted = new Set(nodes);
+  for (const child of [...parent.children]) if (!wanted.has(child)) child.remove();
+  let cursor = parent.firstElementChild;
+  for (const node of nodes) {
+    if (node === cursor) cursor = cursor.nextElementSibling;
+    else parent.insertBefore(node, cursor);
+  }
+}
+function processCell(view, index, value, note = "") {
+  const cell = view.cells[index];
+  if (cell.value.textContent !== value) cell.value.textContent = value;
+  if (cell.note.textContent !== note) cell.note.textContent = note;
+  cell.note.hidden = !note;
+}
+function processRow() {
+  const node = document.createElement("tr"), cells = ["Application / process", "CPU %", "GPU %", "Memory"].map((label) => {
+    const cell = document.createElement("td"), value = document.createElement("span"), note = document.createElement("small");
+    cell.dataset.label = label; note.className = "process-metric-note"; cell.append(value, note); node.append(cell);
+    return { node: cell, value, note };
+  });
+  return { node, cells };
+}
+function processGroupRow(id) {
+  const view = processRow(), button = document.createElement("button"), arrow = document.createElement("span");
+  button.className = "process-group-button"; button.setAttribute("type", "button"); arrow.setAttribute("aria-hidden", "true");
+  button.append(arrow, view.cells[0].value); view.cells[0].node.insertBefore(button, view.cells[0].note);
+  const detail = document.createElement("tr"), cell = document.createElement("td"), target = `process-members-${++procView.nextId}`;
+  detail.className = "process-members-row"; detail.setAttribute("id", target); cell.setAttribute("colspan", "4"); detail.append(cell);
+  button.setAttribute("aria-controls", target);
+  button.addEventListener("click", () => {
+    if (!state.details.process || !procView.open.has(id)) procView.open.add(id); else procView.open.delete(id);
+    if (!state.details.process) changeDetails(["process"], true); else processes();
+  });
+  return { ...view, kind: "application", button, arrow, detail, cell, members: new Map(), body: null };
+}
+function processMemberTable(view, name) {
+  if (!view.body) {
+    const table = document.createElement("table"), caption = document.createElement("caption"), head = document.createElement("thead"), row = document.createElement("tr");
+    table.className = "process-members-table"; caption.className = "sr-only";
+    for (const text of ["Process / PID", "CPU %", "GPU %", "Memory"]) { const cell = document.createElement("th"); cell.setAttribute("scope", "col"); cell.textContent = text; row.append(cell); }
+    head.append(row); view.body = document.createElement("tbody"); view.caption = caption;
+    table.append(caption, head, view.body); view.cell.append(table);
+  }
+  if (view.caption.textContent !== `Processes in ${name}`) view.caption.textContent = `Processes in ${name}`;
+}
+function processGroups(raw, rows) {
+  if (!Array.isArray(raw)) return null;
+  const byPid = new Map(rows.map((row) => [row.pid, row])), used = new Set(), ids = new Set(), groups = [];
+  for (const group of raw) {
+    if (!diskText(group?.id, 256) || !diskText(group.name, 160) || !["application", "process"].includes(group.kind) || ids.has(group.id)
+      || !Array.isArray(group.members) || !group.members.length || (group.kind === "process" && group.members.length !== 1)) return null;
+    ids.add(group.id);
+    const members = [];
+    for (const member of group.members) {
+      if (!byPid.has(member?.pid) || used.has(member.pid) || !diskText(member.instance, 256)) return null;
+      used.add(member.pid); members.push({ row: byPid.get(member.pid), key: `instance/${member.pid}/${member.instance}` });
+    }
+    if ([group.cpu_known, group.gpu_known].some((count) => diskInteger(count) === null || count > members.length)) return null;
+    groups.push({ ...group, members });
+  }
+  return used.size === rows.length ? groups : null;
+}
+function processMetric(row, key, grouped) {
+  if (key === "mem_bytes") return diskInteger(row[key]);
+  return finite(row[key]) && (!grouped || row[key === "cpu_pct" ? "cpu_known" : "gpu_known"] > 0) ? row[key] : null;
+}
+function processValues(view, row, grouped = false) {
+  for (const [index, key] of ["cpu_pct", "gpu_pct", "mem_bytes"].entries()) {
+    const value = processMetric(row, key, grouped), known = grouped && key !== "mem_bytes" ? row[key === "cpu_pct" ? "cpu_known" : "gpu_known"] : null;
+    const partial = known !== null && known < row.members.length;
+    processCell(view, index + 1, value === null ? "Unavailable" : key === "mem_bytes" ? diskBytes(value) : `${partial ? "≥" : ""}${number(value)}%`,
+      partial ? `${known}/${row.members.length} known` : "");
+  }
+}
+function processPosition() {
+  const scroll = $("process-details"), rect = scroll.getBoundingClientRect(), top = rect.top + $("process-head").getBoundingClientRect().height;
+  const anchor = procView.anchors.find((item) => { const box = item.node.getBoundingClientRect(); return box.bottom > top && box.top < rect.bottom; });
+  return { scroll, top: scroll.scrollTop, key: anchor?.key, offset: anchor ? anchor.node.getBoundingClientRect().top - rect.top : 0,
+    active: scroll.contains(document.activeElement) ? document.activeElement : null };
+}
+function restoreProcessPosition(position, reset) {
+  const { scroll, active } = position;
+  const visible = active === scroll || procView.anchors.some((item) => item.node.contains(active));
+  if (active && (!visible || document.activeElement !== active)) (visible && document.documentElement.contains(active) ? active : scroll).focus({ preventScroll: true });
+  const anchor = procView.anchors.find((item) => item.key === position.key);
+  if (reset) scroll.scrollTop = 0;
+  else if (anchor) scroll.scrollTop += anchor.node.getBoundingClientRect().top - scroll.getBoundingClientRect().top - position.offset;
+  else scroll.scrollTop = position.top;
+}
+function processes(reset = false) {
+  const position = processPosition(), items = state.sample?.processes, seen = new Set();
+  const rows = Array.isArray(items) ? items.filter((row) => {
+    if (!diskText(row?.name, 512) || !Number.isSafeInteger(row.pid) || row.pid <= 0 || row.pid > 2147483647 || seen.has(row.pid)) return false;
+    seen.add(row.pid); return true;
+  }) : [];
+  const groups = Array.isArray(items) && rows.length === items.length ? processGroups(state.sample?.process_groups, rows) : null;
+  const grouped = procView.mode === "grouped" && groups !== null, all = state.details.process;
+  const query = String($("process-filter").value || "").slice(0, 128).trim().toLowerCase(), match = (row) => row.name.toLowerCase().includes(query) || String(row.pid).includes(query);
+  const key = ["cpu_pct", "gpu_pct", "mem_bytes"].includes($("process-sort").value) ? $("process-sort").value : "cpu_pct";
+  const complete = (row) => key === "mem_bytes" || row[key === "cpu_pct" ? "cpu_known" : "gpu_known"] === row.members.length;
+  const compare = (grouped) => (a, b) => {
+    const av = processMetric(a, key, grouped), bv = processMetric(b, key, grouped);
+    return Number(bv !== null) - Number(av !== null) || (av !== null ? bv - av : 0)
+      || (grouped && av !== null ? Number(complete(b)) - Number(complete(a)) : 0)
+      || (grouped ? a.name.localeCompare(b.name) || a.id.localeCompare(b.id) : a.pid - b.pid);
+  };
+  const instances = new Map();
+  if (groups !== null) {
+    const ids = new Set(groups.map((group) => group.id)), applications = new Set(groups.filter((group) => group.kind === "application").map((group) => group.id));
+    for (const id of procView.open) if (!applications.has(id)) procView.open.delete(id);
+    for (const id of procView.groups.keys()) if (!ids.has(id)) procView.groups.delete(id);
+    for (const group of groups) for (const member of group.members) instances.set(member.row.pid, member.key);
+  }
+  const rawKey = (row) => instances.get(row.pid) || `raw/${row.pid}/${row.name}`;
+  if (Array.isArray(items)) { const keys = new Set(rows.map(rawKey)); for (const value of procView.raw.keys()) if (!keys.has(value)) procView.raw.delete(value); }
+  const roots = grouped ? groups.map((group) => ({ ...group, matches: group.name.toLowerCase().includes(query) ? group.members : group.members.filter((member) => match(member.row)) }))
+    .filter((group) => group.matches.length).sort(compare(true)) : rows.filter(match).slice().sort(compare(false));
+  const nodes = [], anchors = [];
+  for (const [index, root] of roots.entries()) {
+    const hidden = !all && index >= 5;
+    if (grouped) {
+      let view = procView.groups.get(root.id);
+      if (!view || view.kind !== root.kind) { view = root.kind === "application" ? processGroupRow(root.id) : { ...processRow(), kind: "process" }; procView.groups.set(root.id, view); }
+      processValues(view, root, true); view.node.hidden = hidden;
+      nodes.push(view.node); if (!hidden) anchors.push({ key: `group/${root.id}`, node: view.node });
+      if (root.kind === "process") { processCell(view, 0, root.name, `PID ${root.members[0].row.pid}`); continue; }
+      const open = all && procView.open.has(root.id);
+      processCell(view, 0, root.name, `Application total / ${root.matches.length}/${root.members.length} matching`);
+      view.arrow.textContent = open ? "▾" : "▸"; view.button.setAttribute("aria-expanded", String(open)); view.node.hidden = hidden; view.detail.hidden = hidden || !open;
+      nodes.push(view.detail);
+      const current = new Set(root.members.map((member) => member.key)); for (const value of view.members.keys()) if (!current.has(value)) view.members.delete(value);
+      if (open) {
+        processMemberTable(view, root.name);
+        const children = root.matches.slice().sort((a, b) => compare(false)(a.row, b.row)).map((member) => {
+          const child = view.members.get(member.key) || processRow(); view.members.set(member.key, child);
+          processCell(child, 0, member.row.name, `PID ${member.row.pid}`); processValues(child, member.row); child.node.hidden = false;
+          if (!hidden) anchors.push({ key: `${root.id}/${member.key}`, node: child.node }); return child.node;
+        });
+        processChildren(view.body, children);
+      }
+    } else {
+      const id = rawKey(root), view = procView.raw.get(id) || processRow(); procView.raw.set(id, view);
+      processCell(view, 0, root.name, `PID ${root.pid}`); processValues(view, root); view.node.hidden = hidden;
+      nodes.push(view.node); if (!hidden) anchors.push({ key: id, node: view.node });
+    }
+  }
+  processChildren($("process-rows"), nodes); procView.anchors = anchors;
+  $("process-table").hidden = !roots.length; $("process-empty").hidden = !!roots.length;
+  put("process-empty", !Array.isArray(items) ? "Process telemetry requires a local loopback request." : query ? "No entries match this filter."
+    : grouped ? "No application groups reported." : items.length && !rows.length ? "Process telemetry unavailable." : "No processes reported.");
+  put("process-count", grouped ? `${groups.length} GROUPS / ${rows.length} PROCESSES` : Array.isArray(items) ? `${rows.length} PROCESSES` : "PROCESS TELEMETRY UNAVAILABLE");
+  put("process-scope", `${all ? "All" : `Top ${Math.min(5, roots.length)}`} of ${roots.length} ${grouped ? "groups" : "processes"}${query ? " matching the filter" : ""} in the selected order.`);
+  put("process-view-status", procView.mode === "raw" ? "Individual process readings" : grouped ? "Application totals / expand a group for its member processes" : "Application grouping unavailable; showing raw processes.");
+  $("process-notes").hidden = !all || !grouped;
+  restoreProcessPosition(position, reset);
 }
 function update(sample) {
   const metrics = sample.metrics, vm = metrics.soc?.vm, memory = metrics.memory || {};
@@ -626,7 +763,14 @@ async function poll() {
   }
 }
 motion.addEventListener("change", settle);
-$("process-sort").addEventListener("change", processes);
+$("process-view").value = procView.mode;
+$("process-view").addEventListener("change", () => {
+  procView.mode = ["grouped", "raw"].includes($("process-view").value) ? $("process-view").value : "grouped";
+  try { localStorage.setItem(processViewKey, procView.mode); } catch { /* Keep this view usable without storage. */ }
+  processes(true);
+});
+$("process-sort").addEventListener("change", () => processes(true));
+$("process-filter").addEventListener("input", () => processes(true));
 $("disk-select").addEventListener("change", () => { state.diskSelected = state.disks.has($("disk-select").value) ? $("disk-select").value : null; drawDiskChart(); });
 Object.keys(panelNames).forEach((name) => $(`${name}-toggle`).addEventListener("click", () => changeDetails([name])));
 $("expand-all").addEventListener("click", () => changeDetails(Object.keys(panelNames), true));
