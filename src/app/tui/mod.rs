@@ -588,6 +588,7 @@ impl App {
       self.info = None;
       self.kill.close();
       self.sync_info_worker();
+      self.sync_process_demand();
       self.source_process = None;
       self.source_sequence = 0;
     }
@@ -3485,6 +3486,38 @@ mod tests {
     app.process_state = Some(crate::source::ProcessState::Disabled);
     let status = app.process_status().unwrap();
     assert!(status.contains("paused") && status.contains("7s old"));
+  }
+
+  #[test]
+  fn source_session_changes_release_info_demand_without_another_input_event() {
+    use std::sync::{Arc, Mutex, mpsc};
+
+    use crate::source::ProcessDemand;
+
+    for (shown, unfocused, expected) in
+      [(true, true, ProcessDemand::Summary), (false, false, ProcessDemand::None)]
+    {
+      let (mut app, _) = info_app();
+      assert!(app.handle_key(key('i')).is_continue());
+      app.cfg.show_procs = shown;
+      app.unfocused = unfocused;
+      app.source_session = "old-owner".into();
+      let requested = Arc::new(Mutex::new(ProcessDemand::None));
+      app.source_requested = Some(Arc::clone(&requested));
+      app.sync_process_demand();
+      assert_eq!(*requested.lock().unwrap(), ProcessDemand::Details);
+
+      let slot = Arc::new(super::SourceSlot::default());
+      let (tx, rx) = mpsc::channel();
+      app.source_frames = Some(Arc::clone(&slot));
+      let mut frame = crate::source::Frame::fixture(1, 1);
+      frame.session = "replacement-owner".into();
+      assert!(slot.put(Arc::new(frame), &tx));
+      assert!(app.handle_event(rx.recv().unwrap(), &RwLock::new(TUI_MIN_MS)).is_continue());
+      assert!(app.info.is_none());
+      assert_eq!(app.source_demand, Some(expected));
+      assert_eq!(*requested.lock().unwrap(), expected);
+    }
   }
 
   #[test]
