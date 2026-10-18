@@ -202,7 +202,30 @@ fn classify(path: &str) -> Bundle {
           == Some(Component::Normal("Contents".as_ref()))
     })
   };
-  let app = enclosing("app").last().map(|bundle| {
+  let mut candidates = enclosing("app");
+  let mut app = candidates.next();
+  for parent in candidates {
+    let Some(relative) = app.and_then(|child| child.strip_prefix(parent).ok()) else { break };
+    let mut parts = relative.components();
+    // An embedded independent app (e.g. Xcode's Simulator) is not its enclosing app's helper.
+    let helper = parts.next() == Some(Component::Normal("Contents".as_ref()))
+      && match parts.next() {
+        Some(Component::Normal(role))
+          if role == "Frameworks" || role == "Helpers" || role == "XPCServices" =>
+        {
+          true
+        }
+        Some(Component::Normal(role)) if role == "Library" => {
+          parts.next() == Some(Component::Normal("LoginItems".as_ref()))
+        }
+        _ => false,
+      };
+    if !helper {
+      break;
+    }
+    app = Some(parent);
+  }
+  let app = app.map(|bundle| {
     (
       bundle.to_string_lossy().into_owned(),
       bundle.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
@@ -229,6 +252,11 @@ impl Ownership {
       paths: HashMap::new(),
       apps: HashMap::new(),
     }
+  }
+
+  #[cfg(test)]
+  pub(crate) fn set_default_for_test(&mut self, default: Option<Coalition>) {
+    self.default = default;
   }
 
   pub fn fresh(&mut self) -> String {
@@ -262,20 +290,23 @@ impl Ownership {
         }
         self.apps[&key].clone()
       });
-      if let (Some(app), Some(coal)) = (
-        &app,
-        coal.filter(|coal| {
-          coal.iter().all(|id| *id != 0) && self.default.is_some_and(|default| default != *coal)
-        }),
-      ) {
-        owners
-          .entry((uid, coal))
-          .and_modify(|owner| {
-            if owner.as_ref() != Some(app) {
-              *owner = None;
-            }
-          })
-          .or_insert_with(|| Some(app.clone()));
+      if let Some(coal) = coal.filter(|coal| {
+        coal.iter().all(|id| *id != 0) && self.default.is_some_and(|default| default != *coal)
+      }) {
+        if let Some(app) = &app {
+          owners
+            .entry((uid, coal))
+            .and_modify(|owner| {
+              if owner.as_ref() != Some(app) {
+                *owner = None;
+              }
+            })
+            .or_insert_with(|| Some(app.clone()));
+        } else if path.is_none() {
+          // Unreadable identity/path could hide a competing app; a later seed cannot prove
+          // uniqueness.
+          owners.insert((uid, coal), None);
+        }
       }
       result.push((app, bundle.is_some_and(|bundle| bundle.xpc)));
     }
@@ -423,6 +454,65 @@ mod tests {
       owner.applications(&[(501, Some(APP), Some(COAL)), (501, Some(XPC), Some(COAL))])[1]
         .is_none()
     );
+  }
+
+  #[test]
+  fn review_regression_unresolved_owners_block_xpc_until_the_next_complete_snapshot() {
+    let mut owner = ownership();
+    let anchor = (501, Some(APP), Some(COAL));
+    let unknown = (501, None, Some(COAL));
+    let xpc = (501, Some(XPC), Some(COAL));
+    for entries in [[anchor, unknown, xpc], [unknown, anchor, xpc], [anchor, xpc, unknown]] {
+      let result = owner.applications(&entries);
+      let index = entries.iter().position(|entry| *entry == xpc).unwrap();
+      assert!(result[index].is_none(), "an unreadable competing owner prevents uniqueness");
+    }
+    let recovered = owner.applications(&[anchor, xpc]);
+    assert!(recovered[0].is_some());
+    assert_eq!(recovered[0], recovered[1], "failures are not cached across snapshots");
+    let non_competitors = owner.applications(&[
+      anchor,
+      (502, None, Some(COAL)),
+      (501, Some("/bin/zsh"), Some(COAL)),
+      xpc,
+    ]);
+    assert_eq!(non_competitors[0], non_competitors[3]);
+    assert!(non_competitors[1].is_none() && non_competitors[2].is_none());
+  }
+
+  #[test]
+  fn review_regression_independent_nested_applications_keep_their_own_helpers() {
+    const XCODE: &str = "/Applications/Xcode.app/Contents/MacOS/Xcode";
+    const SIMULATOR: &str = "/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app/Contents/MacOS/Simulator";
+    const SIM_HELPER: &str = "/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app/Contents/Frameworks/Runtime.framework/Helpers/agent.app/Contents/MacOS/agent";
+    const CHROME_HELPER: &str = "/Applications/Browser.app/Contents/Frameworks/Browser.framework/Versions/A/Helpers/worker.app/Contents/MacOS/worker";
+    let mut owner = ownership();
+    let apps = owner.applications(&[
+      (501, Some(XCODE), None),
+      (501, Some(SIMULATOR), None),
+      (501, Some(SIM_HELPER), None),
+      (501, Some(CHROME_HELPER), None),
+      (501, Some(APP), None),
+    ]);
+    assert_eq!(apps[0].as_ref().unwrap().name, "Xcode");
+    assert_eq!(apps[1].as_ref().unwrap().name, "Simulator");
+    assert_ne!(apps[0], apps[1]);
+    assert_eq!(apps[1], apps[2]);
+    assert_eq!(apps[3], apps[4]);
+    let copied = owner.applications(&[(501, Some(SIMULATOR), None), (501, Some("/Volumes/Other/Xcode.app/Contents/Developer/Applications/Simulator.app/Contents/MacOS/Simulator"), None)]);
+    assert_eq!(copied[0].as_ref().unwrap().name, copied[1].as_ref().unwrap().name);
+    assert_ne!(copied[0], copied[1]);
+    for directory in ["Resources", "Tools", "Developer/Applications"] {
+      let path = format!(
+        "/Applications/Browser.app/Contents/{directory}/Independent.app/Contents/MacOS/tool"
+      );
+      assert_eq!(classify(&path).app.unwrap().1, "Independent", "{directory}");
+    }
+    for directory in ["Helpers", "Frameworks", "XPCServices", "Library/LoginItems"] {
+      let path =
+        format!("/Applications/Browser.app/Contents/{directory}/agent.app/Contents/MacOS/tool");
+      assert_eq!(classify(&path).app.unwrap().1, "Browser", "{directory}");
+    }
   }
 
   #[test]

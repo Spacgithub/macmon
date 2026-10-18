@@ -744,11 +744,9 @@ impl ProcSampler {
       // exec (about 1 ms for 800 processes)
       raw.path = exe_path(raw.pid);
       let before = identities.get(&raw.pid).copied().flatten();
-      raw.coalition = raw
-        .path
-        .as_deref()
-        .filter(|path| before.is_some() && self.ownership.candidate(path))
-        .and_then(|_| proc_groups::coalition(raw.pid));
+      let candidate =
+        raw.path.as_deref().map_or(before.is_some(), |path| self.ownership.candidate(path));
+      raw.coalition = candidate.then(|| proc_groups::coalition(raw.pid)).flatten();
       finish_identity(raw, before, proc_groups::identity(raw.pid))
     });
     self.update(rows, elapsed_ns)
@@ -797,16 +795,19 @@ impl ProcSampler {
     let apps = self.ownership.applications(&observations);
 
     for (raw, app) in rows.into_iter().zip(apps) {
-      let prev = self.known.remove(&raw.pid).filter(|prev| {
+      let previous = self.known.remove(&raw.pid);
+      // Lifetime identity survives a temporary libproc/ps switch even when its rate baseline
+      // cannot.
+      let instance = previous
+        .as_ref()
+        .filter(|prev| raw.identity.is_some() && prev.identity == raw.identity)
+        .map_or_else(|| self.ownership.fresh(), |prev| prev.instance.clone());
+      let prev = previous.filter(|prev| {
         prev.counters.start == raw.counters.start
           && prev.identity == raw.identity
           && prev.comm == raw.comm
           && raw.path.as_ref().is_none_or(|path| *path == prev.path)
       });
-      let instance = prev
-        .as_ref()
-        .filter(|_| raw.identity.is_some())
-        .map_or_else(|| self.ownership.fresh(), |prev| prev.instance.clone());
       let mut usage = usage(prev.as_ref().map(|prev| &prev.counters), &raw.counters, elapsed_ns);
       let ready = prev.as_ref().is_some_and(|prev| {
         elapsed_ns > 0 && raw.counters.cpu_ns >= prev.counters.cpu_ns
@@ -1251,6 +1252,63 @@ mod tests {
     let flat = ProcSampler::dashboard_rows(vec![second]).remove(0);
     assert_eq!((flat.cpu_pct, flat.gpu_pct), (grouped[0].cpu_pct, grouped[0].gpu_pct));
     assert_eq!((grouped[0].cpu_known, grouped[0].gpu_known), (0, 0));
+  }
+
+  #[test]
+  fn review_regression_source_fallback_keeps_instance_but_resets_rate_baselines() {
+    let path = "/Apps/Browser.app/Contents/MacOS/Browser";
+    let input = |cpu| Raw {
+      path: Some(path.into()),
+      counters: Counters { start: 42, ..row(A, cpu, Some(cpu), "Browser").counters },
+      ..row(A, cpu, Some(cpu), "Browser")
+    };
+    let fallback = |cpu| Raw {
+      ps: true,
+      comm: path.into(),
+      counters: Counters { start: 0, energy_nj: None, ..input(cpu).counters },
+      ..input(cpu)
+    };
+    let mut sampler = ProcSampler::new();
+    let first = sampler.update(vec![input(0)], 0).remove(0);
+    let busy = sampler.update(vec![input(SEC)], SEC).remove(0);
+    assert_eq!(first.meta.instance, busy.meta.instance);
+    assert!(busy.meta.known.0);
+    let ps = sampler.update(vec![fallback(2 * SEC)], SEC).remove(0);
+    assert_eq!(busy.meta.instance, ps.meta.instance);
+    assert!(!ps.meta.known.0 && ps.cpu_pct == 0.0);
+    let back = sampler.update(vec![input(3 * SEC)], SEC).remove(0);
+    assert_eq!(ps.meta.instance, back.meta.instance);
+    assert_eq!(first.meta.app, back.meta.app);
+    assert!(!back.meta.known.0 && back.cpu_pct == 0.0);
+    let busy = sampler.update(vec![input(4 * SEC)], SEC).remove(0);
+    assert_eq!(back.meta.instance, busy.meta.instance);
+    assert!(busy.meta.known.0);
+  }
+
+  #[test]
+  fn unconfirmed_sampler_observations_do_not_assign_xpc_and_recovery_is_local() {
+    let app = "/Apps/Browser.app/Contents/MacOS/Browser";
+    let other = "/Apps/Other.app/Contents/MacOS/Other";
+    let xpc = "/System/Services/worker.xpc/Contents/MacOS/worker";
+    let input = |pid, path: Option<&str>| Raw {
+      path: path.map(str::to_string),
+      coalition: Some([30, 31]),
+      ..row(pid, 0, None, "worker")
+    };
+    let mut sampler = ProcSampler::new();
+    sampler.ownership.set_default_for_test(Some([1, 3]));
+    for unavailable in [None, Some(other)] {
+      let mut unknown = input(B, unavailable);
+      if unavailable.is_some() {
+        let before = unknown.identity;
+        assert!(finish_identity(&mut unknown, before, None));
+      }
+      let rows = sampler.update(vec![input(A, Some(app)), unknown, input(B + 1, Some(xpc))], SEC);
+      assert!(rows[0].meta.app.is_some());
+      assert!(rows[1].meta.app.is_none() && rows[2].meta.app.is_none());
+    }
+    let recovered = sampler.update(vec![input(A, Some(app)), input(B + 1, Some(xpc))], SEC);
+    assert_eq!(recovered[0].meta.app, recovered[1].meta.app);
   }
 
   #[test]
