@@ -13,6 +13,7 @@ mod config;
 mod fds;
 mod find_clpc;
 mod proc_groups;
+mod process_demand;
 mod procs;
 mod serve;
 mod source;
@@ -307,11 +308,13 @@ fn main() -> Result<(), Box<dyn Error>> {
       let shared: serve::SharedMetrics = Arc::new(RwLock::new(Some(first)));
       let cadence = Arc::new(RwLock::new(serve::Cadence::with_source(Arc::clone(&client))));
       let shared_frames = Arc::clone(&shared);
+      let process_cadence = Arc::clone(&cadence);
       thread::spawn(move || {
         let mut previous = None::<(String, u64)>;
         loop {
           let key = previous.as_ref().map(|(session, sequence)| (session.as_str(), *sequence));
-          match client.wait_after(key, Duration::from_secs(1)) {
+          let wait = process_cadence.write().unwrap().refresh_process_demand(Instant::now());
+          match client.wait_after(key, wait) {
             Ok(Some(frame)) => {
               previous = Some((frame.session.clone(), frame.revision));
               *shared_frames.write().unwrap() = Some(frame);

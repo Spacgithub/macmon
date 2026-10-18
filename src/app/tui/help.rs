@@ -49,6 +49,7 @@ const HELP: &[Row] = &[
   Key("?", "show / hide this help"),
   Section("Info overlay"),
   Key("/", "filter the files"),
+  Key("r", "refresh the process details now"),
   Key("e", "show the selected file in Finder"),
   Key("c", "copy the selected path"),
   Key("q / Esc", "back to the processes"),

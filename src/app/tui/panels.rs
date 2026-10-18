@@ -908,6 +908,7 @@ mod tests {
                       id: format!("app-{}", index / 4),
                       name: format!("App {}", index / 4),
                     }),
+                    ..Default::default()
                   },
                 })
                 .collect(),

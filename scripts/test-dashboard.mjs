@@ -108,13 +108,14 @@ function fanTemplate() {
   return content;
 }
 
-async function drainMicrotasks() { for (let i = 0; i < 12; i++) await Promise.resolve(); }
+async function drainMicrotasks() { for (let i = 0; i < 24; i++) await Promise.resolve(); }
 
-function boot({ reduced = false, storage = new Map(), storageFailure = false, expanded = false } = {}) {
+function boot({ reduced = false, storage = new Map(), storageFailure = false, expanded = false, managed = false, hostname = 'localhost' } = {}) {
   let now = 0, nextId = 1, activeFetches = 0, maximumFetches = 0;
   const timers = new Map(), frames = new Map(), requests = [], elements = new Map();
   const document = new Target();
-  Object.assign(document, { hidden: false, activeElement: null, documentElement: new Element('root'),
+  let focused = true;
+  Object.assign(document, { hidden: false, hasFocus: () => focused, activeElement: null, documentElement: new Element('root'),
     getElementById(id) {
       const find = (node) => node.getAttribute('id') === id ? node : node.children.map(find).find(Boolean);
       const element = elements.get(id) || find(this.documentElement);
@@ -140,18 +141,24 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
   }
   elements.get('fan-template').content = fanTemplate();
   const media = new Target(); media.matches = reduced;
+  const window = new Target(); Object.assign(window, { devicePixelRatio: 2, location: { hostname } });
   const timer = (callback, delay = 0) => {
     const id = nextId++;
     timers.set(id, { at: now + Math.max(0, Number(delay)), callback });
     return id;
   };
   const fetch = (url, options) => {
-    assert.ok(['/api/sample', '/api/interval'].includes(url));
+    assert.ok(['/api/sample', '/api/interval', '/api/process-demand'].includes(url));
     if (url === '/api/sample') assert.equal(options.cache, 'no-store');
     else {
       assert.equal(options.method, 'POST');
       assert.equal(options.headers['Content-Type'], 'application/json');
-      assert.ok(['increase', 'decrease'].includes(JSON.parse(options.body).adjustment));
+      const body = JSON.parse(options.body);
+      if (url === '/api/interval') assert.ok(['increase', 'decrease'].includes(body.adjustment));
+      else {
+        assert.ok(['none', 'summary', 'details'].includes(body.demand));
+        assert.ok(body.lease === null || /^[\da-f]{32}$/i.test(body.lease));
+      }
     }
     assert.ok(!requests.some((request) => request.url === url && !request.done), `Concurrent ${url}`);
     const request = { url, options, done: false, jsonCalls: 0 };
@@ -174,9 +181,10 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
       if (options.signal.aborted) finish(new Error('Already aborted'), true);
     });
     requests.push(request);
+    if (url === '/api/process-demand' && !managed) request.answer({}, 404);
     return request.promise;
   };
-  const context = vm.createContext({ document, window: { devicePixelRatio: 2 }, console, AbortController,
+  const context = vm.createContext({ document, window, console, AbortController,
     localStorage: { getItem(key) { if (storageFailure) throw new Error('Storage denied'); return storage.get(key) ?? null; },
       setItem(key, value) { if (storageFailure) throw new Error('Storage denied'); storage.set(key, value); } },
     performance: { now: () => now }, fetch, matchMedia: () => media,
@@ -211,8 +219,9 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
     status: () => elements.get('status').dataset.state,
     now: () => now,
     maximumFetches: () => maximumFetches,
-    async answer(payload, status = 200) { assert.ok(pending(), 'No pending real poll'); pending().answer(payload, status); await drainMicrotasks(); },
+    async answer(payload, status = 200) { await drainMicrotasks(); assert.ok(pending(), 'No pending real poll'); pending().answer(payload, status); await drainMicrotasks(); },
     async control(payload, status = 200) { assert.ok(pending('/api/interval'), 'No pending real control'); pending('/api/interval').answer(payload, status); await drainMicrotasks(); },
+    async demand(payload = { lease: 'a'.repeat(32), ttl_ms: 15000 }, status = 200) { assert.ok(pending('/api/process-demand'), 'No pending process-demand request'); pending('/api/process-demand').answer(payload, status); await drainMicrotasks(); },
     async fail() { assert.ok(pending()); pending().fail(); await drainMicrotasks(); },
     async click(id) { const element = elements.get(id); if (!element.disabled) element.emit('click'); await drainMicrotasks(); },
     advance,
@@ -226,6 +235,7 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
     async motion(enabled) { elements.get('motion').checked = enabled; elements.get('motion').emit('change'); await drainMicrotasks(); },
     async reduced(enabled) { media.matches = enabled; media.emit('change'); await drainMicrotasks(); },
     async hidden(enabled) { document.hidden = enabled; document.emit('visibilitychange'); await drainMicrotasks(); },
+    async focused(enabled) { focused = enabled; window.emit(enabled ? 'focus' : 'blur'); await drainMicrotasks(); },
   };
 }
 
@@ -270,8 +280,8 @@ const processGroupDetail = (h, row) => h.document.getElementById(row.querySelect
 const groupMembers = (h, row) => processGroupDetail(h, row).querySelector('.process-members-table')?.children.find((node) => node.tagName === 'TBODY').children || [];
 async function toggleProcessGroup(h, row) { row.querySelector('.process-group-button').emit('click'); await drainMicrotasks(); }
 async function processControl(h, id, value, event = 'change') { h.elements.get(id).value = value; h.elements.get(id).emit(event); await drainMicrotasks(); }
-function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, process_groups, temperatures, memory_activity, thermal_state, disks } = {}) {
-  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, process_groups, temperatures, memory_activity, thermal_state, disks };
+function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks } = {}) {
+  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks };
 }
 function nvme(overrides = {}) {
   return { critical_warning: 0, percentage_used: 5, available_spare_percent: 100, spare_threshold_percent: 10,
@@ -478,21 +488,21 @@ await check('hidden tabs cancel animation and polling, then refresh on return', 
 });
 
 await check('hidden in-flight abort and rapid visibility changes preserve single flight', async () => {
-  const h = boot(); assert.ok(h.pending());
-  await h.hidden(true); assert.equal(h.requests[0].aborted, 'hidden');
+  const h = boot(); await drainMicrotasks(); assert.ok(h.pending());
+  await h.hidden(true); assert.equal(h.requests.find((request) => request.url === '/api/sample').aborted, 'hidden');
   await h.hidden(false); await h.advance(0);
-  assert.equal(h.requests.length, 2);
+  assert.equal(h.requests.filter((request) => request.url === '/api/sample').length, 2);
   h.document.emit('visibilitychange'); h.document.emit('visibilitychange');
   h.inspect('poll(); poll();'); await drainMicrotasks();
-  assert.equal(h.requests.length, 2); assert.equal(h.maximumFetches(), 1);
+  assert.equal(h.requests.filter((request) => request.url === '/api/sample').length, 2); assert.equal(h.maximumFetches(), 1);
   await h.answer(sample()); await h.advance(0);
   assert.equal(h.maximumFetches(), 1);
-  assert.ok(h.requests.length <= 3);
+  assert.ok(h.requests.filter((request) => request.url === '/api/sample').length <= 3);
 });
 
 await check('fetch timeout and invalid envelopes stay bounded and recover', async () => {
-  const h = boot(); await h.advance(2501);
-  assert.equal(h.requests[0].done, true); assert.equal(h.status(), 'offline');
+  const h = boot(); await drainMicrotasks(); await h.advance(2501);
+  assert.equal(h.requests.find((request) => request.url === '/api/sample').done, true); assert.equal(h.status(), 'offline');
   await nextPoll(h); await h.answer({ ...sample(), sequence: 'not-an-integer' });
   assert.equal(h.status(), 'offline'); assert.equal(h.state().history.length, 0);
   await nextPoll(h); await h.answer(sample());
@@ -1296,7 +1306,7 @@ await check('Disk health age includes sample age and fractional browser elapsed 
   await h.advance(600); assert.equal(h.state().disks.get('100:101').badge.dataset.state, 'stale');
   assert.match(h.state().disks.get('100:101').badge.textContent, /Stale/);
   assert.match(diskFields(h)['Health age'], /120s old \/ stale/);
-  assert.equal(h.requests.length, 1, 'Health can expire without a new sample or extra fetch');
+  assert.equal(h.requests.filter((request) => request.url === '/api/sample').length, 1, 'Health can expire without a new sample or extra fetch');
   await h.hidden(true); await h.advance(30000); await h.hidden(false);
   assert.equal(h.state().disks.get('100:101').badge.dataset.state, 'stale');
 });
@@ -1537,6 +1547,184 @@ await check('Network Auto selects only one interface with deterministic ties and
   assert.equal(h.text('network-observer'), 'Auto / utun1'); assert.equal(h.text('network-rx'), '4 KiB/s');
   assert.deepEqual(body.children, nodes); assert.equal(replaced, 0); assert.equal(h.document.activeElement, scroll); assert.equal(scroll.scrollTop, 123);
   assert.equal(body.children.length, 3); await h.click('network-toggle'); assert.equal(body.children.length, 3);
+});
+
+const collection = (overrides = {}) => ({ session: 'collector-one', sequence: 1, state: 'ready', demand: 'summary', interval_ms: 5000, ...overrides });
+const demandBody = (h) => JSON.parse(h.pending('/api/process-demand').options.body);
+
+await check('managed process polling registers first and uses the lease marker without legacy requests', async () => {
+  const h = boot({ managed: true });
+  assert.equal(h.pending(), undefined); assert.deepEqual(demandBody(h), { lease: null, demand: 'summary' });
+  await h.demand();
+  assert.equal(h.pending().options.headers['X-Macmon-Process-Lease'], 'a'.repeat(32));
+  await h.answer(sample({ ...processFixture(), process_collection: collection() }));
+  assert.match(h.text('process-status'), /summary 5\.0s/);
+  await h.click('process-toggle'); assert.deepEqual(demandBody(h), { lease: 'a'.repeat(32), demand: 'details' });
+  await h.demand(); await h.answer(sample({ ...processFixture(), process_collection: collection({ demand: 'details', interval_ms: 1000 }) }));
+  const before = h.requests.filter((request) => request.url === '/api/process-demand').length;
+  await toggleProcessGroup(h, processGroups(h)[0]);
+  await processControl(h, 'process-view', 'raw'); await processControl(h, 'process-sort', 'mem_bytes'); await processControl(h, 'process-filter', 'Worker', 'input');
+  assert.equal(h.requests.filter((request) => request.url === '/api/process-demand').length, before, 'Member expansion, sorting and filtering do not request per-PID telemetry');
+  assert.ok(h.requests.filter((request) => request.url === '/api/sample').every((request) => request.options.headers['X-Macmon-Process-Lease']));
+});
+
+await check('demand updates serialize and coalesce rapid blur hide restore so late none cannot win', async () => {
+  const h = boot({ managed: true }); await h.demand();
+  await h.answer(sample({ ...processFixture(), process_collection: collection() }));
+  await h.click('process-toggle'); await h.demand();
+  await h.answer(sample({ ...processFixture(), process_collection: collection({ demand: 'details', interval_ms: 1000 }) }));
+  await h.focused(false); assert.equal(demandBody(h).demand, 'summary');
+  await h.hidden(true); assert.equal(demandBody(h).demand, 'summary', 'One POST remains in flight');
+  await h.demand(); assert.equal(demandBody(h).demand, 'none');
+  await h.hidden(false); await h.focused(true); assert.equal(demandBody(h).demand, 'none');
+  await h.demand(); assert.equal(demandBody(h).demand, 'details', 'The latest visible focused state follows the delayed none');
+  await h.demand(); assert.equal(h.inspect('processLease.sent'), 'details');
+  assert.equal(h.pending('/api/process-demand'), undefined); assert.ok(h.pending());
+  const bodies = h.requests.filter((request) => request.url === '/api/process-demand').map((request) => JSON.parse(request.options.body).demand);
+  assert.deepEqual(bodies, ['summary', 'details', 'summary', 'none', 'details']);
+});
+
+await check('hidden tabs release process demand and do not renew it while asleep', async () => {
+  const h = boot({ managed: true }); await h.demand();
+  await h.answer(sample({ ...processFixture(), process_collection: collection() }));
+  await h.hidden(true); assert.equal(demandBody(h).demand, 'none'); await h.demand();
+  const requests = h.requests.length; await h.advance(20000); assert.equal(h.requests.length, requests);
+  await h.hidden(false); assert.deepEqual(demandBody(h), { lease: null, demand: 'summary' });
+  await h.demand({ lease: 'b'.repeat(32), ttl_ms: 15000 });
+  assert.equal(h.pending().options.headers['X-Macmon-Process-Lease'], 'b'.repeat(32));
+});
+
+await check('successful managed reads renew the same bounded lease beyond its original expiry', async () => {
+  const h = boot({ managed: true }); await h.demand();
+  await h.answer(sample({ ...processFixture(1), process_collection: collection() }));
+  for (let i = 1; i <= 17; i++) {
+    await nextPoll(h); await h.answer(sample({ sequence: i + 1, ...processFixture(1), process_collection: collection(), processes_age_ms: i * 1000 }));
+  }
+  assert.ok(h.now() > 15000); assert.equal(h.requests.filter((request) => request.url === '/api/process-demand').length, 1);
+  assert.ok(h.requests.filter((request) => request.url === '/api/sample').every((request) => request.options.headers['X-Macmon-Process-Lease'] === 'a'.repeat(32)));
+});
+
+await check('expired managed GET and POST leases re-register without an unmarked legacy fallback', async () => {
+  const h = boot({ managed: true }); await h.demand();
+  await h.answer(sample(), 410); assert.deepEqual(demandBody(h), { lease: null, demand: 'summary' });
+  await h.demand({ lease: 'b'.repeat(32), ttl_ms: 15000 });
+  assert.equal(h.pending().options.headers['X-Macmon-Process-Lease'], 'b'.repeat(32));
+  await h.answer(sample({ ...processFixture(), process_collection: collection() }));
+  await h.click('process-toggle'); await h.demand({}, 410);
+  assert.deepEqual(demandBody(h), { lease: null, demand: 'details' });
+  await h.demand({ lease: 'c'.repeat(32), ttl_ms: 15000 });
+  assert.equal(h.pending().options.headers['X-Macmon-Process-Lease'], 'c'.repeat(32));
+  assert.ok(h.requests.filter((request) => request.url === '/api/sample').every((request) => request.options.headers['X-Macmon-Process-Lease']));
+});
+
+await check('legacy demand capability is probed only once and preserves the old raw API', async () => {
+  const h = boot({ managed: true }); await h.demand({}, 404);
+  assert.equal(Object.keys(h.pending().options.headers).length, 0);
+  await h.answer(sample({ ...processFixture(), process_groups: undefined }));
+  assert.match(h.text('process-view-status'), /grouping unavailable/);
+  await h.click('process-toggle'); await h.hidden(true); await h.hidden(false);
+  assert.equal(h.requests.filter((request) => request.url === '/api/process-demand').length, 1);
+  assert.equal(Object.keys(h.pending().options.headers).length, 0);
+});
+
+await check('remote pages do not register process demand and forbidden controls retain system-only polling', async () => {
+  for (const hostname of ['monitor.example', '192.0.2.1', '[2001:db8::1]', 'localhost.attacker.invalid']) {
+    const h = boot({ managed: true, hostname }); await drainMicrotasks();
+    assert.equal(h.pending('/api/process-demand'), undefined); assert.equal(h.pending().options.headers['X-Macmon-Process-Lease'], 'none');
+    await h.answer(sample()); assert.equal(h.status(), 'live'); assert.match(h.text('process-status'), /Unavailable/);
+    await h.click('process-toggle'); assert.equal(h.pending('/api/process-demand'), undefined);
+  }
+  const denied = boot({ managed: true }); await denied.demand({}, 403);
+  assert.equal(denied.pending().options.headers['X-Macmon-Process-Lease'], 'none', '403 is a restricted request, not legacy demand');
+  await denied.answer(sample()); assert.equal(denied.status(), 'live');
+  await denied.click('process-toggle'); assert.equal(denied.requests.filter((request) => request.url === '/api/process-demand').length, 1);
+  for (const hostname of ['localhost', '127.0.0.1', '127.42.0.1', '[::1]', '[::ffff:7f00:1]']) {
+    const h = boot({ managed: true, hostname }); assert.ok(h.pending('/api/process-demand'));
+  }
+});
+
+await check('bad or failed lease replies never create an unmarked process demand', async () => {
+  for (const reply of [{ lease: '<script>', ttl_ms: 15000 }, { lease: 'a'.repeat(33), ttl_ms: 15000 }, { lease: 'a'.repeat(32), ttl_ms: 0 }, { lease: 'a'.repeat(32), ttl_ms: 15001 }]) {
+    const h = boot({ managed: true }); await h.demand(reply);
+    assert.equal(h.pending(), undefined); assert.equal(h.status(), 'offline');
+    assert.equal(h.requests.filter((request) => request.url === '/api/sample').length, 0);
+  }
+  const slow = boot({ managed: true }); await slow.advance(2); await slow.demand({ lease: 'a'.repeat(32), ttl_ms: 1 });
+  assert.equal(slow.pending(), undefined); assert.equal(slow.status(), 'offline');
+  const failed = boot({ managed: true }); await failed.demand({}, 503); assert.equal(failed.pending(), undefined); assert.equal(failed.status(), 'offline');
+});
+
+await check('independent process sequences refresh immediately during a ten-second system interval without adding chart samples', async () => {
+  const h = boot({ managed: true }); await h.click('process-toggle'); await h.demand(); await h.demand();
+  const first = processFixture(1), detail = collection({ interval_ms: 10000, demand: 'details' });
+  await h.answer(sample({ ...first, interval_ms: 10000, cadence: cadence(10000), process_collection: detail }));
+  const history = h.state().history.length, before = processName(processGroups(h)[0]);
+  await h.advance(999); assert.equal(h.pending(), undefined);
+  await h.advance(1); assert.ok(h.pending());
+  const next = processFixture(1); next.process_groups[0].name = 'New process snapshot';
+  await h.answer(sample({ ...next, interval_ms: 10000, cadence: cadence(10000), process_collection: { ...detail, sequence: 2 }, data: metrics({ cpu_active_ratio: 0.9 }) }));
+  assert.notEqual(before, processName(processGroups(h)[0])); assert.equal(processName(processGroups(h)[0]), 'New process snapshot');
+  assert.equal(h.state().history.length, history); assert.equal(h.text('cpu-value'), '25.0%');
+});
+
+await check('unchanged process snapshots skip full row validation while controls still update immediately', async () => {
+  const h = boot({ managed: true }); await h.demand();
+  const data = processFixture(1, 200), initial = data.processes[0].name; let reads = 0;
+  Object.defineProperty(data.processes[0], 'name', { get() { reads++; return initial; } });
+  await h.answer(sample({ ...data, process_collection: collection() }));
+  const after = reads, root = processGroups(h)[0], button = root.querySelector('.process-group-button'); button.focus();
+  await nextPoll(h); await h.answer(sample({ ...data, sequence: 2, processes_age_ms: 1000, process_collection: collection() }));
+  assert.equal(reads, after, 'A system-only frame does not scan and sort the same 200 processes again');
+  assert.equal(processGroups(h)[0], root); assert.equal(h.document.activeElement, button);
+  await processControl(h, 'process-filter', 'Worker 0-199', 'input'); assert.ok(reads > after);
+  assert.match(root.children[0].textContent, /1\/200 matching/);
+});
+
+await check('collector session changes replace process identities even if the sweep sequence restarts', async () => {
+  const h = boot({ managed: true }); await h.demand(); const data = processFixture(1);
+  await h.answer(sample({ ...data, process_collection: collection() }));
+  const old = processGroups(h)[0]; await toggleProcessGroup(h, old); await h.demand();
+  await h.answer(sample({ ...data, process_collection: collection({ session: 'collector-two' }) }));
+  const current = processGroups(h)[0]; assert.notEqual(current, old);
+  assert.equal(current.querySelector('.process-group-button').getAttribute('aria-expanded'), 'false');
+  assert.equal(h.state().details.process, true); assert.equal(h.state().history.length, 1);
+});
+
+await check('process freshness uses its own cadence and advances age without rebuilding rows between polls', async () => {
+  const h = boot({ managed: true }); await h.demand();
+  await h.answer(sample({ ...processFixture(1), interval_ms: 10000, cadence: cadence(10000), process_collection: collection({ interval_ms: 10000 }) }));
+  const row = processGroups(h)[0]; await h.advance(4000);
+  assert.equal(h.pending(), undefined); assert.match(h.text('process-status'), /4s old/); assert.equal(processGroups(h)[0], row);
+  const near = boot({ managed: true }); await near.demand();
+  await near.answer(sample({ ...processFixture(1), processes_age_ms: 14999, process_collection: collection() }));
+  assert.doesNotMatch(near.text('process-status'), /STALE/); await near.advance(2); assert.match(near.text('process-status'), /STALE/);
+});
+
+await check('paused warming and failed collection retain the actual cached age and group expansion', async () => {
+  const h = boot({ managed: true }); await h.demand(); const data = processFixture(1);
+  await h.answer(sample({ ...data, process_collection: collection() }));
+  const row = processGroups(h)[0]; await toggleProcessGroup(h, row); await h.demand();
+  await h.answer(sample({ ...data, processes_age_ms: 7000, process_collection: collection({ state: 'disabled', demand: 'none', interval_ms: null }) }));
+  assert.match(h.text('process-status'), /^PAUSED \/ retained \/ 7s old/); assert.equal(processGroupDetail(h, row).visible, true);
+  await nextPoll(h); await h.answer(sample({ ...data, processes_age_ms: 8000, process_collection: collection({ state: 'warming' }) }));
+  assert.match(h.text('process-status'), /^WARMING \/ retained \/ 8s old/); assert.equal(processGroups(h)[0], row);
+  await nextPoll(h); await h.answer(sample({ ...data, processes_age_ms: 9000, process_collection: collection({ state: 'failed' }) }));
+  assert.match(h.text('process-status'), /^FAILED \/ retained \/ 9s old/); assert.equal(processGroupDetail(h, row).visible, true);
+  await nextPoll(h); await h.answer(sample({ ...data, process_collection: collection({ sequence: 2 }) }));
+  assert.doesNotMatch(h.text('process-status'), /PAUSED|WARMING|FAILED/); assert.equal(processGroupDetail(h, row).visible, true);
+  const empty = boot({ managed: true }); await empty.demand();
+  await empty.answer(sample({ process_collection: collection({ sequence: 0, state: 'warming' }) }));
+  assert.match(empty.text('process-status'), /^WARMING/); assert.match(empty.text('process-empty'), /first process snapshot/);
+});
+
+await check('malformed collection metadata stays unavailable without inserting external state text', async () => {
+  const cases = [{ session: '' }, { session: '<bad>\u0000' }, { sequence: -1 }, { sequence: Number.MAX_SAFE_INTEGER + 1 }, { state: '<img onerror=x>' }, { demand: 'full' }, { interval_ms: 0 }, { interval_ms: 2 ** 32 }];
+  for (const invalid of cases) {
+    const h = boot({ managed: true }); await h.demand();
+    await h.answer(sample({ ...processFixture(1), process_collection: collection(invalid) }));
+    assert.equal(h.inspect('procView.collection'), null); assert.equal(processGroups(h).length, 1);
+    assert.doesNotMatch(h.text('process-status'), /<img|full/);
+  }
 });
 
 console.log(`${tests.length} dashboard checks passed.`);

@@ -100,7 +100,8 @@ selected panel. `d` expands all panels or returns them to summaries. `f` opens t
 panel in a full-screen detail view; `f` / `Esc` returns. Use arrows, Page Up/Down or Home/End
 to scroll complete core, interface and sensor lists. Process arrows retain their selection behavior
 and open the full list when needed. Filtering, sorting and selected processes survive detail
-changes and resizing; `p` separately hides the process panel and stops its sampling.
+changes and resizing; `p` separately hides the process panel and releases this terminal's
+process demand. Other connected views can keep shared process collection active.
 
 Expanded Compute adds the original overall CPU activity, reported/installed core counts,
 core-type summaries and every reported die/core. GPU details add reported activity, supported
@@ -198,6 +199,14 @@ available. `Enter` keeps the filter and `Esc` clears it after leaving a full-pan
 Grouped CPU 100% is one core, memory sums reported process memory, and GPU totals sum
 process shares. `≥` marks a partial total; `-` means unavailable. Large values retain their
 units using compact notation. Unconfirmed application ownership remains an individual row.
+
+Complete process snapshots refresh every 5 seconds in a summary, or every 1 second while a
+detailed list is requested. A slower system interval takes precedence. The highest demand
+among connected views wins; with no demand, collection pauses and retained data keeps its
+original age. Unfocused terminals use the summary cadence. A process Info overlay always
+requests details, but reads only that selected PID's files and sockets on a separate worker,
+every 5 seconds (or the slower system interval). Press `r` in Info to refresh immediately;
+while entering its filter, `r` remains text. Closing Info discards late results.
 
 ### JSON output
 
@@ -303,12 +312,17 @@ matching/total count; application totals still include all members. Unknown owne
 as an individual process. Older backends without grouping data retain the individual list.
 CPU, GPU and memory are sortable by usage; CPU 100% means one busy core. New processes and
 unavailable rates show `Unavailable`; partial totals show `≥` and known-member coverage.
-Process sampling runs once per completed
-metrics cycle, independently of browsers. Only loopback clients with a matching loopback Host
+Visible browser summaries request the 5-second process cadence; expanded lists request
+1 second while focused, and hidden tabs release their demand. Only loopback clients with a matching loopback Host
 receive process names and PIDs; other requests get `processes: null`. Snapshot age is reported
 as `processes_age_ms`, and all processes remain accessible in the scrollable table.
 System and process collection run independently. Their separate timestamps and ages retain
 the actual completion time; a slower process read does not delay publication of system metrics.
+`process_collection` reports the collector session, process sequence, state, aggregate demand
+and actual interval. Browser demand uses bounded 15-second leases through a same-origin
+loopback `POST /api/process-demand`; leases expire even when tabs stop making requests.
+Older clients without a lease keep their existing full-snapshot behavior while polling
+`/api/sample`. Remote system metrics and older backends remain supported.
 
 The same local snapshot includes `process_groups`: application summaries and unassigned
 individual processes, with opaque group IDs and `{pid, instance}` member identities. Confirmed

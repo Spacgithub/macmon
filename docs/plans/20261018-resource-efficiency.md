@@ -43,7 +43,7 @@
 
 - [x] Record an optimization baseline and define matched before/after scenarios.
 - [x] Implement and verify shared sampling, cadence, safe transport and collector lifetime.
-- [ ] Implement and verify demand-driven process snapshots and selected-PID detail collection.
+- [x] Implement and verify demand-driven process snapshots and selected-PID detail collection.
 - [ ] Add Terminal/Web frame-rate controls and verify real scheduling at each rate.
 - [ ] Complete full checks, independent reviews, real hardware/browser regression and
       repeated CPU/memory comparisons; retain all existing monitoring and compatibility.

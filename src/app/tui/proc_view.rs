@@ -1247,6 +1247,8 @@ impl App {
       Titles::new(theme::value(format!("6 Processes · top 5 / {count}"), theme::SECTION))
         .right(hint("f", "full"))
     };
+    let title =
+      if let Some(status) = self.process_status() { title.left(faint(status)) } else { title };
     let inner = draw_box(f, area, title);
     self.proc_view.targets = Targets::default();
     if inner.is_empty() {
@@ -1323,6 +1325,8 @@ impl App {
   /// on the bottom border. Keeps the cells that react to the mouse for `ProcView::handle_mouse`.
   pub(super) fn render_proc_box(&mut self, f: &mut Frame, area: Rect) {
     let titles = self.proc_view.titles(area.width);
+    let titles =
+      if let Some(status) = self.process_status() { titles.left(faint(status)) } else { titles };
     let titles = if self.panels_legacy() {
       titles
     } else {

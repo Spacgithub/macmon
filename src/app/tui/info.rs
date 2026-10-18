@@ -1,6 +1,8 @@
 //! The info overlay (`i`): the executable, working directory, open files and sockets of the
 //! selected process, under a line counting the descriptors; `e` reveals one.
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -10,6 +12,7 @@ use ratatui::widgets::Clear;
 use super::boxes::{
   Titles, draw_box, draw_divider, draw_scrollbar, hint, join, render_bottom_border, title_text_room,
 };
+use super::info_worker::{Completion, Request, Target};
 use super::kill::{ProcSys, failure};
 use super::proc_view::{
   ELLIPSIS, Filter, cut_middle, filter_title, scroll_offset, step, type_filter,
@@ -100,39 +103,129 @@ pub(super) struct Info {
   home: String,
   /// `c` copied the selected text, and no key was pressed since.
   copied: bool,
+  request: Option<Request>,
+  sampled: Option<Instant>,
+  refreshing: bool,
+  rendered_age: Option<u64>,
 }
 
 impl Info {
   /// The overlay of `proc`, its first row selected.
-  pub(super) fn new(proc: &ProcInfo, sys: &dyn ProcSys) -> Self {
-    let (proc, files, filter) = (proc.clone(), Ok(vec![]), String::new());
+  pub(super) fn new(proc: &ProcInfo, generation: u64) -> Self {
+    let (proc, files, filter) = (proc.clone(), Err("Collecting…".into()), String::new());
     let home = std::env::var("HOME").unwrap_or_default();
     let (typing, index, key, offset, page) = (false, 0, None, 0, 0);
     let copied = false;
-    let mut info = Self { proc, files, filter, typing, index, key, offset, page, home, copied };
-    info.refresh(sys);
+    let mut info = Self {
+      proc,
+      files,
+      filter,
+      typing,
+      index,
+      key,
+      offset,
+      page,
+      home,
+      copied,
+      request: None,
+      sampled: None,
+      refreshing: true,
+      rendered_age: None,
+    };
+    info.request_refresh(generation);
     info
   }
 
-  /// Reads the files again. A pid reused since the sample (another start time) reads as exited, a
-  /// `ps` row (no start time) as not permitted, as kill takes them.
-  pub(super) fn refresh(&mut self, sys: &dyn ProcSys) {
+  pub(super) fn request(&self) -> Option<Request> {
+    self.request.clone()
+  }
+
+  /// Replacing a generation cancels any read already in flight, without blocking this event.
+  pub(super) fn request_refresh(&mut self, generation: u64) {
+    self.request = Some(Request {
+      generation,
+      target: Target {
+        pid: self.proc.pid,
+        started: self.proc.started,
+        instance: self.proc.meta.instance.clone(),
+        identity: self.proc.meta.identity,
+      },
+    });
+    self.refreshing = true;
+  }
+
+  /// Only the currently open overlay may accept a result, including close/reopen of one PID.
+  pub(super) fn complete(&mut self, result: Completion) -> bool {
+    if self.request.as_ref() != Some(&result.request) {
+      return false;
+    }
+    self.files = result.files.map_err(failure);
+    self.sampled = Some(result.sampled);
+    self.refreshing = false;
+    self.follow();
+    true
+  }
+
+  #[cfg(test)]
+  fn fixture(proc: &ProcInfo, sys: &dyn ProcSys) -> Self {
+    let mut info = Self::new(proc, 1);
+    info.refresh_fixture(sys);
+    info
+  }
+
+  /// Explicit synchronous fixture injection; ordinary render tests never start a native worker.
+  #[cfg(test)]
+  pub(super) fn refresh_fixture(&mut self, sys: &dyn ProcSys) {
     let (pid, started) = (self.proc.pid, self.proc.started);
     let files = sys.open_files(pid).and_then(|files| {
       let started = started.ok_or(libc::EPERM)?;
       if sys.identity(pid) == Some(started) { Ok(files) } else { Err(libc::ESRCH) }
     });
-    self.files = files.map_err(failure);
-    self.follow();
+    self.complete(Completion { request: self.request().unwrap(), sampled: Instant::now(), files });
   }
 
   /// Takes the name and path of its process from a new sample: an `exec` keeps the pid and the
   /// start time. A process gone from the sample keeps them; its files tell it exited.
-  pub(super) fn update_proc(&mut self, procs: &[ProcInfo]) {
-    let same = |p: &&ProcInfo| (p.pid, p.started) == (self.proc.pid, self.proc.started);
-    if let Some(proc) = procs.iter().find(same) {
-      (self.proc.name, self.proc.path) = (proc.name.clone(), proc.path.clone());
+  pub(super) fn update_proc(&mut self, procs: &[ProcInfo]) -> bool {
+    let Some(proc) = procs.iter().find(|proc| proc.pid == self.proc.pid) else { return false };
+    if self.request.is_none() {
+      return false;
     }
+    let native = (self.proc.meta.identity, proc.meta.identity);
+    let reused = matches!(native, (Some(a), Some(b)) if a.unique != b.unique)
+      || matches!((self.proc.started, proc.started), (Some(a), Some(b)) if a != b);
+    if reused {
+      self.files = Err(failure(libc::ESRCH));
+      self.request = None;
+      self.sampled = None;
+      self.refreshing = false;
+      return false;
+    }
+    let same_native = matches!(native, (Some(a), Some(b)) if a.unique == b.unique);
+    if self.proc.started != proc.started && !same_native {
+      return false;
+    }
+    let changed = self.proc.path != proc.path
+      || proc.meta.identity.is_some() && self.proc.meta.identity != proc.meta.identity
+      || self.proc.started.is_none() && proc.started.is_some();
+    (self.proc.name, self.proc.path) = (proc.name.clone(), proc.path.clone());
+    if changed {
+      let identity = proc.meta.identity.or(self.proc.meta.identity);
+      self.proc.meta = proc.meta.clone();
+      self.proc.meta.identity = identity;
+      self.proc.started = proc.started.or(self.proc.started);
+      self.files = Err("Collecting…".into());
+      self.sampled = None;
+    }
+    changed
+  }
+
+  fn age(&self) -> Option<u64> {
+    self.sampled.map(|sampled| sampled.elapsed().as_secs())
+  }
+
+  pub(super) fn age_changed(&self) -> bool {
+    self.age() != self.rendered_age
   }
 
   /// `path` with the home directory as `~`.
@@ -287,6 +380,7 @@ impl Info {
   /// with a scrollbar when they don't fit, or why there are none, and `? | q back` on the bottom
   /// border (not while typing).
   pub(super) fn render(&mut self, f: &mut Frame, area: Rect) {
+    self.rendered_age = self.age();
     f.render_widget(Clear, area);
     let name = vec![heading(self.proc.name.clone()), text(format!(" {}", self.proc.pid))];
     let titles = Titles::new(name);
@@ -331,14 +425,27 @@ impl Info {
     // help and back as on the main footer, `copied` after `c`; nothing while typing (the filter
     // keys are on the divider)
     if !self.typing && area.height >= 2 {
-      let copied = if self.copied { vec![faint("copied")] } else { vec![] };
-      render_bottom_border(f, area, vec![hint("?", ""), hint("q", "back")], |_| copied);
+      let age = match (self.age(), self.refreshing) {
+        (Some(age), true) => format!("Refreshing · {age}s old"),
+        (Some(age), false) => format!("{age}s old"),
+        (None, true) => "Collecting…".into(),
+        (None, false) => "Stopped".into(),
+      };
+      let status = vec![faint(if self.copied { "copied".into() } else { age })];
+      render_bottom_border(
+        f,
+        area,
+        vec![hint("r", "refresh"), hint("?", ""), hint("q", "back")],
+        |_| status,
+      );
     }
   }
 }
 
 #[cfg(test)]
 mod tests {
+  use std::time::{Duration, Instant};
+
   use ratatui::Terminal;
   use ratatui::backend::TestBackend;
   use ratatui::buffer::Buffer;
@@ -349,7 +456,9 @@ mod tests {
 
   use super::{Info, cut_path};
   use crate::fds::{Kind, OpenFile};
+  use crate::proc_groups::Identity;
   use crate::procs::{self, ProcInfo};
+  use crate::tui::info_worker::Completion;
   use crate::tui::kill::tests::FakeSys;
   use crate::tui::kill::{LibcSys, ProcSys};
   use crate::tui::theme;
@@ -448,7 +557,7 @@ mod tests {
   /// screen, no counts line).
   fn overlay(proc: ProcInfo, files: Result<Vec<OpenFile>, i32>) -> (Info, FakeSys) {
     let fake = fake(files);
-    let mut info = Info::new(&proc, &fake);
+    let mut info = Info::fixture(&proc, &fake);
     info.home = "/Users/vlad".into();
     render(&mut info, 80, 8);
     (info, fake)
@@ -614,7 +723,8 @@ mod tests {
       modifiers: KeyModifiers::NONE,
     };
     info.handle_mouse(wheel);
-    assert_eq!(rows(&render(&mut info, 80, 8))[7], format!("╰{} ? | q back ─╯", "─".repeat(65)));
+    let bottom = rows(&render(&mut info, 80, 8)).pop().unwrap();
+    assert!(bottom.contains("s old") && bottom.ends_with(" refresh | ? | q back ─╯"));
     // a click too
     assert!(press(&mut info, &fake, KeyCode::Char('c')));
     info.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), ..wheel });
@@ -676,21 +786,21 @@ mod tests {
     let mut files = chrome_files();
     files.retain(|file| file.fd != Some(8));
     set(files.clone());
-    info.refresh(&fake);
+    info.refresh_fixture(&fake);
     assert!(selected(&info).ends_with("Ruleset Data") && info.rows()[info.index].count == 1);
 
     // the row closed: the row in its place
     let index = info.index;
     files.retain(|file| !file.text.ends_with("Ruleset Data"));
     set(files);
-    info.refresh(&fake);
+    info.refresh_fixture(&fake);
     let tcp = "192.168.1.20:50122 → 140.82.112.4:443 (established)";
     assert_eq!((selected(&info), info.index), (tcp.into(), index));
 
     // the exe too has its own key
     assert!(press(&mut info, &fake, KeyCode::Home));
     set(chrome_files());
-    info.refresh(&fake);
+    info.refresh_fixture(&fake);
     assert_eq!(info.rows()[info.index].kind, Kind::Exe);
   }
 
@@ -707,7 +817,7 @@ mod tests {
     ];
     for (files, started, text) in cases {
       let fake = fake(files);
-      let mut info = Info::new(&ProcInfo { started, ..proc() }, &fake);
+      let mut info = Info::fixture(&ProcInfo { started, ..proc() }, &fake);
       let buf = render(&mut info, 40, 12);
       let shown = rows(&buf);
       // no `copy | finder`, no counts line, the divider, then the text
@@ -715,7 +825,7 @@ mod tests {
       assert_eq!(shown[1], format!("├─ / filter {}┤", "─".repeat(27)));
       assert_eq!(shown[2], format!("│{text:38}│"));
       assert_eq!((buf[(2, 2)].fg, buf[(2, 2)].modifier), (theme::TEXT, Modifier::DIM), "{text}");
-      assert_eq!(shown[11], format!("╰{} ? | q back ─╯", "─".repeat(25)));
+      assert!(shown[11].contains("s old") && shown[11].ends_with(" refresh | ? | q back ─╯"));
       // nothing to select or reveal
       for code in [KeyCode::Down, KeyCode::End, KeyCode::Char('e')] {
         assert!(press(&mut info, &fake, code));
@@ -726,7 +836,7 @@ mod tests {
     // exited while open
     let (mut info, fake) = info(Ok(files()));
     fake.0.borrow_mut().files.clear();
-    info.refresh(&fake);
+    info.refresh_fixture(&fake);
     assert_eq!(rows(&render(&mut info, 40, 5))[2], format!("│{:38}│", " Already exited"));
 
     // a filter that matches nothing: no `copy | finder` either, back with a row
@@ -762,7 +872,8 @@ mod tests {
       "│                                                                                                  │",
       "╰───────────────────────────────────────────────────────────────────────────────────── ? | q back ─╯",
     ];
-    assert_eq!(rows(&buf), overlay);
+    assert_eq!(&rows(&buf)[..15], &overlay[..15]);
+    assert!(rows(&buf)[15].contains("s old") && rows(&buf)[15].contains("refresh"));
     // `×N` faint like the type and the mode, the paths plain, the exe selected
     let cell = |x: u16, y: u16| (buf[(x, y)].fg, buf[(x, y)].modifier);
     let (plain, faint) = ((theme::TEXT, Modifier::empty()), (theme::TEXT, Modifier::DIM));
@@ -847,7 +958,8 @@ mod tests {
       "╰───────────────────────────────────────────── ? | q back ─╯",
     ];
     let shown = rows(&buf);
-    assert_eq!(shown, overlay);
+    assert_eq!(&shown[..7], &overlay[..7]);
+    assert!(shown[7].contains("s old") && shown[7].contains("refresh"));
     // the type and mode faint, the path in the default color, the selected row plain text
     // reversed from border to border, the key of the hint cyan, its label faint
     let cell = |x: u16, y: u16| (buf[(x, y)].fg, buf[(x, y)].modifier);
@@ -898,11 +1010,86 @@ mod tests {
     info.update_proc(&other);
     assert_eq!(selected(&info), EXE);
     info.update_proc(&[exec]);
-    info.refresh(&fake);
+    info.refresh_fixture(&fake);
     assert_eq!(selected(&info), "/bin/zsh");
     assert!(rows(&render(&mut info, 80, 8))[0].starts_with("╭─ zsh 631 ─"));
     assert!(press(&mut info, &fake, KeyCode::Char('e')));
     assert_eq!(revealed(&fake), ["/bin/zsh"]);
+  }
+
+  #[test]
+  fn asynchronous_results_keep_age_and_reject_obsolete_refreshes() {
+    let mut info = Info::new(&proc(), 1);
+    assert!(info.rows().is_empty() && info.refreshing);
+    assert!(rows(&render(&mut info, 80, 8))[2].contains("Collecting"));
+    let first = info.request().unwrap();
+    assert!(info.complete(Completion {
+      request: first.clone(),
+      sampled: Instant::now() - Duration::from_secs(7),
+      files: Ok(files()),
+    }));
+    let count = info.rows().len();
+    assert!(rows(&render(&mut info, 80, 8))[7].contains("7s old"));
+    assert!(!info.age_changed());
+    info.request_refresh(2);
+    assert!(info.refreshing && info.rows().len() == count);
+    assert!(!info.complete(Completion {
+      request: first,
+      sampled: Instant::now(),
+      files: Ok(vec![])
+    }));
+    assert_eq!(info.age(), Some(7));
+    assert!(rows(&render(&mut info, 80, 8))[7].contains("Refreshing"));
+    assert!(info.complete(Completion {
+      request: info.request().unwrap(),
+      sampled: Instant::now(),
+      files: Err(libc::EPERM),
+    }));
+    assert!(info.rows().is_empty() && !info.refreshing);
+  }
+
+  #[test]
+  fn exec_restarts_details_and_a_reused_pid_cannot_inherit_them() {
+    let mut sampled = proc();
+    sampled.meta.identity = Some(Identity { unique: 42, version: 1 });
+    sampled.meta.instance = "native-42".into();
+    let mut info = Info::new(&sampled, 3);
+    let before = info.request().unwrap();
+    assert!(info.complete(Completion {
+      request: before.clone(),
+      sampled: Instant::now(),
+      files: Ok(files())
+    }));
+    let mut exec = sampled.clone();
+    exec.meta.identity.as_mut().unwrap().version += 1;
+    exec.path = "/bin/zsh".into();
+    assert!(info.update_proc(&[exec.clone()]));
+    info.request_refresh(4);
+    assert!(info.rows().is_empty());
+    assert!(!info.complete(Completion {
+      request: before,
+      sampled: Instant::now(),
+      files: Ok(files())
+    }));
+    let mut reused = exec;
+    reused.meta.identity.as_mut().unwrap().unique += 1;
+    assert!(!info.update_proc(&[reused]));
+    assert!(info.request().is_none());
+    assert!(rows(&render(&mut info, 80, 8))[2].contains("Already exited"));
+  }
+
+  #[test]
+  fn unchanged_process_samples_do_not_refresh_or_reset_detail_age() {
+    let (mut info, _) = self::info(Ok(files()));
+    let request = info.request();
+    let sampled = info.sampled;
+    let mut row = proc();
+    row.meta.instance = "new-opaque-fallback-token".into();
+    assert!(!info.update_proc(&[row]));
+    assert!(!info.update_proc(&[]));
+    assert_eq!(info.request(), request);
+    assert_eq!(info.sampled, sampled);
+    assert!(!info.refreshing);
   }
 
   /// The only test with the real calls: the test's own process, and no reveal.
@@ -912,7 +1099,7 @@ mod tests {
     let info = procs::bsd_info(pid).unwrap();
     let started = Some((info.pbi_start_tvsec, info.pbi_start_tvusec));
     assert_eq!(LibcSys.identity(pid), started);
-    let info = Info::new(&ProcInfo { pid, started, ..proc() }, &LibcSys);
+    let info = Info::fixture(&ProcInfo { pid, started, ..proc() }, &LibcSys);
     let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
     assert_eq!(info.files.unwrap()[0], OpenFile { fd: None, kind: Kind::Cwd, text: cwd, mode: "" });
   }

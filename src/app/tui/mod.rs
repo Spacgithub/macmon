@@ -13,6 +13,7 @@ mod fan_replies;
 mod fan_text;
 mod help;
 mod info;
+mod info_worker;
 mod kill;
 mod layout;
 mod memory;
@@ -57,7 +58,9 @@ use crate::config::Config;
 use crate::config::TUI_MIN_MS;
 #[cfg(test)]
 use crate::procs::ProcInfo;
-use crate::source::{CadenceState, Client, ConnectionState, Frame as SourceFrame, ProcessDemand};
+use crate::source::{
+  CadenceState, Client, ConnectionState, Frame as SourceFrame, ProcessDemand, ProcessState,
+};
 
 type WithError<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -154,6 +157,7 @@ enum Event {
     showing: u64,
     procs: Vec<ProcInfo>,
   },
+  Info(info_worker::Completion),
   Key(KeyEvent),
   Mouse(MouseEvent),
   /// The terminal window lost focus.
@@ -390,15 +394,23 @@ enum SourceCommand {
 
 fn source_events(
   client: Client,
+  demand: Arc<Mutex<ProcessDemand>>,
   tx: mpsc::Sender<Event>,
   commands: mpsc::Receiver<SourceCommand>,
   slot: Arc<SourceSlot>,
   mut previous: Option<(String, u64)>,
 ) {
   thread::spawn(move || {
+    let mut requested = *demand.lock().unwrap();
+    let _ = client.set_demand(requested);
     let mut status = None;
     let mut last_cadence = client.cadence();
     loop {
+      let wanted = *demand.lock().unwrap();
+      if requested != wanted {
+        let _ = client.set_demand(wanted);
+        requested = wanted;
+      }
       match commands.try_recv() {
         Ok(SourceCommand::Adjust(increase)) => {
           if let Ok(cadence) = client.adjust(if increase { "increase" } else { "decrease" })
@@ -455,6 +467,12 @@ pub struct App {
   source_sampled: Option<Instant>,
   source_process: Option<(u64, u64)>,
   source_fresh: bool,
+  source_demand: Option<ProcessDemand>,
+  source_requested: Option<Arc<Mutex<ProcessDemand>>>,
+  process_sampled: Option<Instant>,
+  process_state: Option<ProcessState>,
+  process_interval_ms: u32,
+  process_rendered_age: Option<u64>,
   /// Graph bars in three levels (blank, `▄`, `█`): Apple Terminal draws gaps between the eighth
   /// blocks.
   three_level_bars: bool,
@@ -518,6 +536,8 @@ pub struct App {
   help: Option<usize>,
   /// The info overlay (`i`) of the selected process, while it is open.
   info: Option<Info>,
+  info_worker: Option<info_worker::Worker>,
+  info_generation: u64,
   /// The kill popup (`k`) for the selected process.
   kill: Kill,
 }
@@ -567,6 +587,7 @@ impl App {
       self.proc_view.clear();
       self.info = None;
       self.kill.close();
+      self.sync_info_worker();
       self.source_process = None;
       self.source_sequence = 0;
     }
@@ -574,6 +595,9 @@ impl App {
     self.source_sampled = Some(frame.sampled);
     self.source_fresh = self.source_live();
     self.cfg.adopt_interval(frame.cadence.effective_ms);
+    self.process_state = Some(frame.process_state);
+    self.process_interval_ms = frame.process_interval_ms;
+    self.process_sampled = frame.processes.as_ref().map(|processes| processes.snapshot.sampled);
     if self.source_sequence != frame.sequence {
       self.source_sequence = frame.sequence;
       self.memory_activity = frame.details.memory_activity;
@@ -599,11 +623,14 @@ impl App {
       self.proc_view.set_snapshot(rows, groups);
       self.normalize_proc_selection();
       self.source_process = Some((showing, processes.sequence));
-      if let Some(info) = &mut self.info {
-        info.update_proc(self.proc_view.procs().unwrap_or_default());
-        info.refresh(&*self.kill.sys);
+      if let Some(info) = &mut self.info
+        && info.update_proc(self.proc_view.procs().unwrap_or_default())
+      {
+        self.info_generation = self.info_generation.wrapping_add(1);
+        info.request_refresh(self.info_generation);
       }
     }
+    self.sync_info_worker();
   }
 
   fn adjust_source_interval(&mut self, increase: bool) {
@@ -654,6 +681,7 @@ impl App {
       self.proc_view.clear();
       self.info = None;
       self.kill.close();
+      self.sync_info_worker();
     }
   }
 
@@ -670,11 +698,74 @@ impl App {
       self.normalize_proc_selection();
       self.proc_view.set_procs(procs);
       self.normalize_proc_selection();
-      if let Some(info) = &mut self.info {
-        info.update_proc(self.proc_view.procs().unwrap_or_default());
-        info.refresh(&*self.kill.sys);
+      if let Some(info) = &mut self.info
+        && info.update_proc(self.proc_view.procs().unwrap_or_default())
+      {
+        self.info_generation = self.info_generation.wrapping_add(1);
+        info.request_refresh(self.info_generation);
       }
+      self.sync_info_worker();
     }
+  }
+
+  fn sync_info_worker(&self) {
+    if let Some(worker) = &self.info_worker {
+      let interval =
+        info_worker::INTERVAL.max(Duration::from_millis(u64::from(self.cfg.interval())));
+      worker.set(self.info.as_ref().and_then(Info::request), interval);
+    }
+  }
+
+  fn process_demand(&self) -> ProcessDemand {
+    if self.info.is_some() {
+      return ProcessDemand::Details;
+    }
+    if !self.cfg.show_procs || self.panels.fullscreen && self.panels.focus != Panel::Processes {
+      return ProcessDemand::None;
+    }
+    if !self.unfocused
+      && (self.cfg.panel_detailed(Panel::Processes as usize) || self.panels.fullscreen)
+    {
+      ProcessDemand::Details
+    } else {
+      ProcessDemand::Summary
+    }
+  }
+
+  fn sync_process_demand(&mut self) {
+    let demand = self.process_demand();
+    if let Some(requested) = &self.source_requested
+      && self.source_demand != Some(demand)
+    {
+      *requested.lock().unwrap() = demand;
+      self.source_demand = Some(demand);
+    }
+  }
+
+  fn process_status(&self) -> Option<String> {
+    let state = self.process_state?;
+    let age = self.process_sampled.map(|sampled| sampled.elapsed().as_secs());
+    let stale = self.process_sampled.is_some_and(|sampled| {
+      sampled.elapsed().as_millis()
+        > u128::from(self.process_interval_ms).saturating_mul(3).max(3000)
+    });
+    let label = if !self.source_live() {
+      "retained "
+    } else {
+      match state {
+        ProcessState::Disabled => "paused ",
+        ProcessState::Warming => "warming ",
+        ProcessState::Failed => "failed ",
+        ProcessState::Ready if stale => "stale ",
+        ProcessState::Ready => "",
+      }
+    };
+    let age = age.map(|age| format!("{age}s old")).unwrap_or_else(|| "waiting".into());
+    Some(if self.process_interval_ms > 0 {
+      format!("{label}{age} · {:.1}s", f64::from(self.process_interval_ms) / 1000.0)
+    } else {
+      format!("{label}{age}")
+    })
   }
 
   /// Applies one event. Returns `Break` when the app should quit. Keys can change the interval,
@@ -699,11 +790,13 @@ impl App {
           self.cfg.save_interval(cadence.requested_ms);
         }
         self.cfg.adopt_interval(cadence.effective_ms);
+        self.sync_info_worker();
         return ControlFlow::Continue(());
       }
       Event::Key(key) => self.handle_key(key),
       Event::Mouse(mouse) => {
         self.handle_mouse(mouse);
+        self.sync_process_demand();
         return ControlFlow::Continue(());
       }
       #[cfg(test)]
@@ -721,15 +814,23 @@ impl App {
         self.update_procs(showing, procs);
         return ControlFlow::Continue(());
       }
+      Event::Info(result) => {
+        if let Some(info) = &mut self.info {
+          info.complete(result);
+        }
+        return ControlFlow::Continue(());
+      }
       // switching away is done typing: keys back as shortcuts, the filter stays
       Event::FocusLost => {
         self.unfocused = true;
         self.proc_view.end_typing();
         self.info.iter_mut().for_each(|info| info.typing = false);
+        self.sync_process_demand();
         return ControlFlow::Continue(());
       }
       Event::FocusGained => {
         self.unfocused = false;
+        self.sync_process_demand();
         return ControlFlow::Continue(());
       }
       Event::Capabilities(caps) => {
@@ -752,6 +853,8 @@ impl App {
     };
 
     *msec.write().unwrap() = self.cfg.interval();
+    self.sync_info_worker();
+    self.sync_process_demand();
     flow
   }
 
@@ -777,6 +880,15 @@ impl App {
         if !fresh {
           self.kill.close();
         }
+        return Ok(ControlFlow::Continue(true));
+      }
+      if self.info.as_ref().is_some_and(Info::age_changed) {
+        return Ok(ControlFlow::Continue(true));
+      }
+      if self.process_demand() != ProcessDemand::None
+        && self.process_rendered_age
+          != self.process_sampled.map(|sampled| sampled.elapsed().as_secs())
+      {
         return Ok(ControlFlow::Continue(true));
       }
       if !fresh {
@@ -831,7 +943,12 @@ impl App {
       // too (it clears `copied`)
       let help = key.code == KeyCode::Char('?') && !info.typing;
       self.help = help.then_some(0);
+      if key.code == KeyCode::Char('r') && !info.typing {
+        self.info_generation = self.info_generation.wrapping_add(1);
+        info.request_refresh(self.info_generation);
+      }
       self.info = info.handle_key(key, &*self.kill.sys).then_some(info);
+      self.sync_info_worker();
       return ControlFlow::Continue(());
     }
     if self.kill.is_open() {
@@ -881,7 +998,10 @@ impl App {
         if self.procs_visible() && self.panels.focus == Panel::Processes && self.source_live() =>
       {
         match (c, self.proc_view.selected()) {
-          ('i', Some(proc)) => self.info = Some(Info::new(proc, &*self.kill.sys)),
+          ('i', Some(proc)) => {
+            self.info_generation = self.info_generation.wrapping_add(1);
+            self.info = Some(Info::new(proc, self.info_generation));
+          }
           ('k', Some(proc)) => self.kill.open(proc),
           ('e', Some(proc)) if !proc.path.is_empty() => self.kill.sys.reveal(&proc.path),
           ('c', Some(proc)) if !proc.path.is_empty() => {
@@ -894,6 +1014,7 @@ impl App {
       _ => {}
     }
 
+    self.sync_info_worker();
     ControlFlow::Continue(())
   }
 
@@ -1060,6 +1181,7 @@ impl App {
   }
 
   fn render(&mut self, f: &mut Frame) {
+    self.process_rendered_age = self.process_sampled.map(|sampled| sampled.elapsed().as_secs());
     self.screen_area = f.area();
     self.normalize_proc_selection();
     #[cfg(test)]
@@ -1132,9 +1254,8 @@ impl App {
     let client = Client::connect_tui(
       self.cfg.interval(),
       interval.map(|interval| interval.clamp(crate::config::TUI_MIN_MS, crate::config::TUI_MAX_MS)),
-      ProcessDemand::Details,
+      self.process_demand(),
     )?;
-    client.set_demand(ProcessDemand::Details)?;
     let first = client
       .wait_after(None, Duration::from_secs(10))?
       .ok_or("sampling source did not become ready")?;
@@ -1142,19 +1263,32 @@ impl App {
     let (tx, rx) = mpsc::channel::<Event>();
     let (commands, requested) = mpsc::channel();
     self.source_commands = Some(commands);
+    let demand = Arc::new(Mutex::new(self.process_demand()));
+    self.source_requested = Some(demand.clone());
+    self.sync_process_demand();
     let slot = Arc::new(SourceSlot::default());
     self.source_frames = Some(Arc::clone(&slot));
     source_events(
       client,
+      demand,
       tx.clone(),
       requested,
       slot,
       Some((first.session.clone(), first.revision)),
     );
+    let info_tx = tx.clone();
+    self.info_worker =
+      Some(info_worker::Worker::new(move |result| info_tx.send(Event::Info(result)).is_ok()));
+    self.sync_info_worker();
 
     drop(first);
     // the guard restores the terminal on every way out of here, `?` included
-    self.run_terminal(tx, rx, &msec)
+    let result = self.run_terminal(tx, rx, &msec);
+    self.info_worker = None;
+    self.source_commands = None;
+    self.source_requested = None;
+    self.source_frames = None;
+    result
   }
 
   fn run_terminal(
@@ -3285,6 +3419,101 @@ mod tests {
     (app, fake)
   }
 
+  fn complete_info_fixture(app: &mut App) {
+    app.info.as_mut().unwrap().refresh_fixture(&*app.kill.sys);
+  }
+
+  #[test]
+  fn process_demand_tracks_visible_density_and_info_remains_detailed_over_every_panel() {
+    let (mut app, _) = info_app();
+    app.cfg.panel_details = [false; 6];
+    assert_eq!(app.process_demand(), crate::source::ProcessDemand::Summary);
+    app.cfg.panel_details[Panel::Processes as usize] = true;
+    assert_eq!(app.process_demand(), crate::source::ProcessDemand::Details);
+    app.unfocused = true;
+    assert_eq!(app.process_demand(), crate::source::ProcessDemand::Summary);
+    app.unfocused = false;
+    app.panels.fullscreen = true;
+    app.panels.focus = Panel::Compute;
+    assert_eq!(app.process_demand(), crate::source::ProcessDemand::None);
+    let proc = app.proc_view.procs().unwrap()[0].clone();
+    app.info = Some(super::Info::new(&proc, 1));
+    for panel in [
+      Panel::Compute,
+      Panel::Memory,
+      Panel::Power,
+      Panel::Network,
+      Panel::Cooling,
+      Panel::Processes,
+      Panel::Disk,
+    ] {
+      app.panels.focus = panel;
+      app.cfg.show_procs = false;
+      assert_eq!(app.process_demand(), crate::source::ProcessDemand::Details);
+    }
+    app.info = None;
+    assert_eq!(app.process_demand(), crate::source::ProcessDemand::None);
+  }
+
+  #[test]
+  fn source_sessions_cancel_info_and_process_age_is_independent_of_system_freshness() {
+    let (mut app, _) = info_app();
+    assert!(app.handle_key(key('i')).is_continue());
+    let request = app.info.as_ref().unwrap().request().unwrap();
+    let mut frame = crate::source::Frame::fixture(1, 1);
+    frame.session = "replacement-owner".into();
+    app.apply_source(&frame);
+    assert!(app.info.is_none());
+    assert!(
+      app
+        .handle_event(
+          Event::Info(super::info_worker::Completion {
+            request,
+            sampled: Instant::now(),
+            files: Ok(vec![])
+          }),
+          &RwLock::new(TUI_MIN_MS)
+        )
+        .is_continue()
+    );
+    assert!(app.info.is_none());
+    app.process_sampled = Some(Instant::now() - Duration::from_secs(7));
+    app.process_state = Some(crate::source::ProcessState::Ready);
+    app.process_interval_ms = 5000;
+    assert!(app.process_status().unwrap().contains("7s old"));
+    assert!(!app.process_status().unwrap().contains("stale"));
+    app.process_state = Some(crate::source::ProcessState::Disabled);
+    let status = app.process_status().unwrap();
+    assert!(status.contains("paused") && status.contains("7s old"));
+  }
+
+  #[test]
+  fn info_refresh_is_explicit_and_closing_reopening_rejects_late_results() {
+    let (mut app, _) = info_app();
+    assert!(app.handle_key(key('i')).is_continue());
+    assert!(app.info_worker.is_none()); // Unit tests never attach the native reader.
+    let first = app.info.as_ref().unwrap().request().unwrap();
+    let ratio = app.cfg.ratio_mode;
+    assert!(app.handle_key(key('r')).is_continue());
+    let next = app.info.as_ref().unwrap().request().unwrap();
+    assert_ne!(first.generation, next.generation);
+    assert_eq!(app.cfg.ratio_mode, ratio);
+    assert!(app.handle_key(key('/')).is_continue() && app.handle_key(key('r')).is_continue());
+    assert_eq!(app.info.as_ref().unwrap().request(), Some(next.clone()));
+    assert!(press(&mut app, KeyCode::Enter).is_continue());
+    assert!(app.handle_key(key('q')).is_continue() && app.handle_key(key('i')).is_continue());
+    let current = app.info.as_ref().unwrap().request().unwrap();
+    assert_ne!(current.generation, next.generation);
+    let event = Event::Info(super::info_worker::Completion {
+      request: next,
+      sampled: Instant::now(),
+      files: Ok(vec![]),
+    });
+    assert!(app.handle_event(event, &RwLock::new(TUI_MIN_MS)).is_continue());
+    assert_eq!(app.info.as_ref().unwrap().request(), Some(current));
+    assert!(render_to_string(&mut app, 200, 50).contains("Collecting"));
+  }
+
   #[test]
   fn application_summaries_never_trigger_pid_actions_and_explicit_children_keep_existing_actions() {
     let (mut app, fake) = info_app();
@@ -3720,6 +3949,7 @@ mod tests {
   fn i_opens_the_files_of_the_selected_process_over_the_list() {
     let (mut app, fake) = info_app();
     assert!(app.handle_key(key('i')).is_continue());
+    complete_info_fixture(&mut app);
     let buf = render_buffer(&mut app, 200, 50);
     let title = proc_row(&buf, 0);
     assert!(title.starts_with("╭─ WindowServer 631 ───"), "{title}");
@@ -3729,7 +3959,8 @@ mod tests {
     assert!(proc_row(&buf, 3).starts_with(&format!("│ exe       {WINDOW_SERVER} ")));
     assert!(proc_row(&buf, 4).starts_with("│ cwd       / "), "{}", proc_row(&buf, 4));
     assert!(proc_row(&buf, 5).starts_with("│ file  r-  /var/log/system.log "));
-    assert_eq!(row(&buf, buf.area.bottom() - 1), format!("╰{} ? | q back ─╯", "─".repeat(185)));
+    let bottom = row(&buf, buf.area.bottom() - 1);
+    assert!(bottom.contains("s old") && bottom.ends_with(" refresh | ? | q back ─╯"));
 
     // it takes every key, the list's and the global ones (`q` closes it); Ctrl-C still quits
     for c in ['k', 'i', 'p', 's', 'v'] {
@@ -3746,12 +3977,13 @@ mod tests {
     assert_eq!(fake.0.borrow().revealed, ["/var/log/system.log"]);
     assert_eq!(app.proc_view.selected_pid(), Some(631));
 
-    // each sample reads the files again, and the name and path of the process (an exec)
+    // A changed executable invalidates old details; an explicit completion supplies the new ones.
     let pipe = OpenFile { fd: Some(4), kind: Kind::Pipe, text: String::new(), mode: "" };
     fake.0.borrow_mut().files.get_mut(&631).unwrap().as_mut().unwrap().push(pipe);
     let mut procs = varied_procs();
     (procs[1].name, procs[1].path) = ("zsh".into(), "/bin/zsh".into());
     put_procs(&mut app, procs);
+    complete_info_fixture(&mut app);
     let buf = render_buffer(&mut app, 200, 50);
     assert!(proc_row(&buf, 0).starts_with("╭─ zsh 631 ─"), "{}", proc_row(&buf, 0));
     assert!(proc_row(&buf, 1).starts_with("│ 2 fds  1 files  1 pipes "));
@@ -3773,7 +4005,9 @@ mod tests {
   #[test]
   fn the_help_opens_over_the_info_overlay_and_closes_back_to_it() {
     let (mut app, _fake) = info_app();
-    assert!(app.handle_key(key('i')).is_continue() && press(&mut app, KeyCode::Down).is_continue());
+    assert!(app.handle_key(key('i')).is_continue());
+    complete_info_fixture(&mut app);
+    assert!(press(&mut app, KeyCode::Down).is_continue());
     let cwd_selected = |app: &mut App| {
       let buf = render_buffer(app, 200, 50);
       buf[(2, PROC_Y + 4)].modifier.contains(Modifier::REVERSED)
@@ -3802,6 +4036,7 @@ mod tests {
     let (mut app, _fake) = info_app();
     let row = |app: &mut App, y| proc_row(&render_buffer(app, 200, 50), y);
     assert!(app.handle_key(key('i')).is_continue());
+    complete_info_fixture(&mut app);
     // typed into its filter `q` is text
     assert!(app.handle_key(key('/')).is_continue() && app.handle_key(key('q')).is_continue());
     assert!(press(&mut app, KeyCode::Enter).is_continue());
