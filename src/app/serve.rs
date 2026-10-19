@@ -489,6 +489,8 @@ fn loopback_host(peer: SocketAddr, port: u16, host: &str) -> bool {
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
+  #[cfg(test)]
+  tests::before_response_write();
   let status_text = match status {
     200 => "OK",
     400 => "Bad Request",
@@ -571,10 +573,6 @@ fn handle_conn(
       };
       drop(control);
       write_response(&mut stream, status, "application/json", &body);
-      return;
-    }
-    if status == 200 && !cadence.read().unwrap().monitoring().enabled {
-      write_response(&mut stream, 503, "application/json", r#"{"error":"monitoring paused"}"#);
       return;
     }
     if status == 200 && path == "/api/process-demand" {
@@ -665,12 +663,14 @@ fn handle_conn(
   }
 
   if path == "/api/source" {
-    let control = cadence.read().unwrap();
-    let source = control.source.as_ref();
-    let frame = source.and_then(|source| source.latest());
-    let body = serde_json::json!({"protocol": 1, "session": frame.as_ref().map(|frame| &frame.session),
-      "collector_pid": frame.as_ref().map(|frame| frame.collector_pid),
-      "connected": source.is_some_and(|source| source.status() == crate::source::ConnectionState::Live)}).to_string();
+    let body = {
+      let control = cadence.read().unwrap();
+      let source = control.source.as_ref();
+      let frame = source.and_then(|source| source.latest());
+      serde_json::json!({"protocol": 1, "session": frame.as_ref().map(|frame| &frame.session),
+        "collector_pid": frame.as_ref().map(|frame| frame.collector_pid),
+        "connected": source.is_some_and(|source| source.status() == crate::source::ConnectionState::Live)}).to_string()
+    };
     write_response(
       &mut stream,
       if local { 200 } else { 403 },
@@ -706,41 +706,27 @@ fn handle_conn(
     write_response(&mut stream, 404, "application/json", r#"{"error":"not found"}"#);
     return;
   }
-  // Always acquire cadence before shared; pause and forwarding use this same order.
-  let control = cadence.read().unwrap();
-  if !control.monitoring().enabled {
-    write_response(&mut stream, 503, "application/json", r#"{"error":"monitoring paused"}"#);
-    return;
-  }
-  let lock = shared.read().unwrap();
-
-  let Some(sample) = lock.as_ref() else {
-    drop(lock);
-    write_response(&mut stream, 503, "application/json", r#"{"error":"no data yet"}"#);
-    return;
+  // Capture one authorized snapshot with cadence before shared; never hold either across I/O.
+  let (status, content_type, body) = {
+    let control = cadence.read().unwrap();
+    if !control.monitoring().enabled {
+      (503, "application/json", r#"{"error":"monitoring paused"}"#.to_string())
+    } else {
+      let lock = shared.read().unwrap();
+      match lock.as_ref() {
+        None => (503, "application/json", r#"{"error":"no data yet"}"#.to_string()),
+        Some(sample) => match path.as_str() {
+          "/json" => (200, "application/json", to_json(&sample.metrics, &soc)),
+          "/api/sample" => (200, "application/json", to_sample(sample, &soc, local, &control)),
+          "/metrics" => {
+            (200, "text/plain; version=0.0.4; charset=utf-8", to_prometheus(&sample.metrics, &soc))
+          }
+          _ => (404, "application/json", r#"{"error":"not found"}"#.to_string()),
+        },
+      }
+    }
   };
-
-  match path.as_str() {
-    "/json" => {
-      let body = to_json(&sample.metrics, &soc);
-      drop(lock);
-      write_response(&mut stream, 200, "application/json", &body);
-    }
-    "/api/sample" => {
-      let body = to_sample(sample, &soc, local, &control);
-      drop(lock);
-      write_response(&mut stream, 200, "application/json", &body);
-    }
-    "/metrics" => {
-      let body = to_prometheus(&sample.metrics, &soc);
-      drop(lock);
-      write_response(&mut stream, 200, "text/plain; version=0.0.4; charset=utf-8", &body);
-    }
-    _ => {
-      drop(lock);
-      write_response(&mut stream, 404, "application/json", r#"{"error":"not found"}"#);
-    }
-  }
+  write_response(&mut stream, status, content_type, &body);
 }
 
 fn process_demand_error(error: crate::process_demand::Error) -> (u16, String) {
@@ -857,6 +843,19 @@ mod tests {
     Cadence, SharedCadence, SharedMetrics, escape_label_value, escape_xml, handle_conn,
     loopback_host, publish_sample, read_request, serve_url, to_json, to_prometheus, to_sample,
   };
+
+  type ResponseWriteGate = (mpsc::Sender<()>, mpsc::Receiver<()>);
+  thread_local! {
+    static RESPONSE_WRITE_GATE: std::cell::RefCell<Option<ResponseWriteGate>> = const { std::cell::RefCell::new(None) };
+  }
+  pub(super) fn before_response_write() {
+    RESPONSE_WRITE_GATE.with(|gate| {
+      if let Some((started, release)) = gate.borrow_mut().take() {
+        started.send(()).unwrap();
+        release.recv_timeout(Duration::from_secs(5)).unwrap();
+      }
+    });
+  }
 
   fn request(shared: &SharedMetrics, fragments: &[&[u8]]) -> String {
     exchange(shared, &Arc::new(RwLock::new(Cadence::new(1000))), |_| {
@@ -1060,6 +1059,80 @@ mod tests {
     writer.join().unwrap();
     assert!(!cadence.read().unwrap().monitoring().enabled);
     assert!(shared.read().unwrap().is_none());
+  }
+
+  #[test]
+  fn a_blocked_response_writer_never_holds_sampling_or_monitoring_locks() {
+    for (path, enabled, has_sample, status) in [
+      ("/api/sample", true, true, 200),
+      ("/json", true, true, 200),
+      ("/metrics", true, true, 200),
+      ("/api/source", true, true, 200),
+      ("/api/sample", true, false, 503),
+      ("/json", true, false, 503),
+      ("/metrics", true, false, 503),
+      ("/api/sample", false, true, 503),
+      ("/json", false, true, 503),
+      ("/metrics", false, true, 503),
+      ("/api/source", false, true, 200),
+      ("/api/monitoring", false, true, 200),
+    ] {
+      let shared = Arc::new(RwLock::new(None));
+      if has_sample {
+        publish_sample(&shared, Metrics::default(), vec![], 1000, None, super::sample_time());
+      }
+      let cadence = Arc::new(RwLock::new(Cadence::new(1000)));
+      if !enabled {
+        cadence.write().unwrap().set_monitoring(false, &shared).unwrap();
+      }
+      let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+      let address = listener.local_addr().unwrap();
+      let (started, writing) = mpsc::channel();
+      let (release, blocked) = mpsc::channel();
+      let worker = {
+        let shared = shared.clone();
+        let cadence = cadence.clone();
+        thread::spawn(move || {
+          RESPONSE_WRITE_GATE.with(|gate| *gate.borrow_mut() = Some((started, blocked)));
+          handle_conn(listener.accept().unwrap().0, shared, Arc::new(SocInfo::default()), cadence);
+        })
+      };
+      let mut client = TcpStream::connect(address).unwrap();
+      client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+      write!(client, "GET {path} HTTP/1.1\r\nHost: {address}\r\n\r\n").unwrap();
+      writing.recv_timeout(Duration::from_secs(5)).unwrap();
+      assert!(
+        cadence.try_write().is_ok(),
+        "{path} retained cadence while the response writer was blocked"
+      );
+      assert!(
+        shared.try_write().is_ok(),
+        "{path} retained the sample while the response writer was blocked"
+      );
+      assert!(
+        monitoring_post(&shared, &cadence, serde_json::json!({"enabled":false}))
+          .starts_with("HTTP/1.1 200")
+      );
+      {
+        let mut control = cadence.write().unwrap();
+        control.set_monitoring(true, &shared).unwrap();
+        assert!(control.forward(
+          &shared,
+          Arc::new(crate::source::Frame::fixture(2, 2)),
+          control.monitoring().generation
+        ));
+      }
+      // The outstanding response keeps its captured authorization/body even after these changes.
+      release.send(()).unwrap();
+      let mut response = String::new();
+      client.read_to_string(&mut response).unwrap();
+      assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{path}: {response}");
+      if path == "/api/sample" && status == 200 {
+        let snapshot: serde_json::Value = serde_json::from_str(body(&response)).unwrap();
+        assert_eq!(snapshot["sequence"], 1, "the pending response retains its captured snapshot");
+      }
+      worker.join().unwrap();
+    }
   }
 
   #[test]

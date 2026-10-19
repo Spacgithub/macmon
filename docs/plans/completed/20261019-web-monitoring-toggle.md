@@ -1,3 +1,5 @@
+Done: 2026-10-19, PR #39
+
 # Manual Web monitoring switch
 
 ## Behavior and decisions
@@ -35,5 +37,19 @@
 - [x] Implement client subscription suspension/resumption with focused lifecycle tests.
 - [x] Implement guarded HTTP controls and honest paused data availability.
 - [x] Add accessible dashboard controls, state synchronization and regression tests.
-- [ ] Verify rootless shutdown/resume, a concurrent Terminal consumer, cadence and
+- [x] Verify rootless shutdown/resume, a concurrent Terminal consumer, cadence and
       browser behavior; run full checks and independent review, then publish the PR.
+
+## Result
+
+Delivered a backend-wide Web monitoring switch in PR #39. It releases sampling and
+process demand while retaining the control page; independent Terminal consumers
+continue using the shared owner. Resume waits for fresh readings and preserves the
+shared cadence. Legacy successful outputs, released preferences and library/IPC
+interfaces remain compatible; paused data endpoints return 503.
+
+Independent reviews and full checks passed, including 121 dashboard checks and a
+blocked-writer regression across 12 route/state combinations. On an Apple M2 Max
+with macOS 15.6.1, 39 rootless acceptance checks verified concurrent clients,
+shutdown/resume, native telemetry and service isolation. Browser checks covered
+multiple tabs, paused reload, keyboard control, restart recovery and narrow layout.
