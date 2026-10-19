@@ -570,6 +570,9 @@ requires both capacities from the same public IOPS description; normalized perce
 `MaxCapacity` is never divided by a registry design capacity in mAh. Other fields stay
 unavailable when the system does not expose them; monitoring never changes charging policy.
 
+See [native coverage and resource measurements](docs/monitoring-validation.md) for
+the supported readings observed on the validation Mac and the fixture-only cases.
+
 ### Network monitoring
 
 The TUI shows receive and transmit rates and cumulative byte counters for each network

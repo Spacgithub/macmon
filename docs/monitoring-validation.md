@@ -61,6 +61,27 @@ They are separate from per-interface counters. Session totals begin at observati
 they do not measure lifetime, boot or Internet-only usage. Native UDP traffic,
 other Mac models and other macOS releases were not independently measured here.
 
+## Battery coverage
+
+- The shared owner uses native power-source notifications with a cached, low-frequency
+  fallback. Registry health readings stay separate from power-source acquisition age.
+  Battery sampling does not wait on or change the core/process sampling cadence.
+- On this Mac, the native source reported 81%, AC power, not charging, Good condition,
+  150 cycles, approximately 12.19 V and 0 A / 0 W. The electrical flow is voltage times
+  signed current at the battery terminals; it is separate from chip/system estimates
+  and wall power.
+- Temperature, nominal/design capacity and time estimates were unavailable. They remain
+  null in the API and visibly unavailable in details, rather than becoming zero.
+  Freshness is acquisition age; it does not establish the hardware's update time.
+- Native loopback API checks covered two backends sharing one owner, additive legacy
+  compatibility, an installed older Terminal sharing that owner, and complete worker
+  retirement. Power summaries/details, stale/missing data and wide/compact layouts
+  have regressions. The real Web preview showed the same supported readings.
+
+Charging, discharging, UPS, absent-battery and malformed native-property cases use
+fixtures. The validation did not change charging policy, disconnect power, or write
+hardware settings. Other hardware/macOS combinations remain unmeasured.
+
 ## Matched resource results
 
 Values are medians of three 30-second round means; parentheses show the range.
@@ -71,11 +92,18 @@ for their Terminal and Web consumers, and retired their test processes afterward
 | Added feature | Reference | CPU before (%) | CPU after (%) |
 | --- | --- | ---: | ---: |
 | Application network | Main `5c2fca6` | 2.59 (2.50–2.62) | 4.08 (3.90–4.12) |
+| Battery | Application-network stack | 3.85 (3.79–4.09) | 3.68 (3.48–3.98) |
 
 | Added feature | RSS before (MiB) | RSS after (MiB) | Footprint before (MiB) | Footprint after (MiB) |
 | --- | ---: | ---: | ---: | ---: |
 | Application network | 90.6 (80.2–95.5) | 104.8 (87.0–111.6) | 59.5 (56.9–59.6) | 59.6 (51.1–60.1) |
+| Battery | 97.1 (85.3–104.3) | 98.2 (86.5–103.6) | 57.5 (52.2–59.7) | 59.6 (59.4–59.7) |
 
 Application monitoring added 1.49 percentage points of one core and 14.3 MiB
 sampled RSS at the medians. Footprint ranges overlap; these runs do not establish
 a physical-memory saving. The new observer is included in these totals.
+
+The battery comparison retained fresh native readings in every measured window.
+Its CPU, RSS and footprint ranges overlap their reference ranges; this sample does
+not establish a resource saving or a meaningful CPU increase. Compare each row only
+with its paired reference, rather than adding medians from different runs.
