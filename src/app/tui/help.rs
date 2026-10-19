@@ -33,6 +33,8 @@ const HELP: &[Row] = &[
   Key("↑ ↓ / PgUp", "scroll a detail panel (PgDn / Home / End also work)"),
   Key("p", "show / hide the processes"),
   Key("v", "graph / gauge"),
+  Key("n", "Network panel: applications / interfaces"),
+  Key("s / Space", "Application network: sort / expand selected members"),
   Key("r", "CPU and GPU usage: freq / raw"),
   Key("a", "fan motion on / off"),
   Key("⇧A", "fan animation target: 15 / 30 / 60 FPS (default 30)"),

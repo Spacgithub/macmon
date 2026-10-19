@@ -338,6 +338,10 @@ impl App {
   }
 
   pub(super) fn render_network_page(&self, f: &mut Frame, area: Rect, offset: usize, limit: usize) {
+    if self.app_network.enabled {
+      self.render_app_network(f, area, self.panels_legacy() || limit != 3);
+      return;
+    }
     let metrics = self.network.as_deref().unwrap_or_default();
     let legacy = self.panels_legacy();
     let detailed = legacy || limit != 3;

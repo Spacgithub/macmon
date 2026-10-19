@@ -565,6 +565,47 @@ The public macOS interface MIB supplies 64-bit counters without sudo. Prometheus
 `macmon_network_receive_bytes_per_second` and `macmon_network_transmit_bytes_per_second`
 gauges, labeled by `interface`. Unavailable rates have no gauge series for that sample.
 
+### Application network traffic
+
+Select the Terminal Network panel (`4` or Tab), then press `n` to switch between
+interfaces and applications. `Enter` expands the panel and `f` opens its full view;
+use ↑/↓ to select an application, Space or ←/→ to fold its PID members, `s` to cycle
+receive/transmit rate or session-total sorting, and PgUp/PgDn to scroll long lists.
+The Web Network panel shows the top three applications; its Details switch exposes
+all groups. Each application has an independent member toggle and a sort selector.
+Existing interface counters remain available in both views.
+
+One rootless `nettop` observer belongs to the shared collector, even when Terminal
+and Web are open together. It observes TCP/UDP socket counters every two seconds.
+Its logging output uses a private pseudo-terminal for timely flushing and never
+changes your terminal. A completed block is published at the next block header, so
+its age is normally about two seconds. Read failures and timeouts are unavailable;
+a new PID, exec, counter decrease or observer restart warms a fresh rate baseline.
+PID lifetime checks bracket the observation. A proven reused PID, exec or real-UID change with a
+continuous retained NStat row stays excluded until that row disappears or the
+observer restarts. Application/helper ownership uses
+the same confirmed bundle/coalition rules as process grouping. Unverified processes
+are counted as excluded; names and PID details require the existing local process
+access boundary. The additive `/api/sample.app_network` field includes its own age,
+sequence and status. Library metrics, `/json` and Prometheus stay compatible.
+
+Session totals count **observed increases since this collector began monitoring**,
+not lifetime, boot or Internet totals. The observer retains completed socket traffic
+when macOS reports it; unavailable intervals and counter resets omit unprovable
+bytes. App totals retain exited helpers while a confirmed application remains live.
+Temporarily unreadable process metadata retains known IDs and totals without
+publishing members or interval rates until fresh lifetime checks succeed. Historical
+metadata is bounded to 4096 PIDs, with fresh evidence preferred; proven exits and
+evicted uncertain identities end their retained accounting. Historical paths never
+prove new application/helper ownership. Fresh unresolved owners block coalition-based
+helper inference; incomplete PID enumerations cannot prove exits or unique owners.
+Each CSV block is bounded to 1 MiB. Source visibility can differ by macOS release or permissions.
+Loopback, proxy, VPN and shared-service accounting can differ from interface totals;
+these two views must not be added together.
+
+See [native coverage and resource measurements](docs/monitoring-validation.md)
+for the tested hardware, acquisition limits and matched CPU/memory method.
+
 ### Disk monitoring API
 
 `Sampler::disks()` and the top-level `disks` field in HTTP `/api/sample` expose physical

@@ -263,19 +263,26 @@ fn basename(path: &str) -> Option<&str> {
   path.rsplit('/').next().filter(|name| !name.is_empty())
 }
 
-fn list_pids(pids: &mut Vec<i32>) {
+/// Returns whether the native enumeration is complete; a full buffer may omit new PIDs.
+pub(crate) fn list_pids(pids: &mut Vec<i32>) -> bool {
   pids.clear();
   // With a NULL buffer it returns the number of pids; reserve extra for processes spawned between
   // the two calls.
   let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
   if count <= 0 {
-    return;
+    return false;
   }
 
   pids.resize(count as usize + 64, 0);
   let size = (pids.len() * mem::size_of::<i32>()) as c_int;
   let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr() as *mut c_void, size) };
+  finish_pids(pids, count)
+}
+
+fn finish_pids(pids: &mut Vec<i32>, count: c_int) -> bool {
+  let complete = count > 0 && (count as usize) < pids.len();
   pids.truncate(count.max(0) as usize);
+  complete
 }
 
 /// `PROC_PIDTBSDINFO` of `pid`; `None` for other users' processes and gone ones.
@@ -295,7 +302,7 @@ fn rusage(pid: i32, flavor: c_int) -> Option<rusage_info_v6> {
 }
 
 /// Executable path; readable for processes of any user.
-fn exe_path(pid: i32) -> Option<String> {
+pub(crate) fn exe_path(pid: i32) -> Option<String> {
   let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
   let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
   if len <= 0 {
@@ -404,7 +411,7 @@ fn parse_ps(out: &str) -> Vec<Raw> {
 }
 
 /// Real user id of a process; readable for processes of any user.
-fn real_uid(pid: i32) -> Option<u32> {
+pub(crate) fn real_uid(pid: i32) -> Option<u32> {
   let mut info: libc::proc_bsdshortinfo = unsafe { mem::zeroed() };
   let size = mem::size_of::<libc::proc_bsdshortinfo>() as c_int;
   let ptr = &mut info as *mut libc::proc_bsdshortinfo as *mut c_void;
@@ -914,6 +921,17 @@ mod tests {
 
   fn counters(cpu_ns: u64, energy_nj: Option<u64>) -> Counters {
     Counters { start: 42, cpu_ns, energy_nj, gpu_ns: None, gpu_readable: false }
+  }
+
+  #[test]
+  fn native_pid_enumeration_marks_errors_and_full_buffers_incomplete() {
+    for (count, complete, length) in
+      [(-1, false, 0), (0, false, 0), (2, true, 2), (4, false, 4), (8, false, 4)]
+    {
+      let mut pids = vec![1, 2, 3, 4];
+      assert_eq!(finish_pids(&mut pids, count), complete);
+      assert_eq!(pids.len(), length);
+    }
   }
 
   #[test]

@@ -661,6 +661,7 @@ struct OwnerData {
   latest: Option<Arc<Encoded>>,
   processes: Option<Arc<ProcessFrame>>,
   process_demand: ProcessDemand,
+  app_network: Option<crate::app_network::Snapshot>,
   process_epoch: u64,
   process_state: ProcessState,
   error: Option<String>,
@@ -703,6 +704,7 @@ impl Owner {
         latest: None,
         processes: None,
         process_demand: ProcessDemand::None,
+        app_network: None,
         process_epoch: 0,
         process_state: ProcessState::Disabled,
         error: None,
@@ -742,6 +744,7 @@ impl Owner {
       frame.sequence = data.sequence + u64::from(system_sample);
       frame.revision = data.revision + 1;
       frame.processes = data.processes.clone();
+      frame.details.app_network.clone_from(&data.app_network);
       frame.process_state = data.process_state;
       frame.process_demand = data.process_demand;
       frame.cadence = data.cadence.state();
@@ -798,6 +801,18 @@ pub(crate) fn run(initial_ms: u32) -> io::Result<()> {
   fs::set_permissions(runtime.socket(), fs::Permissions::from_mode(0o600))?;
   listener.set_nonblocking(true)?;
   let owner = Arc::new(Owner::new(_lock, initial_ms));
+  owner.data.lock().unwrap().app_network = Some(Default::default());
+  let network_owner = Arc::clone(&owner);
+  let _network = match crate::app_network::Worker::start(move |snapshot| {
+    network_owner.data.lock().unwrap().app_network = Some(snapshot);
+    let _ = network_owner.publish(None, None);
+  }) {
+    Ok(worker) => Some(worker),
+    Err(_) => {
+      owner.data.lock().unwrap().app_network.as_mut().unwrap().state = "unavailable".into();
+      None
+    }
+  };
   let system = Arc::clone(&owner);
   thread::spawn(move || {
     if let Err(error) = sample_system(&system) {
@@ -999,6 +1014,7 @@ fn sample_system(owner: &Owner) -> io::Result<()> {
       memory_activity: *sampler.memory_activity(),
       thermal_state: sampler.thermal_state(),
       disks: sampler.disks().map(<[_]>::to_vec),
+      app_network: None,
     };
     let (processes, cadence) = {
       let data = owner.data.lock().unwrap();

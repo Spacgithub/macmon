@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use clap::parser::ValueSource;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
+mod app_network;
 mod config;
 mod fds;
 mod find_clpc;
