@@ -113,6 +113,8 @@ pub(crate) struct SampleDetails {
   pub disks: Option<Vec<DiskMetric>>,
   #[serde(default)]
   pub app_network: Option<crate::app_network::Snapshot>,
+  #[serde(default)]
+  pub battery: Option<crate::battery::Snapshot>,
 }
 
 impl From<Vec<TemperatureReading>> for SampleDetails {
@@ -324,6 +326,7 @@ fn to_sample(sample: &Sample, soc: &SocInfo, local: bool, cadence: &Cadence) -> 
     "thermal_state": sample.details.thermal_state.filter(|_| !soc.vm),
     "disks": sample.details.disks,
     "app_network": sample.details.app_network.as_ref().filter(|_| local).map(crate::app_network::Snapshot::value),
+    "battery": sample.details.battery,
     "processes": processes.map(|processes| &processes.snapshot.rows),
     "process_groups": processes.map(|processes| &processes.snapshot.groups),
     "processes_age_ms": processes.map(|processes| processes.snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
@@ -961,6 +964,38 @@ mod tests {
       assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
       assert_eq!(body(&response), r#"{"error":"no data yet"}"#);
     }
+  }
+
+  #[test]
+  fn battery_is_additive_defaulted_and_legacy_exports_stay_unchanged() {
+    let shared = Arc::new(RwLock::new(None));
+    let battery = crate::battery::Snapshot {
+      state: crate::battery::State::Available,
+      percent: Some(81.0),
+      charging: Some(false),
+      age_ms: Some(25),
+      ..Default::default()
+    };
+    publish_sample(
+      &shared,
+      Metrics::default(),
+      super::SampleDetails { battery: Some(battery.clone()), ..Default::default() },
+      1000,
+      None,
+      super::sample_time(),
+    );
+    let response: serde_json::Value =
+      serde_json::from_str(body(&get(&shared, "/api/sample"))).unwrap();
+    assert_eq!(response["battery"], serde_json::to_value(&battery).unwrap());
+    assert!(response["metrics"].get("battery").is_none());
+    let legacy: serde_json::Value = serde_json::from_str(body(&get(&shared, "/json"))).unwrap();
+    assert!(legacy.get("battery").is_none());
+    assert!(!body(&get(&shared, "/metrics")).contains("battery"));
+    let details: super::SampleDetails = serde_json::from_value(
+      serde_json::json!({"temperatures":[],"memory_activity":{},"thermal_state":null,"disks":null}),
+    )
+    .unwrap();
+    assert!(details.battery.is_none());
   }
 
   #[test]

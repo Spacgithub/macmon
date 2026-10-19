@@ -539,6 +539,35 @@ The working rootless workaround we found is to read hidden energy reports from t
 
 Both the CLI and the Rust library use known CLPC counters automatically, and `Sampler::new()` retains legacy fallbacks for older systems. New chips or driver versions may need additional mappings. On an unsupported configuration, zero CPU/ANE readings can mean unavailable counters rather than zero consumption. See [docs/clpc-discovery.md](docs/clpc-discovery.md) for details.
 
+### Battery monitoring
+
+The Power panel includes a compact internal-battery summary. Expand Power in Terminal
+(`3`, then `f` for the full scrollable view) or the dashboard for charging state,
+source-reported condition, cycle count, supported electrical readings and time estimates.
+`/api/sample.battery` is additive; `pipe`, `/json`, Prometheus, the library API and saved
+settings keep their existing formats. Old collectors without this field show unavailable.
+
+One read-only worker in the shared collector uses [native power-source notifications](https://developer.apple.com/documentation/iokit/1523868-iopsnotificationcreaterunloopsou),
+coalesces changes to at most once per second, and refreshes cached state every 30 seconds.
+IORegistry cycle/electrical data refreshes every 30 seconds or on a power-state change;
+this work does not block system sampling. `state` distinguishes `available`, `absent`
+(no internal battery) and `unavailable`. Multiple ambiguous internal packs are unavailable.
+`age_ms` and `registry_age_ms` mean acquisition age at the containing sample, not the
+hardware's update time; clients add sample age and label readings over 60 seconds stale.
+Names, serials and device identifiers are never emitted.
+
+Positive battery current/power means charging; negative means discharging. Voltage and
+current are converted from the documented mV/mA units to V/A; power in W uses a coherent
+voltage/current pair from one source snapshot. It measures battery electrical flow,
+separate from chip/system estimates and wall power. Incoherent signs stay unavailable.
+Time estimates are source-provided minutes, shown only in the applicable charging or
+discharging state; negative/calculating/sentinel values stay unavailable. Temperature
+uses only the [public IOPS Celsius field](https://developer.apple.com/documentation/iokit/kiopstemperaturekey).
+Unverified IORegistry temperature scales are not guessed. Nominal/design health percentage
+requires both capacities from the same public IOPS description; normalized percentage
+`MaxCapacity` is never divided by a registry design capacity in mAh. Other fields stay
+unavailable when the system does not expose them; monitoring never changes charging policy.
+
 ### Network monitoring
 
 The TUI shows receive and transmit rates and cumulative byte counters for each network

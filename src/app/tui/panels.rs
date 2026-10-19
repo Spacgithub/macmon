@@ -10,7 +10,7 @@ use ratatui::widgets::Paragraph;
 use super::boxes::{Titles, draw_box, draw_scrollbar, hint};
 use super::cooling::Placement;
 use super::theme::{self, dim, text};
-use super::{App, cooling_layout, disk, help, memory};
+use super::{App, battery, cooling_layout, disk, help, memory};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -568,6 +568,7 @@ impl App {
         };
         let mut lines =
           vec![Line::from(theme::value(format!("{label} {:.2} W", total.top_value), theme::POWER))];
+        lines.extend(battery::lines(self.battery.as_ref(), detailed, self.disk_age(), width));
         if detailed {
           lines.push(Line::from(dim("Source       now W    avg W   peak W")));
           for (name, store) in [

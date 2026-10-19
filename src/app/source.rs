@@ -813,9 +813,11 @@ pub(crate) fn run(initial_ms: u32) -> io::Result<()> {
       None
     }
   };
+  let battery_worker = crate::battery::Worker::start().ok();
+  let battery = battery_worker.as_ref().map(|worker| worker.reader.clone()).unwrap_or_default();
   let system = Arc::clone(&owner);
   thread::spawn(move || {
-    if let Err(error) = sample_system(&system) {
+    if let Err(error) = sample_system(&system, &battery) {
       system.data.lock().unwrap().error = Some(error.to_string());
       system.changed.notify_all();
     }
@@ -978,7 +980,7 @@ fn owner_connection(mut stream: UnixStream, owner: Arc<Owner>) -> io::Result<()>
   }
 }
 
-fn sample_system(owner: &Owner) -> io::Result<()> {
+fn sample_system(owner: &Owner, battery: &crate::battery::Reader) -> io::Result<()> {
   {
     let data = owner.data.lock().unwrap();
     let _guard = owner
@@ -1015,6 +1017,7 @@ fn sample_system(owner: &Owner) -> io::Result<()> {
       thermal_state: sampler.thermal_state(),
       disks: sampler.disks().map(<[_]>::to_vec),
       app_network: None,
+      battery: Some(battery.snapshot()),
     };
     let (processes, cadence) = {
       let data = owner.data.lock().unwrap();

@@ -51,7 +51,7 @@ fn frequency(value: u32, supported: bool) -> String {
 }
 
 /// Wrap complete fields, so narrow detail cards never cut a number from its unit.
-fn fields(lines: &mut Vec<Line<'static>>, values: &[String], width: usize) {
+pub(super) fn fields(lines: &mut Vec<Line<'static>>, values: &[String], width: usize) {
   let mut current = String::new();
   for value in values {
     if value.chars().count() > width {

@@ -284,8 +284,8 @@ const processGroupDetail = (h, row) => h.document.getElementById(row.querySelect
 const groupMembers = (h, row) => processGroupDetail(h, row).querySelector('.process-members-table')?.children.find((node) => node.tagName === 'TBODY').children || [];
 async function toggleProcessGroup(h, row) { row.querySelector('.process-group-button').emit('click'); await drainMicrotasks(); }
 async function processControl(h, id, value, event = 'change') { h.elements.get(id).value = value; h.elements.get(id).emit(event); await drainMicrotasks(); }
-function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks, app_network } = {}) {
-  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks, app_network };
+function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks, app_network, battery } = {}) {
+  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks, app_network, battery };
 }
 function nvme(overrides = {}) {
   return { critical_warning: 0, percentage_used: 5, available_spare_percent: 100, spare_threshold_percent: 10,
@@ -1869,4 +1869,49 @@ await check('application socket ages, warming, unavailable, malformed data and c
   await nextPoll(h); const bad = appNetworkFixture(); bad.groups[0].name = 'bad\u0000name'; bad.groups.push({ id: '<img>', name: '<img onerror=bad>', kind: 'process', members: [] });
   await h.answer(sample({ sequence: 4, app_network: bad, process_collection: collection({ session: 'new-owner' }) })); assert.doesNotMatch(h.text('app-network-rows'), /bad|<img/);
 });
+function batteryFixture(overrides = {}) {
+  return { state: 'available', source: 'ac', percent: 81, charging: false, health: 'good', cycles: 150,
+    voltage_v: 12.192, current_a: 0, electrical_power_w: 0, age_ms: 25, registry_age_ms: 30,
+    temperature_celsius: null, capacity_health_percent: null, time_to_full_min: null, time_to_empty_min: null, ...overrides };
+}
+await check('battery summary stays concise and power details expose supported electrical and health readings', async () => {
+  const h = boot(); await h.answer(sample({ battery: batteryFixture() }));
+  assert.match(h.text('battery-summary'), /81.0% \/ AC power \/ Not charging/);
+  assert.equal(h.elements.get('power-details').hidden, true);
+  await h.click('power-toggle');
+  assert.equal(h.elements.get('power-details').hidden, false);
+  assert.equal(h.text('battery-cycles'), '150'); assert.equal(h.text('battery-health'), 'Good');
+  assert.equal(h.text('battery-voltage'), '12.19 V'); assert.equal(h.text('battery-electrical'), '0.00 W');
+  assert.equal(h.text('battery-temperature'), 'Unavailable'); assert.equal(h.text('battery-capacity-health'), 'Unavailable');
+  assert.equal(h.text('battery-empty-time'), 'Unavailable'); assert.equal(h.text('battery-full-time'), 'Unavailable');
+  assert.match(html, /separate from chip\/system estimates/);
+});
+await check('battery discharge and charge use signed flow and applicable estimated minutes', async () => {
+  const h = boot(); await h.answer(sample({ battery: batteryFixture({ source: 'battery', charging: false, current_a: -2, electrical_power_w: -24, time_to_empty_min: 200, time_to_full_min: 60, temperature_celsius: -1 }) }));
+  assert.match(h.text('battery-summary'), /Discharging/);
+  assert.equal(h.text('battery-current'), '-2.00 A'); assert.equal(h.text('battery-electrical'), '-24.00 W');
+  assert.equal(h.text('battery-temperature'), '-1.0 °C'); assert.equal(h.text('battery-empty-time'), '200 min'); assert.equal(h.text('battery-full-time'), 'Unavailable');
+  await nextPoll(h); await h.answer(sample({ sequence: 2, battery: batteryFixture({ charging: true, current_a: 2, electrical_power_w: 24, time_to_full_min: 60, time_to_empty_min: 200 }) }));
+  assert.equal(h.text('battery-current'), '+2.00 A'); assert.equal(h.text('battery-full-time'), '60 min'); assert.equal(h.text('battery-empty-time'), 'Unavailable');
+});
+await check('battery absence, old owners and invalid data are explicit without fabricated zero readings', async () => {
+  const cases = [null, { state: 'absent', age_ms: 0 }, batteryFixture({ percent: 101, health: '<script>', cycles: -1, voltage_v: 0, current_a: 999, electrical_power_w: null, temperature_celsius: 3023, time_to_full_min: -1 })];
+  for (const item of cases) {
+    const h = boot(); await h.answer(sample({ battery: item }));
+    assert.equal(h.text('battery-temperature'), 'Unavailable'); assert.equal(h.text('battery-electrical'), 'Unavailable');
+    assert.equal(h.text('battery-cycles'), 'Unavailable'); assert.equal(h.text('battery-health'), 'Unavailable');
+    assert.equal(h.text('battery-full-time'), 'Unavailable'); assert.doesNotMatch(h.text('battery-summary'), /101|<script>/);
+    if (item?.state === 'absent') assert.equal(h.text('battery-summary'), 'No internal battery');
+    if (!item) assert.equal(h.text('battery-summary'), 'Battery telemetry unavailable');
+  }
+});
+await check('battery freshness adds sample transit time and continues aging through failed polls', async () => {
+  const h = boot(); await h.answer(sample({ battery: batteryFixture({ age_ms: 59900, registry_age_ms: 65000 }) }));
+  assert.match(h.text('battery-freshness'), /registry 65s old \/ stale/);
+  await h.advance(1001); if (h.pending()) await h.fail();
+  assert.match(h.text('battery-summary'), /^Retained/); assert.match(h.text('battery-freshness'), /60s old \/ stale/);
+  await nextPoll(h); await h.answer(sample({ sequence: 2, battery: batteryFixture() }));
+  assert.doesNotMatch(h.text('battery-summary'), /^Retained/);
+});
+
 console.log(`${tests.length} dashboard checks passed.`);

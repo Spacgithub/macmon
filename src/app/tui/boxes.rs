@@ -874,6 +874,15 @@ impl App {
         .into_iter()
         .map(|(label, store)| Row::new([Line::from(dim(label)), quantity(store.top_value)]))
         .collect();
+    if let Some(battery) = &self.battery
+      && inner.height >= 7
+    {
+      let label = battery.percent.map_or_else(|| "—".into(), |value| format!("{value:.0}%"));
+      rows.push(Row::new([
+        Line::from(dim("Battery · 3/f")),
+        Line::from(text(label)).right_aligned(),
+      ]));
+    }
     rows.push(Row::new([Line::from(heading("Temperature")), Line::default()]));
     for (label, temp) in [("CPU", self.cpu_temp.last()), ("GPU", self.gpu_temp.last())] {
       let value = temp.map_or_else(
@@ -886,6 +895,22 @@ impl App {
       Table::new(rows, [Constraint::Min(14), Constraint::Length(12)]),
       inner.inner(Margin::new(1, 0)),
     );
+    if let Some(battery) = &self.battery
+      && inner.height < 7
+      && area.width >= 24
+      && area.height >= 2
+    {
+      let brief = super::battery::brief(
+        battery,
+        self
+          .disk_sampled
+          .map_or(0, |sampled| sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
+      );
+      f.render_widget(
+        Line::from(dim(format!(" {brief} · 3/f "))),
+        Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1),
+      );
+    }
   }
 
   pub(super) fn fan_area(&self, plan: &LayoutPlan) -> Option<Rect> {

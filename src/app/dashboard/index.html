@@ -70,7 +70,21 @@
           <div><p class="muted">System estimate</p><p class="power-primary" id="system-power">Unavailable</p></div>
           <div><p class="muted">CPU + GPU + ANE</p><p class="power-subtotal" id="compute-power">Unavailable</p></div>
         </div>
+      <div class="battery-overview"><h3>Battery</h3><p id="battery-summary">Waiting for a sample</p><p class="muted" id="battery-freshness">Acquisition age unavailable</p></div>
       <div id="power-details" hidden>
+        <h3>Internal battery</h3>
+        <dl class="power-components battery-components">
+          <div><dt>Condition</dt><dd id="battery-health">Unavailable</dd></div>
+          <div><dt>Cycle count</dt><dd id="battery-cycles">Unavailable</dd></div>
+          <div><dt>Nominal / design capacity</dt><dd id="battery-capacity-health">Unavailable</dd></div>
+          <div><dt>Temperature</dt><dd id="battery-temperature">Unavailable</dd></div>
+          <div><dt>Voltage</dt><dd id="battery-voltage">Unavailable</dd></div>
+          <div><dt>Signed current</dt><dd id="battery-current">Unavailable</dd></div>
+          <div><dt>Battery electrical flow</dt><dd id="battery-electrical">Unavailable</dd></div>
+          <div><dt>Estimated time to empty</dt><dd id="battery-empty-time">Unavailable</dd></div>
+          <div><dt>Estimated time to full</dt><dd id="battery-full-time">Unavailable</dd></div>
+        </dl>
+        <p class="muted table-note">Positive electrical flow charges the battery; negative discharges it. This is battery-terminal voltage × current, separate from chip/system estimates and wall power. Missing readings and calculating time estimates stay unavailable. Acquisition age does not establish the hardware's own update time.</p>
         <div class="power-history">
           <div class="power-key"><span>System estimate</span><span>CPU + GPU + ANE</span></div>
           <canvas id="power-chart" role="img" aria-label="System estimate and CPU plus GPU plus ANE subtotal history, separate lines on a shared watt scale, up to 60 samples" aria-describedby="power-range"></canvas>

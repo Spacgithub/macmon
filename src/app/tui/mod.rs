@@ -1,6 +1,7 @@
 //! Terminal user interface.
 
 mod app_network;
+mod battery;
 mod boxes;
 mod compute;
 mod cooling;
@@ -484,6 +485,7 @@ pub struct App {
   thermal_state: Option<ThermalState>,
   disks: Option<Vec<DiskMetric>>,
   disk_sampled: Option<Instant>,
+  battery: Option<crate::battery::Snapshot>,
 
   cpu_power: PowerStore,
   gpu_power: PowerStore,
@@ -608,6 +610,7 @@ impl App {
       self.thermal_state = frame.details.thermal_state;
       self.disks.clone_from(&frame.details.disks);
       self.disk_sampled = Some(frame.sampled);
+      self.battery.clone_from(&frame.details.battery);
       self.temperatures.push(frame.details.temperatures.clone(), &frame.metrics.temp);
       self.update_metrics(frame.metrics.clone());
     }
@@ -3005,6 +3008,24 @@ mod tests {
       assert!(!screen_text(&buf).contains("°C"));
       let area = missing.layout(buf.area).telemetry.unwrap();
       assert!(row(&buf, area.y + 5).contains('—') && row(&buf, area.y + 6).contains('—'));
+    }
+  }
+
+  #[test]
+  fn battery_does_not_clip_existing_legacy_temperatures_or_network() {
+    let battery = crate::battery::Snapshot {
+      state: crate::battery::State::Available,
+      percent: Some(81.0),
+      age_ms: Some(0),
+      ..Default::default()
+    };
+    for (width, height) in [(100, 30), (120, 30), (100, 40)] {
+      let mut app = network_app();
+      app.battery = Some(battery.clone());
+      let screen = screen_text(&render_buffer(&mut app, width, height));
+      for expected in ["Battery", "81%", "3/f", "45°C", "40°C", "Network"] {
+        assert!(screen.contains(expected), "missing {expected} at {width}x{height}: {screen}");
+      }
     }
   }
 
