@@ -115,6 +115,8 @@ pub(crate) struct SampleDetails {
   pub app_network: Option<crate::app_network::Snapshot>,
   #[serde(default)]
   pub battery: Option<crate::battery::Snapshot>,
+  #[serde(default)]
+  pub bluetooth: Option<crate::bluetooth::Snapshot>,
 }
 
 impl From<Vec<TemperatureReading>> for SampleDetails {
@@ -327,6 +329,7 @@ fn to_sample(sample: &Sample, soc: &SocInfo, local: bool, cadence: &Cadence) -> 
     "disks": sample.details.disks,
     "app_network": sample.details.app_network.as_ref().filter(|_| local).map(crate::app_network::Snapshot::value),
     "battery": sample.details.battery,
+    "bluetooth": sample.details.bluetooth.as_ref().filter(|_| local).map(|snapshot| snapshot.aged(sample.sampled.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)),
     "processes": processes.map(|processes| &processes.snapshot.rows),
     "process_groups": processes.map(|processes| &processes.snapshot.groups),
     "processes_age_ms": processes.map(|processes| processes.snapshot.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64),
@@ -1374,6 +1377,18 @@ mod tests {
       Metrics::default(),
       super::SampleDetails {
         app_network: Some(crate::app_network::Snapshot::default()),
+        bluetooth: Some(crate::bluetooth::Snapshot {
+          state: crate::bluetooth::State::Ready,
+          controller: Some(true),
+          age_ms: Some(5000),
+          devices: vec![crate::bluetooth::Device {
+            id: "bt-0123456789abcdef".into(),
+            name: "Private accessory".into(),
+            kind: "Mouse".into(),
+            batteries: vec![],
+          }],
+          ..Default::default()
+        }),
         ..Default::default()
       },
       1000,
@@ -1419,6 +1434,13 @@ mod tests {
       assert_eq!(json["processes"].is_array(), allowed, "{authority}");
       assert_eq!(json["process_groups"].is_array(), allowed, "{authority}");
       assert_eq!(json["app_network"].is_object(), allowed, "{authority}");
+      assert_eq!(json["bluetooth"].is_object(), allowed, "{authority}");
+      if allowed {
+        assert_eq!(json["bluetooth"]["devices"][0]["name"], "Private accessory");
+        assert!(json["bluetooth"]["age_ms"].as_u64().unwrap() >= 5000);
+      } else {
+        assert!(!response.contains("Private accessory"));
+      }
       if allowed {
         assert!(json["processes_age_ms"].as_u64().unwrap() >= 5000);
       } else {
@@ -1436,11 +1458,13 @@ mod tests {
     .unwrap();
     assert!(remote["processes"].is_null() && remote["processes_age_ms"].is_null());
     assert!(remote["process_groups"].is_null());
+    assert!(remote["bluetooth"].is_null());
     let old: serde_json::Value = serde_json::from_str(body(&get(&shared, "/json"))).unwrap();
     assert!(old.get("processes").is_none() && old.get("processes_age_ms").is_none());
     assert!(old.get("process_groups").is_none());
     assert!(old.get("app_network").is_none());
     assert!(remote["app_network"].is_null());
+    assert!(old.get("bluetooth").is_none());
     assert_eq!(
       body(&get(&shared, "/metrics")),
       to_prometheus(&Metrics::default(), &SocInfo::default())

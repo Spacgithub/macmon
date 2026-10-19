@@ -815,9 +815,12 @@ pub(crate) fn run(initial_ms: u32) -> io::Result<()> {
   };
   let battery_worker = crate::battery::Worker::start().ok();
   let battery = battery_worker.as_ref().map(|worker| worker.reader.clone()).unwrap_or_default();
+  // Keep the supervisor in this scope: all exit/error paths stop and join its reporter.
+  let bluetooth_worker = crate::bluetooth::Worker::start().ok();
+  let bluetooth = bluetooth_worker.as_ref().map(crate::bluetooth::Worker::reader);
   let system = Arc::clone(&owner);
   thread::spawn(move || {
-    if let Err(error) = sample_system(&system, &battery) {
+    if let Err(error) = sample_system(&system, &battery, bluetooth) {
       system.data.lock().unwrap().error = Some(error.to_string());
       system.changed.notify_all();
     }
@@ -980,7 +983,11 @@ fn owner_connection(mut stream: UnixStream, owner: Arc<Owner>) -> io::Result<()>
   }
 }
 
-fn sample_system(owner: &Owner, battery: &crate::battery::Reader) -> io::Result<()> {
+fn sample_system(
+  owner: &Owner,
+  battery: &crate::battery::Reader,
+  bluetooth: Option<crate::bluetooth::Reader>,
+) -> io::Result<()> {
   {
     let data = owner.data.lock().unwrap();
     let _guard = owner
@@ -1018,6 +1025,13 @@ fn sample_system(owner: &Owner, battery: &crate::battery::Reader) -> io::Result<
       disks: sampler.disks().map(<[_]>::to_vec),
       app_network: None,
       battery: Some(battery.snapshot()),
+      bluetooth: Some(bluetooth.as_ref().map_or_else(
+        || crate::bluetooth::Snapshot {
+          state: crate::bluetooth::State::Unavailable,
+          ..Default::default()
+        },
+        crate::bluetooth::Reader::latest,
+      )),
     };
     let (processes, cadence) = {
       let data = owner.data.lock().unwrap();

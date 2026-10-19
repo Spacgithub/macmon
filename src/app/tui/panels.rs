@@ -372,7 +372,11 @@ impl App {
   }
 
   pub(super) fn next_fan_placements(&self, area: Rect) -> Vec<Placement> {
-    if !self.cooling_detailed() || self.help.is_some() || self.info.is_some() || self.kill.is_open()
+    if !self.cooling_detailed()
+      || self.help.is_some()
+      || self.bluetooth_detail.is_some()
+      || self.info.is_some()
+      || self.kill.is_open()
     {
       return Vec::new();
     }
