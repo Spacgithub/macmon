@@ -1063,6 +1063,7 @@ mod tests {
   fn observer_input_stays_idle_on_its_private_terminal_and_shutdown_reaps_child() {
     let stop = AtomicBool::new(false);
     let mut pid = None;
+    let mut cancelled = None;
     let started = Instant::now();
     observe(
       Command::new("/usr/bin/python3").args(["-c", "import os,select,time; assert os.isatty(0) and os.isatty(1); assert os.ttyname(0)==os.ttyname(1); assert not select.select([0],[],[],0)[0]; print(',bytes_in,bytes_out,\\ncheck.%d,1,2,\\n,bytes_in,bytes_out,' % os.getpid(),flush=True); time.sleep(5)"]),
@@ -1070,10 +1071,12 @@ mod tests {
       Duration::from_secs(5),
       |rows, _, _, _| {
         pid = rows.keys().next().copied();
+        cancelled = Some(Instant::now());
         stop.store(true, Ordering::Release);
       },
     ).unwrap();
     assert!(started.elapsed() < Duration::from_secs(7));
+    assert!(cancelled.unwrap().elapsed() < Duration::from_secs(1));
     let pid = pid.expect("private stdin must be a terminal without immediately readable EOF");
     assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
@@ -1083,11 +1086,34 @@ mod tests {
   fn stream_frames_fragmented_native_csv_and_preserves_header_sample_time() {
     let cancel = AtomicBool::new(false);
     let mut blocks = Vec::new();
-    let result = observe(Command::new("/bin/sh").args(["-c", "printf ',bytes_in,bytes_out,\\n,bytes_tool.42,100,200,\\n'; printf ',bytes_out,bytes_in,\\nx.42,400,300,\\n'; exec /bin/sleep 5"]), &cancel, Duration::from_millis(120), |rows, _, _, sampled| blocks.push((rows, sampled)));
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
-    assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0].0[&42], (100, 200));
-    assert!(blocks[0].1.elapsed() >= Duration::from_millis(100));
+    observe(Command::new("/bin/sh").args(["-c", "printf ',bytes_in,bytes_out,\\nwarmup.41,1,2,\\n,bytes_in,bytes_out,\\n,bytes_tool.42,100,'; /bin/sleep 0.15; printf '200,\\n,bytes_out,bytes_in,\\nx.42,400,300,\\n'; exec /bin/sleep 5"]), &cancel, Duration::from_secs(5), |rows, _, _, sampled| {
+      if blocks.is_empty() {
+        assert_eq!(rows[&41], (1, 2));
+        // The next header was timestamped before this warmup block's callback.
+        // Its age must include publication delay, independently of child startup.
+        thread::sleep(Duration::from_millis(150));
+      } else {
+        assert_eq!(rows[&42], (100, 200));
+        assert!(sampled.elapsed() >= Duration::from_millis(100));
+        cancel.store(true, Ordering::Release);
+      }
+      blocks.push(rows);
+    }).unwrap();
+    assert_eq!(blocks.len(), 2);
+  }
+
+  #[test]
+  fn silent_source_hits_its_watchdog_without_requiring_startup_output() {
+    let stop = AtomicBool::new(false);
+    let timeout = Duration::from_millis(120);
+    let started = Instant::now();
+    let error = observe(Command::new("/bin/sleep").arg("5"), &stop, timeout, |_, _, _, _| {
+      panic!("a silent source must never publish")
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(started.elapsed() >= timeout);
+    assert!(started.elapsed() < Duration::from_secs(7));
   }
 
   #[test]
@@ -1098,13 +1124,15 @@ mod tests {
       panic!("no snapshot")
     })
     .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(1));
+    // Startup is separate from cancellation; the ready-child case above measures
+    // shutdown from its actual cancellation signal, with a one-second budget.
+    assert!(started.elapsed() < Duration::from_secs(7));
     let stop = AtomicBool::new(false);
     let error = observe(
       Command::new("/bin/sh")
         .args(["-c", "printf ',bytes_in,bytes_out,\\n'; printf '%09000d' 1; exec /bin/sleep 5"]),
       &stop,
-      Duration::from_secs(1),
+      Duration::from_secs(5),
       |_, _, _, _| panic!("partial data must never publish"),
     )
     .unwrap_err();
