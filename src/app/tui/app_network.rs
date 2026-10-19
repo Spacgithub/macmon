@@ -1,5 +1,6 @@
 //! The application view shares the existing Network panel; `n` returns to interfaces.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 
 use ratatui::crossterm::event::KeyCode;
@@ -19,7 +20,8 @@ pub(super) struct View {
   selected: usize,
   sort: usize,
   open: HashSet<String>,
-  scroll: Option<usize>,
+  scroll: Cell<Option<usize>>,
+  rendered_offset: Cell<usize>,
 }
 
 impl View {
@@ -57,21 +59,25 @@ impl View {
       }
       KeyCode::Up => {
         self.selected = self.selected.saturating_sub(1);
-        self.scroll = None;
+        self.scroll.set(None);
       }
       KeyCode::Down => {
         self.selected = (self.selected + 1).min(count.saturating_sub(1));
-        self.scroll = None;
+        self.scroll.set(None);
       }
-      KeyCode::PageDown => self.scroll = Some(self.scroll.unwrap_or(0).saturating_add(10)),
-      KeyCode::PageUp => self.scroll = Some(self.scroll.unwrap_or(0).saturating_sub(10)),
+      KeyCode::PageDown => self
+        .scroll
+        .set(Some(self.scroll.get().unwrap_or(self.rendered_offset.get()).saturating_add(10))),
+      KeyCode::PageUp => self
+        .scroll
+        .set(Some(self.scroll.get().unwrap_or(self.rendered_offset.get()).saturating_sub(10))),
       KeyCode::Home => {
         self.selected = 0;
-        self.scroll = None;
+        self.scroll.set(None);
       }
       KeyCode::End => {
         self.selected = count.saturating_sub(1);
-        self.scroll = None;
+        self.scroll.set(None);
       }
       KeyCode::Char(' ') | KeyCode::Right | KeyCode::Left => {
         let Some(id) = self.groups().get(self.selected).map(|group| group.id.clone()) else {
@@ -214,8 +220,13 @@ impl App {
     let offset = self
       .app_network
       .scroll
+      .get()
       .unwrap_or(offset)
       .min(lines.len().saturating_sub(inner.height as usize));
+    self.app_network.rendered_offset.set(offset);
+    if self.app_network.scroll.get().is_some() {
+      self.app_network.scroll.set(Some(offset));
+    }
     frame.render_widget(
       Paragraph::new(lines).scroll((offset.min(u16::MAX as usize) as u16, 0)),
       inner,
@@ -295,6 +306,43 @@ mod tests {
     app.handle_panel_key(key(KeyCode::Char('n')));
     assert!(!app.app_network.enabled);
     assert!(app.network.is_none()); // Application view did not replace interface telemetry.
+  }
+
+  #[test]
+  fn paging_uses_the_visible_offset_without_overscrolling_or_jumping_above_selection() {
+    let mut app = App::from_parts(Default::default(), Config::load_from(None));
+    let mut data = sample();
+    let template = data.groups[0].members[0].clone();
+    data.groups[0].members = (0..40)
+      .map(|index| Member {
+        pid: 1000 + index,
+        name: format!("member-{index}"),
+        instance: format!("instance-{index}"),
+        ..template.clone()
+      })
+      .collect();
+    app.app_network.update(Some(data));
+    app.app_network.key(KeyCode::Right);
+    for _ in 0..100 {
+      app.app_network.key(KeyCode::PageDown);
+    }
+    let bottom = draw(&app, 100, 12);
+    assert!(bottom.contains("member-39"));
+    let offset = app.app_network.rendered_offset.get();
+    assert_eq!(app.app_network.scroll.get(), Some(offset));
+    app.app_network.key(KeyCode::PageUp);
+    let up = draw(&app, 100, 12);
+    assert_ne!(bottom, up, "the first PageUp must move after reaching the bottom");
+    assert_eq!(app.app_network.rendered_offset.get(), offset.saturating_sub(10));
+
+    app.app_network.key(KeyCode::End);
+    let selected = draw(&app, 100, 12);
+    assert!(selected.contains(">+ Editor"));
+    let automatic = app.app_network.rendered_offset.get();
+    assert!(automatic > 10);
+    app.app_network.key(KeyCode::PageDown);
+    let _ = draw(&app, 100, 12);
+    assert!(app.app_network.rendered_offset.get() >= automatic);
   }
 
   #[test]

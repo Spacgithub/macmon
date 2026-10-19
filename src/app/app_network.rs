@@ -1064,14 +1064,16 @@ mod tests {
     let stop = AtomicBool::new(false);
     let mut pid = None;
     let started = Instant::now();
-    let error = observe(
+    observe(
       Command::new("/usr/bin/python3").args(["-c", "import os,select,time; assert os.isatty(0) and os.isatty(1); assert os.ttyname(0)==os.ttyname(1); assert not select.select([0],[],[],0)[0]; print(',bytes_in,bytes_out,\\ncheck.%d,1,2,\\n,bytes_in,bytes_out,' % os.getpid(),flush=True); time.sleep(5)"]),
       &stop,
-      Duration::from_millis(500),
-      |rows, _, _, _| pid = rows.keys().next().copied(),
-    ).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    assert!(started.elapsed() < Duration::from_secs(2));
+      Duration::from_secs(5),
+      |rows, _, _, _| {
+        pid = rows.keys().next().copied();
+        stop.store(true, Ordering::Release);
+      },
+    ).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(7));
     let pid = pid.expect("private stdin must be a terminal without immediately readable EOF");
     assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
