@@ -248,7 +248,7 @@ what we need.
       and sorting in Terminal/Web while retaining per-interface monitoring.
       Plan: [docs/plans/20261018-app-network-battery-bluetooth.md](plans/20261018-app-network-battery-bluetooth.md).
 
-- [ ] **39. Monitor the battery.** Show source-supported charge, power source, charging
+- [x] **39. Monitor the battery.** Show source-supported charge, power source, charging
       state, health, cycles and electrical readings through shared cached acquisition,
       with compact Terminal/Web summaries and manually expanded details.
       Plan: [docs/plans/20261018-app-network-battery-bluetooth.md](plans/20261018-app-network-battery-bluetooth.md).

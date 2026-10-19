@@ -267,3 +267,7 @@ footer { margin-top: 24px; text-align: center; }
 .app-network-summary { margin-top: 1.3rem; padding-top: 1rem; border-top: 1px solid var(--line); }
 .app-network-summary h3 { font-size: .95rem; margin: 0 0 .5rem; }
 .app-network-member td:first-child { padding-left: 1.5rem; }
+.battery-overview { border-top: 1px solid var(--line); padding-top: 1rem; margin-top: 1rem; }
+.battery-overview h3 { margin: 0 0 .5rem; }
+.battery-overview p { margin: .3rem 0; }
+.battery-components { margin-top: 1rem; }

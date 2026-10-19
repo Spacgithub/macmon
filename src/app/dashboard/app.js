@@ -110,6 +110,33 @@ function watts(value) {
   const small = value > 0 && value < 1;
   return `${(small ? value * 1000 : value).toLocaleString("en-US", { maximumSignificantDigits: 4 })} ${small ? "mW" : "W"}`;
 }
+function battery(sample) {
+  const item = sample?.battery, available = item?.state === "available";
+  const measured = (value, min, max) => typeof value === "number" && Number.isFinite(value) && value >= min && value <= max;
+  const quantity = (value, min, max, unit) => available && measured(value, min, max) ? `${number(value < 0 ? -value : value, 2)} ${unit}${value < 0 ? " / discharge" : ""}` : "Unavailable";
+  const acquired = finite(item?.age_ms) ? item.age_ms + age() : Infinity;
+  const registry = finite(item?.registry_age_ms) ? item.registry_age_ms + age() : Infinity;
+  const retained = !live() || acquired > 60000, prefix = retained && item ? "Retained / " : "";
+  const source = { ac: "AC power", battery: "Battery power", ups: "UPS power", offline: "Offline", unknown: "Source unknown" }[item?.source] || "Source unknown";
+  const charging = item?.charging === true ? "Charging" : item?.charging === false ? item?.source === "battery" ? "Discharging" : "Not charging" : "Charge state unavailable";
+  const charge = measured(item?.percent, 0, 100) ? `${number(item.percent)}%` : "Percentage unavailable";
+  put("battery-summary", prefix + (available ? `${charge} / ${source} / ${charging}` : item?.state === "absent" ? "No internal battery" : "Battery telemetry unavailable"));
+  const since = (value) => finite(value) ? `${Math.floor(value / 1000)}s old${value > 60000 ? " / stale" : ""}` : "age unavailable";
+  put("battery-freshness", item ? `Power source ${since(acquired)} / registry ${since(registry)}` : "Acquisition age unavailable");
+  const health = ["good", "fair", "poor"].includes(item?.health) ? item.health[0].toUpperCase() + item.health.slice(1) : "Unavailable";
+  put("battery-health", available ? health : "Unavailable");
+  put("battery-cycles", available && Number.isSafeInteger(item.cycles) && item.cycles >= 0 && item.cycles < 1000000 ? String(item.cycles) : "Unavailable");
+  put("battery-capacity-health", quantity(item?.capacity_health_percent, 0, 100, "%"));
+  put("battery-temperature", available && measured(item?.temperature_celsius, -40, 100) ? `${item.temperature_celsius.toFixed(1)} °C` : "Unavailable");
+  put("battery-voltage", quantity(item?.voltage_v, 1, 50, "V"));
+  const signed = (value, unit, max) => available && measured(value, -max, max) ? `${value > 0 ? "+" : ""}${value.toFixed(2)} ${unit}` : "Unavailable";
+  put("battery-current", signed(item?.current_a, "A", 50));
+  put("battery-electrical", signed(item?.electrical_power_w, "W", 2500));
+  const minutes = (value, applicable) => available && applicable && Number.isSafeInteger(value) && value >= 0 && value < 65535 ? `${value} min` : "Unavailable";
+  put("battery-empty-time", minutes(item?.time_to_empty_min, item?.source === "battery" && item?.charging === false));
+  put("battery-full-time", minutes(item?.time_to_full_min, item?.source === "ac" && item?.charging === true));
+  return item ? 1000 : Infinity;
+}
 function memoryActivity(sample) {
   const activity = sample.memory_activity;
   const level = ["normal", "warning", "critical"].includes(activity?.pressure) ? activity.pressure : "unavailable";
@@ -406,10 +433,10 @@ function settle() {
   const unavailable = state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : "";
   put("process-status", Array.isArray(procView.sample?.processes) ? `${processState}${finite(procAge) ? `${Math.floor(procAge / 1000)}s old` : "Age unavailable"}${cadence} / CPU 100% = one core` : collection ? `${unavailable}${collection.state.toUpperCase()} / Waiting for a process snapshot${cadence}` : "Unavailable for this request");
   applicationNetwork(false);
-  const diskDelay = refreshDiskHealth();
+  const diskDelay = refreshDiskHealth(), batteryDelay = battery(state.sample);
   if (!document.hidden) {
     const processDelay = Array.isArray(procView.sample?.processes) && finite(procAge) ? Math.min(1000 - procAge % 1000, !retained && procAge <= processLimit() ? Math.max(1, processLimit() - procAge + 1) : Infinity) : Infinity;
-    const delay = Math.min(live() ? Math.max(1, limit() - age() + 1) : Infinity, diskDelay, processDelay, appNetwork.sample ? 1000 : Infinity);
+    const delay = Math.min(live() ? Math.max(1, limit() - age() + 1) : Infinity, diskDelay, processDelay, appNetwork.sample ? 1000 : Infinity, batteryDelay);
     if (Number.isFinite(delay)) staleTimer = setTimeout(settle, delay);
   }
   if (moving()) {

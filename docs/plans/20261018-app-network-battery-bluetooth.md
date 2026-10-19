@@ -50,8 +50,8 @@ future independent Swift control system belong to a separate project.
       reducing existing per-interface access.
 - [x] Add focused parser, identity, failure, rate, privacy, freshness and UI regressions;
       run checks and runtime/resource validation; review and deliver the network PR.
-- [ ] Implement battery acquisition, honest availability/freshness and shared output.
-- [ ] Add Terminal/Web battery summaries and details with focused regressions, native
+- [x] Implement battery acquisition, honest availability/freshness and shared output.
+- [x] Add Terminal/Web battery summaries and details with focused regressions, native
       runtime verification and resource measurements; review and deliver the battery PR.
 - [ ] Implement Bluetooth device/battery acquisition with explicit supported coverage.
 - [ ] Add Terminal/Web device summaries and expandable supported battery components;

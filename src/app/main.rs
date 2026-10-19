@@ -10,6 +10,7 @@ use clap::parser::ValueSource;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 mod app_network;
+mod battery;
 mod config;
 mod fds;
 mod find_clpc;
