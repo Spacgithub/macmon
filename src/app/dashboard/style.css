@@ -276,3 +276,7 @@ footer { margin-top: 24px; text-align: center; }
 .bluetooth-scroll { max-height: 25rem; overflow: auto; margin-top: var(--bluetooth-gap); }
 .bluetooth-device { padding: .85rem 0; border-top: 1px solid var(--line); }
 .bluetooth-device h3, .bluetooth-device p { overflow-wrap: anywhere; margin: .25rem 0; }
+.monitoring-control { display: flex; justify-content: flex-end; align-items: center; gap: .75rem; margin-top: .75rem; }
+.monitoring-control > span { color: var(--muted); font-size: .75rem; }
+#monitoring-feedback { max-width: 25rem; }
+#status[data-state="paused"] { color: var(--muted); }

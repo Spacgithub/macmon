@@ -310,6 +310,16 @@ struct ClientData {
   session: String,
   error: String,
   socket: Option<UnixStream>,
+  enabled: bool,
+  generation: u64,
+  fresh_after: Option<Instant>,
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+pub(crate) struct Monitoring {
+  pub enabled: bool,
+  pub state: &'static str,
+  pub generation: u64,
 }
 
 impl ClientData {
@@ -343,6 +353,16 @@ struct ClientInner {
   runtime: Runtime,
   id: String,
   default_ms: u32,
+}
+
+impl ClientInner {
+  fn active(&self, data: &ClientData, generation: u64) -> io::Result<()> {
+    if data.enabled && data.generation == generation && !self.stopped.load(Ordering::Acquire) {
+      Ok(())
+    } else {
+      Err(io::Error::new(io::ErrorKind::NotConnected, "monitoring subscription suspended"))
+    }
+  }
 }
 
 pub(crate) struct Client {
@@ -389,6 +409,9 @@ impl Client {
         session: String::new(),
         error: String::new(),
         socket: None,
+        enabled: true,
+        generation: 0,
+        fresh_after: None,
       }),
       changed: Condvar::new(),
       stopped: AtomicBool::new(false),
@@ -409,6 +432,42 @@ impl Client {
   }
   pub fn cadence(&self) -> CadenceState {
     self.inner.data.lock().unwrap().cadence
+  }
+  pub(crate) fn monitoring(&self) -> Monitoring {
+    let data = self.inner.data.lock().unwrap();
+    Monitoring {
+      enabled: data.enabled,
+      state: if !data.enabled {
+        "paused"
+      } else if data.state == ConnectionState::Live {
+        "running"
+      } else {
+        "reconnecting"
+      },
+      generation: data.generation,
+    }
+  }
+  pub(crate) fn set_enabled(&self, enabled: bool) -> io::Result<()> {
+    let mut data = self.inner.data.lock().unwrap();
+    if data.enabled != enabled {
+      if data.generation == 9_007_199_254_740_991 {
+        return Err(io::Error::other("monitoring generation exhausted"));
+      }
+      data.generation += 1;
+      data.enabled = enabled;
+      data.frame = None;
+      data.fresh_after = enabled.then(Instant::now);
+      data.error.clear();
+      *self.inner.demand.lock().unwrap() = ProcessDemand::None;
+      data.state =
+        if enabled { ConnectionState::Connecting } else { ConnectionState::Disconnected };
+      if let Some(socket) = data.socket.take() {
+        let _ = socket.shutdown(Shutdown::Both);
+      }
+    }
+    drop(data);
+    self.inner.changed.notify_all();
+    Ok(())
   }
   pub fn wait_after(
     &self,
@@ -438,9 +497,10 @@ impl Client {
     if !matches!(adjustment, "increase" | "decrease") {
       return Err(invalid("invalid interval adjustment"));
     }
-    let session = self.session()?;
+    let (session, generation) = self.session()?;
     self.control(
       &session,
+      generation,
       Request::Adjust {
         protocol: PROTOCOL,
         session: session.clone(),
@@ -449,25 +509,33 @@ impl Client {
     )
   }
   pub fn set_demand(&self, demand: ProcessDemand) -> io::Result<()> {
+    let data = self.inner.data.lock().unwrap();
+    self.inner.active(&data, data.generation)?;
     *self.inner.demand.lock().unwrap() = demand;
     Ok(())
   }
-  fn session(&self) -> io::Result<String> {
+  fn session(&self) -> io::Result<(String, u64)> {
     let data = self.inner.data.lock().unwrap();
     if data.state != ConnectionState::Live {
       return Err(io::Error::new(io::ErrorKind::NotConnected, "sampling source is disconnected"));
     }
-    Ok(data.session.clone())
+    Ok((data.session.clone(), data.generation))
   }
-  fn control(&self, session: &str, request: Request) -> io::Result<CadenceState> {
-    let mut stream = self.inner.runtime.connect()?;
-    write_json(&mut stream, b'Q', &request)?;
+  fn control(&self, session: &str, generation: u64, request: Request) -> io::Result<CadenceState> {
+    let mut stream = {
+      let data = self.inner.data.lock().unwrap();
+      self.inner.active(&data, generation)?;
+      let mut stream = self.inner.runtime.connect()?;
+      write_json(&mut stream, b'Q', &request)?;
+      stream
+    };
     let (kind, bytes) = read_packet(&mut stream)?;
     if kind != b'C' {
       return Err(invalid("collector rejected control"));
     }
     let cadence = serde_json::from_slice(&bytes)?;
     let mut data = self.inner.data.lock().unwrap();
+    self.inner.active(&data, generation)?;
     if data.session != session {
       return Err(io::Error::new(
         io::ErrorKind::NotConnected,
@@ -528,39 +596,73 @@ fn replacement_interval(shared: u32, explicit: Option<u32>, fallback: u32) -> u3
 
 fn client_worker(inner: Arc<ClientInner>, mut initial_ms: Option<u32>) {
   while !inner.stopped.load(Ordering::Acquire) {
+    let generation = {
+      let data = inner.data.lock().unwrap();
+      let data = inner
+        .changed
+        .wait_while(data, |data| {
+          (!data.enabled || data.state == ConnectionState::Incompatible)
+            && !inner.stopped.load(Ordering::Acquire)
+        })
+        .unwrap();
+      if inner.stopped.load(Ordering::Acquire) {
+        return;
+      }
+      if data.generation > 0 {
+        initial_ms = None;
+      }
+      data.generation
+    };
     let result = (|| -> io::Result<()> {
-      let mut stream = match inner.runtime.connect() {
-        Ok(stream) => stream,
-        Err(error)
-          if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) =>
-        {
-          let shared = inner.data.lock().unwrap().cadence.requested_ms;
-          spawn_owner(&inner.runtime, replacement_interval(shared, initial_ms, inner.default_ms))?;
-          let deadline = Instant::now() + Duration::from_secs(5);
-          loop {
-            match inner.runtime.connect() {
-              Ok(stream) => break stream,
-              Err(error) if Instant::now() < deadline && !inner.stopped.load(Ordering::Acquire) => {
-                let _ = error;
-                thread::sleep(Duration::from_millis(40));
-              }
-              Err(error) => return Err(error),
-            }
+      let connected = {
+        let data = inner.data.lock().unwrap();
+        inner.active(&data, generation)?;
+        match inner.runtime.connect() {
+          Ok(stream) => Some(stream),
+          Err(error)
+            if matches!(
+              error.kind(),
+              io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+          {
+            spawn_owner(
+              &inner.runtime,
+              replacement_interval(data.cadence.requested_ms, initial_ms, inner.default_ms),
+            )?;
+            None
           }
+          Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
       };
-      let subscribed_demand = *inner.demand.lock().unwrap();
-      write_json(
-        &mut stream,
-        b'Q',
-        &Request::Subscribe {
-          protocol: PROTOCOL,
-          id: inner.id.clone(),
-          initial_ms,
-          demand: subscribed_demand,
-        },
-      )?;
+      let mut stream = if let Some(stream) = connected {
+        stream
+      } else {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+          let data = inner.data.lock().unwrap();
+          inner.active(&data, generation)?;
+          match inner.runtime.connect() {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => {}
+            Err(error) => return Err(error),
+          }
+          drop(data);
+          thread::sleep(Duration::from_millis(40));
+        }
+      };
+      let subscribed_demand = {
+        let mut data = inner.data.lock().unwrap();
+        inner.active(&data, generation)?;
+        // Register before the handshake: pause can interrupt a stalled welcome immediately.
+        data.socket = Some(stream.try_clone()?);
+        let demand = *inner.demand.lock().unwrap();
+        write_json(
+          &mut stream,
+          b'Q',
+          &Request::Subscribe { protocol: PROTOCOL, id: inner.id.clone(), initial_ms, demand },
+        )?;
+        demand
+      };
       let (kind, bytes) = read_packet(&mut stream)?;
       if kind != b'H' {
         return Err(invalid("incompatible sampling owner"));
@@ -570,23 +672,35 @@ fn client_worker(inner: Arc<ClientInner>, mut initial_ms: Option<u32>) {
         return Err(invalid("incompatible sampling protocol"));
       }
       let session = welcome.session;
-      initial_ms = None; // Reconnects never replay an old CLI preference over another consumer.
+      initial_ms = None; // Never replay an old CLI preference over another consumer.
       {
         let mut data = inner.data.lock().unwrap();
+        inner.active(&data, generation)?;
         data.welcome(&session, welcome.cadence);
-        data.socket = Some(stream.try_clone()?);
       }
       let mut sent_demand = subscribed_demand;
-      while !inner.stopped.load(Ordering::Acquire) {
-        let demand = *inner.demand.lock().unwrap();
+      loop {
+        let demand = {
+          let data = inner.data.lock().unwrap();
+          inner.active(&data, generation)?;
+          *inner.demand.lock().unwrap()
+        };
         if demand != sent_demand {
           let mut control = inner.runtime.connect()?;
-          let session = inner.data.lock().unwrap().session.clone();
-          write_json(
-            &mut control,
-            b'Q',
-            &Request::Demand { protocol: PROTOCOL, session, id: inner.id.clone(), demand },
-          )?;
+          {
+            let data = inner.data.lock().unwrap();
+            inner.active(&data, generation)?;
+            write_json(
+              &mut control,
+              b'Q',
+              &Request::Demand {
+                protocol: PROTOCOL,
+                session: session.clone(),
+                id: inner.id.clone(),
+                demand,
+              },
+            )?;
+          }
           let (kind, _) = read_packet(&mut control)?;
           if kind != b'C' {
             return Err(invalid("collector rejected demand"));
@@ -610,8 +724,12 @@ fn client_worker(inner: Arc<ClientInner>, mut initial_ms: Option<u32>) {
               }
             }
             let mut data = inner.data.lock().unwrap();
+            inner.active(&data, generation)?;
             if frame.session != session {
               return Err(invalid("collector frame belongs to another session"));
+            }
+            if data.fresh_after.is_some_and(|after| frame.sampled < after) {
+              continue;
             }
             data.accept_cadence(&session, frame.cadence);
             frame.cadence = data.cadence;
@@ -620,30 +738,29 @@ fn client_worker(inner: Arc<ClientInner>, mut initial_ms: Option<u32>) {
           }
           b'C' => {
             let cadence = serde_json::from_slice(&bytes)?;
-            inner.data.lock().unwrap().accept_cadence(&session, cadence);
+            let mut data = inner.data.lock().unwrap();
+            inner.active(&data, generation)?;
+            data.accept_cadence(&session, cadence);
           }
           _ => return Err(invalid("invalid collector response")),
         }
         inner.changed.notify_all();
       }
-      Ok(())
     })();
     let mut data = inner.data.lock().unwrap();
-    data.socket = None;
-    if let Err(error) = result {
-      data.state = if error.kind() == io::ErrorKind::InvalidData {
-        ConnectionState::Incompatible
-      } else {
-        ConnectionState::Disconnected
-      };
-      data.error = error.to_string();
+    if data.generation == generation {
+      data.socket = None;
+      if let Err(error) = result {
+        data.state = if error.kind() == io::ErrorKind::InvalidData {
+          ConnectionState::Incompatible
+        } else {
+          ConnectionState::Disconnected
+        };
+        data.error = error.to_string();
+      }
     }
     inner.changed.notify_all();
-    if data.state == ConnectionState::Incompatible {
-      break;
-    }
-    drop(data);
-    thread::sleep(Duration::from_millis(150));
+    let _ = inner.changed.wait_timeout(data, Duration::from_millis(150)).unwrap();
   }
 }
 
@@ -1340,6 +1457,123 @@ mod tests {
   }
 
   #[test]
+  fn monitoring_pause_interrupts_handshake_and_resume_rejects_cached_frames() {
+    let dir = Directory::new();
+    let runtime = dir.runtime();
+    let listener = bind_private_socket(&runtime).unwrap();
+    let (events, received) = std::sync::mpsc::channel();
+    let (release, next) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+      let (mut first, _) = listener.accept().unwrap();
+      let (_, request) = read_packet(&mut first).unwrap();
+      assert!(matches!(
+        serde_json::from_slice::<Request>(&request).unwrap(),
+        Request::Subscribe { initial_ms: Some(5000), .. }
+      ));
+      let old = Frame::fixture(1, 1);
+      first.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+      events.send(()).unwrap();
+      assert_eq!(first.read(&mut [0]).unwrap(), 0, "pause closes a pre-welcome socket");
+      events.send(()).unwrap();
+      let (mut resumed, _) = listener.accept().unwrap();
+      let (_, request) = read_packet(&mut resumed).unwrap();
+      assert!(matches!(
+        serde_json::from_slice::<Request>(&request).unwrap(),
+        Request::Subscribe { initial_ms: None, demand: ProcessDemand::None, .. }
+      ));
+      write_json(
+        &mut resumed,
+        b'H',
+        &Welcome {
+          protocol: PROTOCOL,
+          session: old.session.clone(),
+          cadence: revisioned_cadence(500, 500, 2),
+        },
+      )
+      .unwrap();
+      write_json(&mut resumed, b'F', &old).unwrap();
+      events.send(()).unwrap();
+      next.recv_timeout(IO_TIMEOUT).unwrap();
+      write_json(&mut resumed, b'F', &Frame::fixture(2, 2)).unwrap();
+      let _ = resumed.read(&mut [0]);
+    });
+    let client = Client::at(runtime, Some(5000), ProcessDemand::Details, 1000).unwrap();
+    received.recv_timeout(IO_TIMEOUT).unwrap();
+    client.set_enabled(false).unwrap();
+    received.recv_timeout(IO_TIMEOUT).unwrap();
+    assert_eq!(client.monitoring().state, "paused");
+    assert_eq!(client.monitoring().generation, 1);
+    assert!(client.latest().is_none());
+    assert!(client.set_demand(ProcessDemand::Details).is_err());
+    client.set_enabled(false).unwrap();
+    assert_eq!(client.monitoring().generation, 1, "absolute controls are idempotent");
+    client.set_enabled(true).unwrap();
+    received.recv_timeout(IO_TIMEOUT).unwrap();
+    thread::sleep(Duration::from_millis(20));
+    assert!(client.latest().is_none(), "a retained owner frame is not a fresh resumed reading");
+    assert_eq!(client.monitoring().state, "reconnecting");
+    release.send(()).unwrap();
+    until(|| client.latest().is_some());
+    assert_eq!(client.latest().unwrap().sequence, 2);
+    assert_eq!(client.cadence().requested_ms, 500);
+    assert_eq!(client.monitoring().state, "running");
+    drop(client);
+    server.join().unwrap();
+  }
+
+  #[test]
+  fn a_control_ack_from_before_pause_cannot_change_the_resumed_cadence() {
+    let dir = Directory::new();
+    let runtime = dir.runtime();
+    let listener = bind_private_socket(&runtime).unwrap();
+    let (pending, observed) = std::sync::mpsc::channel();
+    let (release, next) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+      let (mut subscription, _) = listener.accept().unwrap();
+      read_packet(&mut subscription).unwrap();
+      let mut frame = Frame::fixture(1, 1);
+      frame.cadence = revisioned_cadence(500, 500, 0);
+      write_json(
+        &mut subscription,
+        b'H',
+        &Welcome { protocol: PROTOCOL, session: frame.session.clone(), cadence: frame.cadence },
+      )
+      .unwrap();
+      write_json(&mut subscription, b'F', &frame).unwrap();
+      let (mut command, _) = listener.accept().unwrap();
+      read_packet(&mut command).unwrap();
+      pending.send(()).unwrap();
+      let (mut resumed, _) = listener.accept().unwrap();
+      read_packet(&mut resumed).unwrap();
+      let mut fresh = Frame::fixture(2, 2);
+      fresh.cadence = frame.cadence;
+      write_json(
+        &mut resumed,
+        b'H',
+        &Welcome { protocol: PROTOCOL, session: fresh.session.clone(), cadence: fresh.cadence },
+      )
+      .unwrap();
+      write_json(&mut resumed, b'F', &fresh).unwrap();
+      next.recv_timeout(IO_TIMEOUT).unwrap();
+      write_json(&mut command, b'C', &revisioned_cadence(750, 750, 1)).unwrap();
+      let _ = resumed.read(&mut [0]);
+    });
+    let client = Arc::new(Client::at(runtime, None, ProcessDemand::None, 1000).unwrap());
+    client.wait_after(None, IO_TIMEOUT).unwrap().unwrap();
+    let adjusting = client.clone();
+    let adjustment = thread::spawn(move || adjusting.adjust("increase"));
+    observed.recv_timeout(IO_TIMEOUT).unwrap();
+    client.set_enabled(false).unwrap();
+    client.set_enabled(true).unwrap();
+    until(|| client.latest().is_some_and(|frame| frame.sequence == 2));
+    release.send(()).unwrap();
+    assert_eq!(adjustment.join().unwrap().unwrap_err().kind(), io::ErrorKind::NotConnected);
+    assert_eq!(client.cadence().requested_ms, 500);
+    drop(client);
+    server.join().unwrap();
+  }
+
+  #[test]
   fn queued_frames_and_heartbeats_cannot_roll_back_an_acknowledged_adjustment() {
     let dir = Directory::new();
     let runtime = dir.runtime();
@@ -1410,6 +1644,9 @@ mod tests {
   fn welcome_resets_cadence_only_for_a_new_session_and_legacy_owners_still_decode() {
     let frame = Frame::fixture(1, 1);
     let mut data = ClientData {
+      enabled: true,
+      generation: 0,
+      fresh_after: None,
       frame: Some(Arc::new(frame)),
       state: ConnectionState::Live,
       cadence: revisioned_cadence(500, 250, 3),

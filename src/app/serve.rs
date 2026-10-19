@@ -1,6 +1,7 @@
 //! HTTP serving and launchd support.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
@@ -24,6 +25,8 @@ pub struct Cadence {
   source: Option<Arc<crate::source::Client>>,
   leases: crate::process_demand::Leases,
   process_demand: crate::source::ProcessDemand,
+  monitoring: crate::source::Monitoring,
+  instance: String,
 }
 
 impl Cadence {
@@ -35,6 +38,11 @@ impl Cadence {
       source: None,
       leases: Default::default(),
       process_demand: crate::source::ProcessDemand::None,
+      monitoring: crate::source::Monitoring { enabled: true, state: "running", generation: 0 },
+      instance: format!(
+        "{:016x}",
+        std::collections::hash_map::RandomState::new().hash_one(Instant::now())
+      ),
     }
   }
 
@@ -77,8 +85,53 @@ impl Cadence {
   pub(crate) fn with_source(source: Arc<crate::source::Client>) -> Self {
     Self { source: Some(source), ..Self::new(1000) }
   }
+  pub(crate) fn monitoring(&self) -> crate::source::Monitoring {
+    self.source.as_ref().map_or(self.monitoring, |source| source.monitoring())
+  }
+  fn monitoring_value(&self) -> serde_json::Value {
+    let mut value = serde_json::to_value(self.monitoring()).unwrap();
+    value["instance"] = self.instance.clone().into();
+    value
+  }
+  fn set_monitoring(&mut self, enabled: bool, shared: &SharedMetrics) -> std::io::Result<()> {
+    if self.monitoring().enabled == enabled {
+      return Ok(());
+    }
+    if let Some(source) = &self.source {
+      source.set_enabled(enabled)?;
+    } else {
+      if self.monitoring.generation == 9_007_199_254_740_991 {
+        return Err(std::io::Error::other("monitoring generation exhausted"));
+      }
+      self.monitoring = crate::source::Monitoring {
+        enabled,
+        state: if enabled { "reconnecting" } else { "paused" },
+        generation: self.monitoring.generation + 1,
+      };
+    }
+    self.leases = Default::default();
+    self.process_demand = crate::source::ProcessDemand::None;
+    *shared.write().unwrap() = None;
+    Ok(())
+  }
+  pub(crate) fn forward(
+    &self,
+    shared: &SharedMetrics,
+    frame: Arc<Sample>,
+    generation: u64,
+  ) -> bool {
+    let monitoring = self.monitoring();
+    if !monitoring.enabled || monitoring.generation != generation {
+      return false;
+    }
+    *shared.write().unwrap() = Some(frame);
+    true
+  }
   /// Called by the forwarding loop even if every browser stops sending requests.
   pub(crate) fn refresh_process_demand(&mut self, now: Instant) -> Duration {
+    if !self.monitoring().enabled {
+      return Duration::from_secs(1);
+    }
     let demand = self.leases.demand(now);
     if demand != self.process_demand {
       if let Some(source) = &self.source {
@@ -499,13 +552,31 @@ fn handle_conn(
         kind.split(';').next().unwrap().trim().eq_ignore_ascii_case("application/json")
       });
     let body = serde_json::from_slice::<serde_json::Value>(&request.body).unwrap_or_default();
-    let status = if !matches!(path.as_str(), "/api/interval" | "/api/process-demand") {
-      404
-    } else if !allowed {
-      403
-    } else {
-      200
-    };
+    let status =
+      if !matches!(path.as_str(), "/api/interval" | "/api/process-demand" | "/api/monitoring") {
+        404
+      } else if !allowed {
+        403
+      } else {
+        200
+      };
+    if status == 200 && path == "/api/monitoring" {
+      let mut control = cadence.write().unwrap();
+      let (status, body) = match body.get("enabled").and_then(serde_json::Value::as_bool) {
+        Some(enabled) => match control.set_monitoring(enabled, &shared) {
+          Ok(()) => (200, control.monitoring_value().to_string()),
+          Err(_) => (503, r#"{"error":"monitoring change unavailable"}"#.into()),
+        },
+        None => (400, r#"{"error":"enabled must be boolean"}"#.into()),
+      };
+      drop(control);
+      write_response(&mut stream, status, "application/json", &body);
+      return;
+    }
+    if status == 200 && !cadence.read().unwrap().monitoring().enabled {
+      write_response(&mut stream, 503, "application/json", r#"{"error":"monitoring paused"}"#);
+      return;
+    }
     if status == 200 && path == "/api/process-demand" {
       let lease = match body.get("lease") {
         Some(serde_json::Value::Null) => Ok(None),
@@ -515,6 +586,11 @@ fn handle_conn(
       let demand = serde_json::from_value::<crate::source::ProcessDemand>(body["demand"].clone())
         .map_err(|_| crate::process_demand::Error::Invalid);
       let mut control = cadence.write().unwrap();
+      if !control.monitoring().enabled {
+        drop(control);
+        write_response(&mut stream, 503, "application/json", r#"{"error":"monitoring paused"}"#);
+        return;
+      }
       let result = lease.and_then(|lease| {
         demand.and_then(|demand| control.leases.register(lease, demand, Instant::now()))
       });
@@ -532,6 +608,11 @@ fn handle_conn(
     }
     let (status, body) = if status == 200 {
       let mut control = cadence.write().unwrap();
+      if !control.monitoring().enabled {
+        drop(control);
+        write_response(&mut stream, 503, "application/json", r#"{"error":"monitoring paused"}"#);
+        return;
+      }
       let adjustment = body["adjustment"].as_str().unwrap_or("");
       if let Some(source) = &control.source {
         match source.adjust(adjustment) {
@@ -553,8 +634,24 @@ fn handle_conn(
     return;
   }
 
+  if path == "/api/monitoring" {
+    let body = cadence.read().unwrap().monitoring_value().to_string();
+    write_response(
+      &mut stream,
+      if local { 200 } else { 403 },
+      "application/json",
+      if local { &body } else { "{}" },
+    );
+    return;
+  }
+
   if path == "/api/sample" && local {
     let mut control = cadence.write().unwrap();
+    if !control.monitoring().enabled {
+      drop(control);
+      write_response(&mut stream, 503, "application/json", r#"{"error":"monitoring paused"}"#);
+      return;
+    }
     let result = control
       .leases
       .observe(request.headers.get("x-macmon-process-lease").map(String::as_str), Instant::now());
@@ -605,6 +702,16 @@ fn handle_conn(
     return;
   }
 
+  if !matches!(path.as_str(), "/json" | "/api/sample" | "/metrics") {
+    write_response(&mut stream, 404, "application/json", r#"{"error":"not found"}"#);
+    return;
+  }
+  // Always acquire cadence before shared; pause and forwarding use this same order.
+  let control = cadence.read().unwrap();
+  if !control.monitoring().enabled {
+    write_response(&mut stream, 503, "application/json", r#"{"error":"monitoring paused"}"#);
+    return;
+  }
   let lock = shared.read().unwrap();
 
   let Some(sample) = lock.as_ref() else {
@@ -620,7 +727,7 @@ fn handle_conn(
       write_response(&mut stream, 200, "application/json", &body);
     }
     "/api/sample" => {
-      let body = to_sample(sample, &soc, local, &cadence.read().unwrap());
+      let body = to_sample(sample, &soc, local, &control);
       drop(lock);
       write_response(&mut stream, 200, "application/json", &body);
     }
@@ -795,6 +902,164 @@ mod tests {
       let body = value.to_string();
       vec![format!("POST /api/process-demand HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()]
     })
+  }
+
+  fn monitoring_post(
+    shared: &SharedMetrics,
+    cadence: &SharedCadence,
+    value: serde_json::Value,
+  ) -> String {
+    exchange(shared, cadence, |port| {
+      let body = value.to_string();
+      vec![format!("POST /api/monitoring HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()]
+    })
+  }
+
+  #[test]
+  fn monitoring_pause_gates_every_data_and_demand_path_but_retains_controls() {
+    let shared = Arc::new(RwLock::new(None));
+    publish_sample(&shared, Metrics::default(), vec![], 1000, None, super::sample_time());
+    let old = shared.read().unwrap().clone().unwrap();
+    let cadence = Arc::new(RwLock::new(Cadence::new(1000)));
+    let paused = monitoring_post(&shared, &cadence, serde_json::json!({"enabled":false}));
+    assert!(paused.starts_with("HTTP/1.1 200"));
+    let paused: serde_json::Value = serde_json::from_str(body(&paused)).unwrap();
+    assert_eq!(paused["enabled"], false);
+    assert_eq!(paused["state"], "paused");
+    assert_eq!(paused["generation"], 1);
+    assert_eq!(paused["instance"].as_str().unwrap().len(), 16);
+    assert!(shared.read().unwrap().is_none());
+    for path in [
+      "/api/sample",
+      "/json",
+      "/metrics",
+      "/dashboard/",
+      "/api/source",
+      "/api/monitoring",
+      "/missing",
+    ] {
+      let response = exchange(&shared, &cadence, |port| {
+        vec![format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").into_bytes()]
+      });
+      let status = if ["/api/sample", "/json", "/metrics"].contains(&path) {
+        503
+      } else if path == "/missing" {
+        404
+      } else {
+        200
+      };
+      assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{path}: {response}");
+    }
+    assert!(
+      process_post(&shared, &cadence, serde_json::json!({"lease":null,"demand":"details"}))
+        .starts_with("HTTP/1.1 503")
+    );
+    let interval = exchange(&shared, &cadence, |port| {
+      vec![format!("POST /api/interval HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: 25\r\n\r\n{{\"adjustment\":\"increase\"}}").into_bytes()]
+    });
+    assert!(interval.starts_with("HTTP/1.1 503"));
+    assert_eq!(
+      cadence.write().unwrap().leases.demand(Instant::now()),
+      crate::source::ProcessDemand::None
+    );
+    assert!(!cadence.read().unwrap().forward(&shared, old.clone(), 0));
+    let resumed = monitoring_post(&shared, &cadence, serde_json::json!({"enabled":true}));
+    assert!(resumed.contains("reconnecting"));
+    assert!(
+      !cadence.read().unwrap().forward(&shared, old, 0),
+      "a pre-pause forwarding result cannot revive data"
+    );
+    assert!(shared.read().unwrap().is_none());
+    assert_eq!(cadence.read().unwrap().monitoring().generation, 2);
+    let repeated = monitoring_post(&shared, &cadence, serde_json::json!({"enabled":true}));
+    assert!(repeated.contains("\"generation\":2"));
+  }
+
+  #[test]
+  fn monitoring_controls_are_boolean_bounded_and_same_origin() {
+    let shared = Arc::new(RwLock::new(None));
+    let cadence = Arc::new(RwLock::new(Cadence::new(1000)));
+    for value in [
+      serde_json::json!({}),
+      serde_json::json!({"enabled":null}),
+      serde_json::json!({"enabled":"false"}),
+      serde_json::json!({"enabled":0}),
+    ] {
+      assert!(monitoring_post(&shared, &cadence, value).starts_with("HTTP/1.1 400"));
+    }
+    for origin in ["", "Origin: http://foreign.invalid\r\n"] {
+      let response = exchange(&shared, &cadence, |port| {
+        vec![format!("POST /api/monitoring HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{origin}Content-Type: application/json\r\nContent-Length: 17\r\n\r\n{{\"enabled\":false}}").into_bytes()]
+      });
+      assert!(response.starts_with("HTTP/1.1 403"));
+    }
+    assert!(cadence.read().unwrap().monitoring().enabled);
+    assert_eq!(cadence.read().unwrap().monitoring().generation, 0);
+    let instance = cadence.read().unwrap().instance.clone();
+    assert_ne!(Cadence::new(1000).instance, instance, "a new HTTP backend has a new instance");
+    monitoring_post(&shared, &cadence, serde_json::json!({"enabled":false}));
+    monitoring_post(&shared, &cadence, serde_json::json!({"enabled":true}));
+    assert_eq!(
+      cadence.read().unwrap().instance,
+      instance,
+      "pausing never replaces the backend instance"
+    );
+    let oversized = exchange(&shared, &cadence, |port| {
+      vec![format!("POST /api/monitoring HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: 65\r\n\r\n{}", " ".repeat(65)).into_bytes()]
+    });
+    assert!(oversized.is_empty());
+    let remote = exchange(&shared, &cadence, |port| {
+      vec![
+        format!("GET /api/monitoring HTTP/1.1\r\nHost: attacker.invalid:{port}\r\n\r\n")
+          .into_bytes(),
+      ]
+    });
+    assert!(remote.starts_with("HTTP/1.1 403"));
+  }
+
+  #[test]
+  fn monitoring_pause_and_a_blocked_sample_reader_use_one_lock_order() {
+    let shared = Arc::new(RwLock::new(None));
+    publish_sample(&shared, Metrics::default(), vec![], 1000, None, super::sample_time());
+    let cadence = Arc::new(RwLock::new(Cadence::new(1000)));
+    let held = shared.write().unwrap();
+    let (done, received) = mpsc::channel();
+    let reader = {
+      let shared = shared.clone();
+      let cadence = cadence.clone();
+      let done = done.clone();
+      thread::spawn(move || {
+        let response = exchange(&shared, &cadence, |port| {
+          vec![format!("GET /json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").into_bytes()]
+        });
+        done.send(response).unwrap();
+      })
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while cadence.try_write().is_ok() {
+      assert!(
+        Instant::now() < deadline,
+        "the sample reader acquires cadence before waiting on shared"
+      );
+      thread::sleep(Duration::from_millis(2));
+    }
+    let writer = {
+      let shared = shared.clone();
+      let cadence = cadence.clone();
+      thread::spawn(move || {
+        done
+          .send(monitoring_post(&shared, &cadence, serde_json::json!({"enabled":false})))
+          .unwrap();
+      })
+    };
+    drop(held);
+    for _ in 0..2 {
+      assert!(received.recv_timeout(Duration::from_secs(3)).unwrap().starts_with("HTTP/1.1 200"));
+    }
+    reader.join().unwrap();
+    writer.join().unwrap();
+    assert!(!cadence.read().unwrap().monitoring().enabled);
+    assert!(shared.read().unwrap().is_none());
   }
 
   #[test]
@@ -1613,68 +1878,86 @@ mod tests {
   fn interval_post_rejects_cross_origin_rebinding_and_ambiguous_requests() {
     let shared = Arc::new(RwLock::new(None));
     let cadence = Arc::new(RwLock::new(Cadence::new(1000)));
-    for mutation in [
-      "missing-origin",
-      "foreign-origin",
-      "null-origin",
-      "wrong-port",
-      "rebinding-host",
-      "missing-type",
-      "form-type",
-      "duplicate-host",
-      "duplicate-origin",
-      "transfer-encoding",
-      "oversized-body",
-      "truncated-body",
-      "no-length",
-      "bad-body",
-      "get",
-    ] {
-      let response = exchange(&shared, &cadence, |port| {
-        let mut host = format!("127.0.0.1:{port}");
-        let mut origin = format!("Origin: http://{host}\r\n");
-        let mut kind = "Content-Type: application/json\r\n";
-        let mut extra = String::new();
-        let mut payload = r#"{"adjustment":"decrease"}"#.to_string();
-        let mut length = payload.len().to_string();
-        match mutation {
-          "missing-origin" => origin.clear(),
-          "foreign-origin" => origin = "Origin: https://attacker.invalid\r\n".into(),
-          "null-origin" => origin = "Origin: null\r\n".into(),
-          "wrong-port" => host = format!("127.0.0.1:{}", port.saturating_sub(1)),
-          "rebinding-host" => {
-            host = format!("localhost.attacker.invalid:{port}");
-            origin = format!("Origin: http://{host}\r\n");
+    for path in ["/api/interval", "/api/monitoring"] {
+      for mutation in [
+        "missing-origin",
+        "foreign-origin",
+        "null-origin",
+        "wrong-port",
+        "rebinding-host",
+        "missing-type",
+        "form-type",
+        "duplicate-host",
+        "duplicate-origin",
+        "transfer-encoding",
+        "oversized-body",
+        "truncated-body",
+        "no-length",
+        "bad-body",
+        "get",
+      ] {
+        let response = exchange(&shared, &cadence, |port| {
+          let mut host = format!("127.0.0.1:{port}");
+          let mut origin = format!("Origin: http://{host}\r\n");
+          let mut kind = "Content-Type: application/json\r\n";
+          let mut extra = String::new();
+          let mut payload = if path == "/api/interval" {
+            r#"{"adjustment":"decrease"}"#
+          } else {
+            r#"{"enabled":false}"#
           }
-          "missing-type" => kind = "",
-          "form-type" => kind = "Content-Type: text/plain\r\n",
-          "duplicate-host" => extra = format!("Host: {host}\r\n"),
-          "duplicate-origin" => extra = origin.clone(),
-          "transfer-encoding" => extra = "Transfer-Encoding: chunked\r\n".into(),
-          "oversized-body" => length = "65".into(),
-          "truncated-body" => length = "64".into(),
-          "bad-body" => payload = "not-json".into(),
-          _ => {}
+          .to_string();
+          let mut length = payload.len().to_string();
+          match mutation {
+            "missing-origin" => origin.clear(),
+            "foreign-origin" => origin = "Origin: https://attacker.invalid\r\n".into(),
+            "null-origin" => origin = "Origin: null\r\n".into(),
+            "wrong-port" => host = format!("127.0.0.1:{}", port.saturating_sub(1)),
+            "rebinding-host" => {
+              host = format!("localhost.attacker.invalid:{port}");
+              origin = format!("Origin: http://{host}\r\n");
+            }
+            "missing-type" => kind = "",
+            "form-type" => kind = "Content-Type: text/plain\r\n",
+            "duplicate-host" => extra = format!("Host: {host}\r\n"),
+            "duplicate-origin" => extra = origin.clone(),
+            "transfer-encoding" => extra = "Transfer-Encoding: chunked\r\n".into(),
+            "oversized-body" => length = "65".into(),
+            "truncated-body" => length = "64".into(),
+            "bad-body" => payload = "not-json".into(),
+            _ => {}
+          }
+          if mutation == "bad-body" {
+            length = payload.len().to_string();
+          }
+          let length = if mutation == "no-length" {
+            String::new()
+          } else {
+            format!("Content-Length: {length}\r\n")
+          };
+          let method = if mutation == "get" { "GET" } else { "POST" };
+          vec![format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n{origin}{kind}{extra}{length}\r\n{payload}").into_bytes()]
+        });
+        match mutation {
+          "duplicate-host" | "duplicate-origin" | "transfer-encoding" | "oversized-body"
+          | "truncated-body" | "no-length" => {
+            assert!(response.is_empty(), "{mutation}: {response}")
+          }
+          "bad-body" => assert!(response.starts_with("HTTP/1.1 400"), "{response}"),
+          "get" => assert!(
+            response.starts_with(if path == "/api/monitoring" {
+              "HTTP/1.1 200"
+            } else {
+              "HTTP/1.1 404"
+            }),
+            "{response}"
+          ),
+          _ => assert!(response.starts_with("HTTP/1.1 403"), "{mutation}: {response}"),
         }
-        if mutation == "bad-body" {
-          length = payload.len().to_string();
-        }
-        let length = if mutation == "no-length" {
-          String::new()
-        } else {
-          format!("Content-Length: {length}\r\n")
-        };
-        let method = if mutation == "get" { "GET" } else { "POST" };
-        vec![format!("{method} /api/interval HTTP/1.1\r\nHost: {host}\r\n{origin}{kind}{extra}{length}\r\n{payload}").into_bytes()]
-      });
-      match mutation {
-        "duplicate-host" | "duplicate-origin" | "transfer-encoding" | "oversized-body"
-        | "truncated-body" | "no-length" => assert!(response.is_empty(), "{mutation}: {response}"),
-        "bad-body" => assert!(response.starts_with("HTTP/1.1 400"), "{response}"),
-        "get" => assert!(response.starts_with("HTTP/1.1 503"), "{response}"),
-        _ => assert!(response.starts_with("HTTP/1.1 403"), "{mutation}: {response}"),
+        assert_eq!(cadence.read().unwrap().value()["requested_ms"], 1000, "{mutation}");
+        assert!(cadence.read().unwrap().monitoring().enabled);
+        assert_eq!(cadence.read().unwrap().monitoring().generation, 0);
       }
-      assert_eq!(cadence.read().unwrap().value()["requested_ms"], 1000, "{mutation}");
     }
   }
 

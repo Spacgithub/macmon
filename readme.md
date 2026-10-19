@@ -426,6 +426,24 @@ macmon web -h       # explain web controls and default behavior
 macmon web stop -h  # help for an individual action (--help also works)
 ```
 
+The dashboard's **Web monitoring** switch pauses this backend's sampling subscription while
+keeping its lightweight HTTP control page available. **Turn on** reconnects and waits for a
+fresh sample. All tabs for that backend share the switch; a separate Terminal or other Web
+backend continues using the shared sampler. With no other consumer, the collector and its
+application-network, battery and Bluetooth workers stop after the idle grace. Paused values
+are marked as retained, animation stops, and `/api/sample`, `/json` and `/metrics` return 503.
+The switch starts enabled when the HTTP backend starts and does not change login settings.
+Use `macmon web stop` for a full service stop that also releases the HTTP port; restart it
+with `macmon web start` or `macmon web`.
+
+Local control clients can `GET /api/monitoring` or send same-origin JSON
+`POST /api/monitoring` with `{"enabled":false}` or `{"enabled":true}`. Replies contain
+`enabled`, `state` (`running`, `paused` or `reconnecting`), `generation` and an opaque
+backend `instance`. Generations increase only when enabled changes and are scoped to that
+instance; repeated absolute requests are idempotent. Controls require the same loopback
+peer, Host and Origin checks as sampling-interval controls. Process-demand and interval
+mutations return 503 while paused. Successful legacy data schemas remain unchanged.
+
 Repeated starts reuse the running service. Closing a browser tab keeps monitoring active;
 use `macmon web stop` to end it. An existing tab stays open and reports OFFLINE after stopping.
 These commands use the same controller as the desktop entry below, bundled into the binary

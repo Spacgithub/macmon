@@ -21,6 +21,8 @@ function loadDetails() {
   return Object.fromEntries(Object.keys(panelNames).map((name) => [name, saved?.[name] === true]));
 }
 const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], disks: new Map(), diskHistory: new Map(), diskSelected: null, cpuTierRows: new Map(), cpuCoreRows: new Map(), networkRows: new Map(), networkStatus: "Waiting for rates", frame: 0, last: null, next: 0, fanFps: loadFanFps(), cadence: null, changing: false, intervalError: false, details: loadDetails() };
+const monitoring = { mode: "probing", value: null, epoch: 0, ready: -1, changing: false, uncertain: false, offline: false, timer: 0, request: null, pending: null };
+function telemetryAllowed() { return ["legacy", "restricted"].includes(monitoring.mode) || monitoring.mode === "managed" && monitoring.value?.enabled && !monitoring.changing && !monitoring.uncertain; }
 const processViewKey = "macmon.process-view.v1";
 const bluetoothRows = new Map();
 function loadProcessView() {
@@ -37,16 +39,20 @@ function localProcessPage() {
 const processLease = { mode: localProcessPage() ? "probing" : "restricted", token: null, expires: 0, ttl: 15000, sent: null, wanted: null, pending: null };
 function wantedProcessDemand() { return document.hidden ? "none" : state.details.process && document.hasFocus() ? "details" : "summary"; }
 function syncProcessDemand() {
+  if (!telemetryAllowed()) return Promise.resolve();
   processLease.wanted = wantedProcessDemand();
   if (["legacy", "restricted"].includes(processLease.mode)) return Promise.resolve();
-  if (processLease.pending) return processLease.pending;
+  if (processLease.pending) return processLease.pending.then(() => telemetryAllowed() ? syncProcessDemand() : undefined);
   processLease.pending = (async () => {
     while (true) {
+      if (!telemetryAllowed()) return;
       const demand = processLease.wanted, lease = performance.now() < processLease.expires ? processLease.token : null;
       if (lease && processLease.sent === demand) return;
-      const request = new AbortController(), started = performance.now(), timeout = setTimeout(() => request.abort(), 2500);
+      const request = new AbortController(), started = performance.now(), epoch = monitoring.epoch, timeout = setTimeout(() => request.abort(), 2500);
+      processLease.request = request;
       try {
         const response = await fetch("/api/process-demand", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ lease, demand }), signal: request.signal });
+        if (!telemetryAllowed() || epoch !== monitoring.epoch || request.signal.aborted) return;
         if ([403, 404].includes(response.status)) {
           processLease.mode = response.status === 404 ? "legacy" : "restricted";
           processLease.token = null; return;
@@ -54,12 +60,13 @@ function syncProcessDemand() {
         if (response.status === 410 && lease) { processLease.token = null; processLease.expires = 0; continue; }
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const result = await response.json();
+        if (!telemetryAllowed() || epoch !== monitoring.epoch || request.signal.aborted) return;
         if (typeof result?.lease !== "string" || !/^[\da-f]{32}$/i.test(result.lease) || !Number.isSafeInteger(result.ttl_ms) || result.ttl_ms < 1 || result.ttl_ms > 15000
           || started + result.ttl_ms <= performance.now()) throw new Error("Invalid process lease");
         Object.assign(processLease, { mode: "managed", token: result.lease, ttl: result.ttl_ms, expires: started + result.ttl_ms, sent: demand });
         if (processLease.sent === processLease.wanted) return;
       } catch (error) { processLease.sent = null; throw error; }
-      finally { clearTimeout(timeout); }
+      finally { clearTimeout(timeout); if (processLease.request === request) processLease.request = null; }
     }
   })().finally(() => { processLease.pending = null; });
   return processLease.pending;
@@ -100,6 +107,88 @@ const reduced = matchMedia("(prefers-reduced-motion: reduce)");
 motion.checked = !reduced.matches;
 $("fan-fps").value = String(state.fanFps);
 let pollTimer, staleTimer, controller;
+function invalidateMonitoring() {
+  monitoring.epoch++; monitoring.ready = -1;
+  controller?.abort("monitoring"); processLease.request?.abort("monitoring");
+  state.intervalRequest?.abort("monitoring"); state.changing = false; state.intervalError = false;
+  processLease.token = null; processLease.expires = 0; processLease.sent = null;
+  clearTimeout(pollTimer); clearTimeout(staleTimer); resetFrameClock();
+}
+function validMonitoring(value) {
+  return typeof value?.enabled === "boolean" && Number.isSafeInteger(value.generation) && value.generation >= 0
+    && typeof value.instance === "string" && /^[\da-f]{16}$/.test(value.instance)
+    && (value.enabled ? ["running", "reconnecting"].includes(value.state) : value.state === "paused");
+}
+function monitoringFeedback() {
+  const button = $("monitoring-toggle"), value = monitoring.value;
+  button.disabled = monitoring.mode !== "managed" || monitoring.changing || monitoring.uncertain;
+  button.setAttribute("aria-pressed", String(value?.enabled === true));
+  button.textContent = value?.enabled === false ? "Turn on" : "Turn off";
+  put("monitoring-feedback", monitoring.changing ? "Applying Web monitoring change…" : monitoring.offline ? "Web backend offline / state not confirmed; checking server" : monitoring.uncertain ? "Change not confirmed; checking server state"
+    : monitoring.mode === "legacy" ? "Monitoring control unavailable on this server" : monitoring.mode === "restricted" ? "Web monitoring control requires a local page"
+      : value?.enabled === false ? "Web monitoring paused / retained values; other monitors continue"
+        : value?.enabled && monitoring.ready !== monitoring.epoch ? "Web monitoring reconnecting; waiting for a fresh sample" : value ? "Web monitoring enabled / Terminal shares the sampler" : "Checking Web monitoring state");
+  refreshCadence();
+}
+function acceptMonitoring(value) {
+  if (!validMonitoring(value)) throw new Error("Invalid monitoring state");
+  const sameInstance = monitoring.value?.instance === value.instance;
+  if (sameInstance && value.generation < monitoring.value.generation) return false;
+  if (sameInstance && value.generation === monitoring.value.generation && value.enabled !== monitoring.value.enabled) throw new Error("Monitoring generation did not advance");
+  const changed = !sameInstance || value.generation !== monitoring.value.generation || value.enabled !== monitoring.value.enabled;
+  const resume = changed || !telemetryAllowed();
+  if (changed) invalidateMonitoring();
+  monitoring.mode = "managed"; monitoring.value = value; monitoring.uncertain = false; monitoring.offline = false;
+  if (value.enabled && monitoring.ready !== monitoring.epoch) state.waiting = true;
+  monitoringFeedback(); settle();
+  if (resume && telemetryAllowed()) { state.urgent = true; clearTimeout(pollTimer); poll(); }
+  return true;
+}
+function checkMonitoring() {
+  if (document.hidden || monitoring.pending || monitoring.changing || ["legacy", "restricted"].includes(monitoring.mode)) return monitoring.pending || Promise.resolve();
+  clearTimeout(monitoring.timer);
+  const request = new AbortController(), epoch = monitoring.epoch, timeout = setTimeout(() => request.abort(), 2500);
+  monitoring.request = request;
+  monitoring.pending = (async () => {
+    try {
+      const response = await fetch("/api/monitoring", { cache: "no-store", signal: request.signal });
+      if (epoch !== monitoring.epoch || request.signal.aborted) return;
+      if ([403, 404].includes(response.status)) {
+        monitoring.mode = response.status === 404 ? "legacy" : "restricted";
+        monitoring.uncertain = false; monitoring.offline = false; monitoringFeedback(); poll(); return;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const value = await response.json();
+      if (epoch === monitoring.epoch && !request.signal.aborted) acceptMonitoring(value);
+    } catch {
+      if (epoch === monitoring.epoch && request.signal.reason !== "hidden" && request.signal.reason !== "monitoring") {
+        monitoring.uncertain = true; monitoring.offline = true; invalidateMonitoring(); monitoringFeedback(); settle();
+      }
+    } finally {
+      clearTimeout(timeout); monitoring.request = null; monitoring.pending = null;
+      if (!document.hidden && !["legacy", "restricted"].includes(monitoring.mode)) monitoring.timer = setTimeout(checkMonitoring, request.signal.reason === "hidden" ? 0 : 5000);
+    }
+  })();
+  return monitoring.pending;
+}
+async function changeMonitoring() {
+  if (monitoring.mode !== "managed" || monitoring.changing || monitoring.uncertain) return;
+  const enabled = !monitoring.value.enabled;
+  monitoring.changing = true; monitoring.request?.abort("monitoring"); clearTimeout(monitoring.timer);
+  invalidateMonitoring(); monitoringFeedback(); settle();
+  const request = new AbortController(), epoch = monitoring.epoch, timeout = setTimeout(() => request.abort(), 2500);
+  try {
+    const response = await fetch("/api/monitoring", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }), signal: request.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const value = await response.json();
+    if (epoch !== monitoring.epoch || request.signal.aborted || !validMonitoring(value) || value.enabled !== enabled || !acceptMonitoring(value)) throw new Error("Monitoring change not confirmed");
+  } catch { monitoring.uncertain = true; }
+  finally {
+    clearTimeout(timeout); monitoring.changing = false; monitoringFeedback(); settle();
+    if (telemetryAllowed()) { state.urgent = true; poll(); }
+    checkMonitoring();
+  }
+}
 function bytes(value) {
   if (!finite(value)) return unknown;
   const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
@@ -369,33 +458,34 @@ function refreshCadence(value = state.cadence) {
   put("interval-value", `${number(value.effective_ms, 0)} ms`);
   put("interval-feedback", state.changing ? "Applying…" : state.intervalError ? "Change not confirmed"
     : value.pending ? `Pending ${number(value.requested_ms, 0)} ms; finishing current sample` : "Service sampling");
-  $("interval-down").disabled = state.changing || value.requested_ms === 250;
-  $("interval-up").disabled = state.changing || value.requested_ms === 10000;
+  $("interval-down").disabled = !telemetryAllowed() || state.changing || value.requested_ms === 250;
+  $("interval-up").disabled = !telemetryAllowed() || state.changing || value.requested_ms === 10000;
   put("cadence-footer", `Local metrics / 60-sample history / ${number(value.effective_ms, 0)} ms sampling`);
 }
 async function adjustInterval(adjustment) {
-  if (state.changing || !state.cadence) return;
+  if (!telemetryAllowed() || state.changing || !state.cadence) return;
   state.changing = true;
   state.intervalError = false;
   refreshCadence();
-  const request = new AbortController(), timeout = setTimeout(() => request.abort(), 2500);
+  const request = new AbortController(), epoch = monitoring.epoch, timeout = setTimeout(() => request.abort(), 2500);
+  state.intervalRequest = request;
   try {
     const response = await fetch("/api/interval", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ adjustment }), signal: request.signal });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    refreshCadence(await response.json());
+    const value = await response.json();
+    if (epoch === monitoring.epoch && !request.signal.aborted && telemetryAllowed()) refreshCadence(value);
   } catch {
-    state.intervalError = true;
+    if (epoch === monitoring.epoch) state.intervalError = true;
   } finally {
     clearTimeout(timeout);
-    state.changing = false;
-    refreshCadence();
-    clearTimeout(pollTimer);
-    state.urgent = true;
-    poll();
+    if (state.intervalRequest === request) {
+      state.intervalRequest = null; state.changing = false; refreshCadence();
+      if (telemetryAllowed()) { clearTimeout(pollTimer); state.urgent = true; poll(); }
+    }
   }
 }
-function live() { return state.online && !state.waiting && state.sample && age() <= limit(); }
+function live() { return telemetryAllowed() && (monitoring.mode !== "managed" || monitoring.ready === monitoring.epoch) && state.online && !state.waiting && state.sample && age() <= limit(); }
 function moving() { return state.details.cooling && live() && !document.hidden && motion.checked && [...state.fans.values()].some((fan) => fan.rpm > 0); }
 function applyDetails() {
   for (const [name, label] of Object.entries(panelNames)) {
@@ -424,19 +514,21 @@ function changeDetails(names, value) {
 }
 function settle() {
   clearTimeout(staleTimer);
-  const status = state.waiting ? "waiting" : state.online === null ? "connecting" : !state.online ? "offline" : live() ? "live" : "stale";
+  const frozen = !telemetryAllowed(), paused = monitoring.mode === "managed" && monitoring.value?.enabled === false && !monitoring.uncertain && !monitoring.changing;
+  const status = paused ? "paused" : frozen ? monitoring.offline ? "offline" : "connecting" : state.waiting ? "waiting" : state.online === null ? "connecting" : !state.online ? "offline" : live() ? "live" : "stale";
   $("status").dataset.state = status;
   put("status", status.toUpperCase());
   put("network-state", `${state.sample && !live() ? "Retained / " : ""}${state.networkStatus}`);
   const procAge = processAge(), collection = procView.collection, retained = collection && ["disabled", "warming", "failed"].includes(collection.state);
-  const processState = state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : retained ? `${collection.state === "disabled" ? "PAUSED" : collection.state.toUpperCase()} / retained / ` : procAge > processLimit() ? "STALE / " : "";
+  const frozenLabel = paused ? "PAUSED" : monitoring.offline ? "OFFLINE" : "WAITING";
+  const processState = frozen ? `${frozenLabel} / retained / ` : state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : retained ? `${collection.state === "disabled" ? "PAUSED" : collection.state.toUpperCase()} / retained / ` : procAge > processLimit() ? "STALE / " : "";
   const cadence = collection ? ` / ${collection.demand}${collection.interval_ms ? ` ${number(collection.interval_ms / 1000)}s` : ""}` : "";
-  const unavailable = state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : "";
+  const unavailable = frozen ? `${frozenLabel} / retained / ` : state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : "";
   put("process-status", Array.isArray(procView.sample?.processes) ? `${processState}${finite(procAge) ? `${Math.floor(procAge / 1000)}s old` : "Age unavailable"}${cadence} / CPU 100% = one core` : collection ? `${unavailable}${collection.state.toUpperCase()} / Waiting for a process snapshot${cadence}` : "Unavailable for this request");
   applicationNetwork(false);
   const diskDelay = refreshDiskHealth(), batteryDelay = battery(state.sample);
   bluetoothStatus();
-  if (!document.hidden) {
+  if (!document.hidden && !frozen) {
     const processDelay = Array.isArray(procView.sample?.processes) && finite(procAge) ? Math.min(1000 - procAge % 1000, !retained && procAge <= processLimit() ? Math.max(1, processLimit() - procAge + 1) : Infinity) : Infinity;
     const delay = Math.min(live() ? Math.max(1, limit() - age() + 1) : Infinity, diskDelay, processDelay, appNetwork.sample ? 1000 : Infinity, batteryDelay, state.sample?.bluetooth?.age_ms != null ? 1000 : Infinity);
     if (Number.isFinite(delay)) staleTimer = setTimeout(settle, delay);
@@ -941,20 +1033,22 @@ function update(sample) {
   drawCharts();
 }
 async function poll() {
-  if (document.hidden || state.busy) return;
+  if (document.hidden || state.busy || !telemetryAllowed()) return;
+  clearTimeout(pollTimer);
   state.busy = true;
   state.urgent = false;
-  const started = performance.now(), request = new AbortController();
+  const started = performance.now(), request = new AbortController(), epoch = monitoring.epoch;
   controller = request;
   let timeout;
   try {
     let response;
     for (let attempt = 0; attempt < 2; attempt++) {
       await syncProcessDemand();
-      if (document.hidden || request.signal.aborted) return;
+      if (document.hidden || request.signal.aborted || epoch !== monitoring.epoch || !telemetryAllowed()) return;
       clearTimeout(timeout); timeout = setTimeout(() => request.abort(), 2500);
       const headers = processLease.mode === "legacy" ? {} : { "X-Macmon-Process-Lease": processLease.token || "none" };
       response = await fetch("/api/sample", { cache: "no-store", headers, signal: request.signal });
+      if (request.signal.aborted || epoch !== monitoring.epoch || !telemetryAllowed()) return;
       if (response.status === 410 && processLease.mode === "managed") { processLease.token = null; processLease.expires = 0; continue; }
       if (processLease.mode === "managed" && [200, 503].includes(response.status)) processLease.expires = started + processLease.ttl;
       break;
@@ -967,11 +1061,14 @@ async function poll() {
     }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const sample = await response.json();
+    if (request.signal.aborted || epoch !== monitoring.epoch || !telemetryAllowed()) return;
     if (!Number.isSafeInteger(sample.sequence) || sample.sequence < 0 || !finite(sample.age_ms)
       || !finite(sample.interval_ms) || !sample.interval_ms || !sample.metrics
       || typeof sample.metrics !== "object" || Array.isArray(sample.metrics)
       || !Number.isFinite(Date.parse(sample.sampled_at))) throw new Error("Invalid sample");
     state.sample = sample;
+    monitoring.ready = epoch;
+    monitoringFeedback();
     if (sample.cadence) refreshCadence(sample.cadence);
     // Count the full request duration as a conservative bound for response transit time.
     state.received = started;
@@ -986,18 +1083,19 @@ async function poll() {
     }
     settle();
   } catch (error) {
-    if (request.signal.reason !== "hidden") {
+    if (!["hidden", "monitoring"].includes(request.signal.reason) && epoch === monitoring.epoch) {
       state.waiting = false;
       state.online = false;
       settle();
     }
   } finally {
     clearTimeout(timeout);
-    controller = null;
+    if (controller === request) controller = null;
     state.busy = false;
     const processDelay = processLease.mode === "managed" ? { none: Infinity, summary: 5000, details: 1000 }[processLease.wanted] : Infinity;
     const delay = Math.min(state.cadence ? Math.min(state.cadence.effective_ms, state.cadence.pending ? 1000 : 10000) : 1000, processDelay, appNetwork.sample ? 2000 : Infinity);
-    if (!document.hidden) pollTimer = setTimeout(poll, state.urgent ? 0 : Math.max(0, Math.max(250, delay) - (performance.now() - started)));
+    clearTimeout(pollTimer);
+    if (!document.hidden && telemetryAllowed()) pollTimer = setTimeout(poll, state.urgent ? 0 : Math.max(0, Math.max(250, delay) - (performance.now() - started)));
   }
 }
 motion.addEventListener("change", settle);
@@ -1025,15 +1123,19 @@ $("collapse-all").addEventListener("click", () => changeDetails(Object.keys(pane
 
 $("interval-down").addEventListener("click", () => adjustInterval("decrease"));
 $("interval-up").addEventListener("click", () => adjustInterval("increase"));
+$("monitoring-toggle").addEventListener("click", changeMonitoring);
 reduced.addEventListener("change", () => { if (reduced.matches) { motion.checked = false; settle(); } });
 document.addEventListener("visibilitychange", () => {
   clearTimeout(pollTimer);
-  requestProcessDemand();
-  if (document.hidden) controller?.abort("hidden"); else { state.urgent = true; poll(); }
+  clearTimeout(monitoring.timer);
+  if (document.hidden) { requestProcessDemand(); controller?.abort("hidden"); monitoring.request?.abort("hidden"); }
+  else if (["legacy", "restricted"].includes(monitoring.mode)) { state.urgent = true; poll(); }
+  else { monitoring.uncertain = true; invalidateMonitoring(); monitoringFeedback(); checkMonitoring(); }
   settle();
 });
 window.addEventListener("focus", requestProcessDemand);
 window.addEventListener("blur", requestProcessDemand);
 new ResizeObserver(drawCharts).observe($("dashboard"));
 applyDetails();
-poll();
+monitoringFeedback();
+checkMonitoring();
