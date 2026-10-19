@@ -82,6 +82,25 @@ Charging, discharging, UPS, absent-battery and malformed native-property cases u
 fixtures. The validation did not change charging policy, disconnect power, or write
 hardware settings. Other hardware/macOS combinations remain unmeasured.
 
+## Bluetooth and combined-client coverage
+
+The native report contained two connected peripherals: a keyboard without a reported
+battery, and a M585/M590 mouse with 100% main charge. Missing batteries remain unavailable.
+See [Bluetooth source evidence and coverage](bluetooth-monitoring.md) for the bounded
+read-only reporter, supported component keys, cache semantics and privacy boundary.
+Earbud left/right/case charge, controller-off, disconnect/reconnect and malformed reports
+use fixtures; no actual radio, pairing or peripheral state was changed.
+
+The complete stack passed private two-backend/single-owner checks, a released older
+Terminal joining the new owner, remote redaction of application/device identities,
+legacy output compatibility and complete owner/worker retirement. A real-data,
+settings-free PTY additionally exercised application sorting/member expansion,
+battery summary/details, Bluetooth access from Power and Network, 28×12 to 160×48
+resizing and exact terminal-mode restoration. The browser preview passed independent
+member toggles, sorting, all-panel expansion/collapse and both narrow and desktop layouts
+with no console warnings/errors. Existing disk, temperature, memory and process panels
+continued to receive data. Production services and saved preferences were preserved.
+
 ## Matched resource results
 
 Values are medians of three 30-second round means; parentheses show the range.
@@ -93,11 +112,13 @@ for their Terminal and Web consumers, and retired their test processes afterward
 | --- | --- | ---: | ---: |
 | Application network | Main `5c2fca6` | 2.59 (2.50–2.62) | 4.08 (3.90–4.12) |
 | Battery | Application-network stack | 3.85 (3.79–4.09) | 3.68 (3.48–3.98) |
+| Bluetooth | Application-network + battery stack | 3.85 (3.83–4.10) | 4.13 (4.02–4.40) |
 
 | Added feature | RSS before (MiB) | RSS after (MiB) | Footprint before (MiB) | Footprint after (MiB) |
 | --- | ---: | ---: | ---: | ---: |
 | Application network | 90.6 (80.2–95.5) | 104.8 (87.0–111.6) | 59.5 (56.9–59.6) | 59.6 (51.1–60.1) |
 | Battery | 97.1 (85.3–104.3) | 98.2 (86.5–103.6) | 57.5 (52.2–59.7) | 59.6 (59.4–59.7) |
+| Bluetooth | 96.9 (87.5–101.5) | 99.8 (89.8–103.9) | 61.7 (61.4–61.7) | 61.2 (59.1–61.3) |
 
 Application monitoring added 1.49 percentage points of one core and 14.3 MiB
 sampled RSS at the medians. Footprint ranges overlap; these runs do not establish
@@ -107,3 +128,17 @@ The battery comparison retained fresh native readings in every measured window.
 Its CPU, RSS and footprint ranges overlap their reference ranges; this sample does
 not establish a resource saving or a meaningful CPU increase. Compare each row only
 with its paired reference, rather than adding medians from different runs.
+
+Bluetooth added 0.29 percentage points of one core and 2.9 MiB sampled RSS at the
+medians. These small differences are not a general performance guarantee; three
+rounds also do not establish a physical-memory saving. Its native reports stayed
+fresh, with the 30-second reporter and reaped child CPU included.
+
+An initial Bluetooth comparison was discarded when its reference stack's original
+`nettop` PID disappeared while the collector and consumers stayed alive. The native
+error and any replacement child's executable were not captured, so the cause is
+unknown. A complete rerun passed all three fixed-lifetime/freshness windows; no
+required PID was substituted and no part of the failed window entered the results.
+Acquisition failures invalidate rate baselines and omit uncertain traffic until
+fresh verified observations resume; stable collector IDs alone do not prove
+continuous network observation.

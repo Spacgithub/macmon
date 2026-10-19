@@ -246,14 +246,14 @@ what we need.
 - [x] **38. Monitor traffic by application.** Attribute rootless network readings to
       confirmed application/helper groups, with session totals, expandable PID details
       and sorting in Terminal/Web while retaining per-interface monitoring.
-      Plan: [docs/plans/20261018-app-network-battery-bluetooth.md](plans/20261018-app-network-battery-bluetooth.md).
+      Plan: [docs/plans/completed/20261018-app-network-battery-bluetooth.md](plans/completed/20261018-app-network-battery-bluetooth.md).
 
 - [x] **39. Monitor the battery.** Show source-supported charge, power source, charging
       state, health, cycles and electrical readings through shared cached acquisition,
       with compact Terminal/Web summaries and manually expanded details.
-      Plan: [docs/plans/20261018-app-network-battery-bluetooth.md](plans/20261018-app-network-battery-bluetooth.md).
+      Plan: [docs/plans/completed/20261018-app-network-battery-bluetooth.md](plans/completed/20261018-app-network-battery-bluetooth.md).
 
-- [ ] **40. Monitor connected Bluetooth devices.** Show device type and available
+- [x] **40. Monitor connected Bluetooth devices.** Show device type and available
       battery components with explicit coverage and freshness, local-only identities
       and independently accessible Terminal/Web details.
-      Plan: [docs/plans/20261018-app-network-battery-bluetooth.md](plans/20261018-app-network-battery-bluetooth.md).
+      Plan: [docs/plans/completed/20261018-app-network-battery-bluetooth.md](plans/completed/20261018-app-network-battery-bluetooth.md).
