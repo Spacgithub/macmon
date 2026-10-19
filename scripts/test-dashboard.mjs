@@ -1965,4 +1965,38 @@ await check('malformed Bluetooth schema never guesses zero charge or repeats dup
   }
 });
 
+await check('Bluetooth device text accepts Unicode scalar limits without hiding other connected devices', async () => {
+  for (const [name, kind] of [
+    ['a'.repeat(120) + '🎧'.repeat(21), 'Headphones'],
+    ['🎧'.repeat(160), '🔊'.repeat(64)],
+    ['e\u0301'.repeat(80), '耳机'.repeat(32)],
+  ]) {
+    const h = boot(), value = bluetoothFixture();
+    Object.assign(value.devices[0], { name, kind });
+    await h.answer(sample({ bluetooth: value })); await h.click('bluetooth-toggle');
+    assert.match(h.text('bluetooth-summary'), /2 connected \/ 1 with battery/);
+    const rows = h.elements.get('bluetooth-rows').children;
+    assert.equal(rows.length, 2); assert.equal(rows[0].querySelector('.bluetooth-name').textContent, name);
+    assert.equal(rows[0].querySelector('.bluetooth-kind').textContent, kind);
+    assert.equal(rows[1].querySelector('.bluetooth-name').textContent, 'Keyboard');
+    assert.match(rows[0].querySelector('.bluetooth-batteries').textContent, /case: 0%/);
+  }
+});
+
+await check('Bluetooth rejects overlong or malformed scalar text while keeping disk validation unchanged', async () => {
+  for (const [field, invalid] of [
+    ['name', '🎧'.repeat(161)], ['kind', '🔊'.repeat(65)],
+    ['name', 'a'.repeat(161)], ['kind', 'a'.repeat(65)],
+    ['name', 'device\u0000name'], ['kind', 'type\u001b[31m'],
+    ['name', 'device\ud800name'], ['name', 'device\udfffname'], ['kind', '\ud800'],
+    ['name', ' \t '],
+  ]) {
+    const h = boot(), value = bluetoothFixture(); value.devices[0][field] = invalid;
+    await h.answer(sample({ bluetooth: value }));
+    assert.equal(h.text('bluetooth-summary'), 'Unavailable');
+    assert.equal(h.elements.get('bluetooth-rows').children.length, 0);
+  }
+  const h = boot(); assert.equal(h.inspect(`diskText("🎧".repeat(81))`), null);
+});
+
 console.log(`${tests.length} dashboard checks passed.`);

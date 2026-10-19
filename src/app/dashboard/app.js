@@ -873,9 +873,14 @@ function bluetoothStatus() {
 }
 function validBluetooth(value) {
   if (![true, false].includes(value?.controller) || !finite(value.age_ms) || !Array.isArray(value.devices) || value.devices.length > 512) return false;
+  const text = (value, maximum) => {
+    if (!diskText(value, maximum * 2)) return false;
+    const scalars = [...value];
+    return scalars.length <= maximum && scalars.every((scalar) => { const point = scalar.codePointAt(0); return point < 0xd800 || point > 0xdfff; });
+  };
   const seen = new Set();
   return value.devices.every((device) => {
-    if (typeof device?.id !== "string" || !/^bt-[\da-f]{16}$/.test(device.id) || seen.has(device.id) || !diskText(device.name) || !diskText(device.kind, 64) || !Array.isArray(device.batteries) || device.batteries.length > 4) return false;
+    if (typeof device?.id !== "string" || !/^bt-[\da-f]{16}$/.test(device.id) || seen.has(device.id) || !text(device.name, 160) || !text(device.kind, 64) || !Array.isArray(device.batteries) || device.batteries.length > 4) return false;
     seen.add(device.id); const components = new Set();
     return device.batteries.every((battery) => {
       if (!["main", "left", "right", "case"].includes(battery?.component) || components.has(battery.component) || !Number.isInteger(battery.percent) || battery.percent < 0 || battery.percent > 100) return false;
