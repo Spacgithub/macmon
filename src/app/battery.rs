@@ -349,15 +349,26 @@ fn read_sources() -> Snapshot {
       return Snapshot::default();
     }
     let dict = unsafe { Dictionary::wrap_under_get_rule(raw) };
-    if string(&dict, "Type").as_deref() == Some("InternalBattery") {
-      match boolean(&dict, "Is Present") {
-        Some(true) => internal.push(parse(&dict, providing)),
-        Some(false) => {}
-        None => return Snapshot::default(),
-      }
+    match description(&dict, providing) {
+      Ok(Some(snapshot)) => internal.push(snapshot),
+      Ok(None) => {}
+      Err(()) => return Snapshot::default(),
     }
   }
   select(internal, providing)
+}
+fn description(dict: &Dictionary, providing: PowerSource) -> Result<Option<Snapshot>, ()> {
+  // IOPSKeys.h requires Type and defines only InternalBattery/UPS for this source list.
+  // A broken or unfamiliar description does not establish that an internal battery is absent.
+  match string(dict, "Type").as_deref() {
+    Some("InternalBattery") => match boolean(dict, "Is Present") {
+      Some(true) => Ok(Some(parse(dict, providing))),
+      Some(false) => Ok(None),
+      None => Err(()),
+    },
+    Some("UPS") => Ok(None),
+    _ => Err(()),
+  }
 }
 fn select(mut internal: Vec<Snapshot>, providing: PowerSource) -> Snapshot {
   match internal.len() {
@@ -517,6 +528,20 @@ mod tests {
     assert!(
       data.as_object().unwrap().keys().all(|key| !["name", "serial", "id"].contains(&key.as_str()))
     );
+  }
+  #[test]
+  fn malformed_source_descriptions_do_not_establish_battery_absence() {
+    for values in [vec![], vec![("Type", n(1))], vec![("Type", s("Unknown"))]] {
+      assert!(description(&dict(&values), PowerSource::Ac).is_err());
+    }
+    let internal = |present| dict(&[("Type", s("InternalBattery")), ("Is Present", present)]);
+    assert!(description(&internal(n(1)), PowerSource::Ac).is_err());
+    assert!(description(&internal(b(false)), PowerSource::Ac).unwrap().is_none());
+    assert_eq!(
+      description(&internal(b(true)), PowerSource::Ac).unwrap().unwrap().state,
+      State::Available
+    );
+    assert!(description(&dict(&[("Type", s("UPS"))]), PowerSource::Ups).unwrap().is_none());
   }
   #[test]
   fn notifications_are_coalesced_fallback_is_bounded_and_age_increases() {

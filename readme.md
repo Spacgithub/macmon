@@ -552,6 +552,8 @@ coalesces changes to at most once per second, and refreshes cached state every 3
 IORegistry cycle/electrical data refreshes every 30 seconds or on a power-state change;
 this work does not block system sampling. `state` distinguishes `available`, `absent`
 (no internal battery) and `unavailable`. Multiple ambiguous internal packs are unavailable.
+Malformed or unrecognized required source types are unavailable, rather than evidence of
+no internal battery. Compact and wide Terminal summaries retain the same state/age labels.
 `age_ms` and `registry_age_ms` mean acquisition age at the containing sample, not the
 hardware's update time; clients add sample age and label readings over 60 seconds stale.
 Names, serials and device identifiers are never emitted.

@@ -877,7 +877,8 @@ impl App {
     if let Some(battery) = &self.battery
       && inner.height >= 7
     {
-      let label = battery.percent.map_or_else(|| "—".into(), |value| format!("{value:.0}%"));
+      let brief = super::battery::brief(battery, self.disk_age());
+      let label = brief.strip_prefix("Battery ").unwrap_or(&brief).to_owned();
       rows.push(Row::new([
         Line::from(dim("Battery · 3/f")),
         Line::from(text(label)).right_aligned(),

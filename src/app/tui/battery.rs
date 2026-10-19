@@ -9,7 +9,9 @@ fn decimal(value: Option<f64>, unit: &str) -> String {
   value.filter(|v| v.is_finite()).map_or_else(|| "Unavailable".into(), |v| format!("{v:.2} {unit}"))
 }
 pub(super) fn brief(battery: &Snapshot, age: u64) -> String {
-  if battery.age_ms.is_none_or(|cached| cached.saturating_add(age) > STALE_MS) {
+  if battery.state == State::Unavailable {
+    "Battery N/A".into()
+  } else if battery.age_ms.is_none_or(|cached| cached.saturating_add(age) > STALE_MS) {
     "Battery stale".into()
   } else {
     match battery.state {

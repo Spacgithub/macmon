@@ -263,7 +263,7 @@ fn areas(
 }
 
 impl App {
-  fn disk_age(&self) -> u64 {
+  pub(super) fn disk_age(&self) -> u64 {
     self
       .disk_sampled
       .map_or(0, |sampled| sampled.elapsed().as_millis().min(u64::MAX as u128) as u64)

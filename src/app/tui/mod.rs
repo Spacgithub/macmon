@@ -3030,6 +3030,35 @@ mod tests {
   }
 
   #[test]
+  fn legacy_battery_labels_preserve_availability_in_compact_and_wide_ledgers() {
+    use crate::battery::{Snapshot, State};
+    for (state, age, expected) in [
+      (State::Available, Some(0), "81%"),
+      (State::Available, Some(60_001), "stale"),
+      (State::Absent, Some(0), "No battery"),
+      (State::Unavailable, Some(0), "N/A"),
+      (State::Unavailable, None, "N/A"),
+    ] {
+      for (width, height) in [(100, 30), (120, 80)] {
+        let mut app = network_app();
+        app.battery =
+          Some(Snapshot { state, age_ms: age, percent: Some(81.0), ..Default::default() });
+        let buffer = render_buffer(&mut app, width, height);
+        let area = app.layout(buffer.area).telemetry.unwrap();
+        assert_eq!(area.inner(Margin::new(1, 1)).height >= 7, height == 80);
+        let screen = screen_text(&buffer);
+        assert!(screen.contains(expected), "missing {expected} at {width}x{height}: {screen}");
+        if expected != "81%" {
+          assert!(!screen.contains("81%"), "retained percentage looked current: {screen}");
+        }
+        for existing in ["45°C", "40°C", "Network"] {
+          assert!(screen.contains(existing), "missing {existing}: {screen}");
+        }
+      }
+    }
+  }
+
+  #[test]
   fn hardware_header_drops_complete_components_at_narrow_widths() {
     let mut app = test_app();
     for width in [200, 80, 60, 45, 30, 18, 8] {
