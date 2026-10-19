@@ -11,6 +11,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 mod app_network;
 mod battery;
+mod bluetooth;
 mod config;
 mod fds;
 mod find_clpc;

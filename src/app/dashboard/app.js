@@ -8,7 +8,7 @@ const frequency = (value) => Number.isSafeInteger(value) && value > 0 && value <
 const number = (value, digits = 1) => finite(value) ? value.toFixed(digits) : unknown;
 const percent = (value) => finite(value) ? `${(Math.min(value, 1) * 100).toFixed(1)}%` : unknown;
 const put = (id, value) => { $(id).textContent = value; };
-const panelNames = { cpu: "CPU", gpu: "GPU", ram: "memory", power: "power", disk: "disk", network: "network", cooling: "temperature and cooling", process: "process" };
+const panelNames = { cpu: "CPU", gpu: "GPU", ram: "memory", power: "power", disk: "disk", network: "network", cooling: "temperature and cooling", process: "process", bluetooth: "Bluetooth" };
 const preferenceKey = "macmon.panel-details.v1";
 const fanFpsKey = "macmon.fan-fps.v1", fanFpsOptions = [15, 30, 60];
 const validFanFps = (value) => fanFpsOptions.includes(value) ? value : 30;
@@ -22,6 +22,7 @@ function loadDetails() {
 }
 const state = { sample: null, identity: null, received: 0, online: null, waiting: false, busy: false, urgent: false, fans: new Map(), history: [], disks: new Map(), diskHistory: new Map(), diskSelected: null, cpuTierRows: new Map(), cpuCoreRows: new Map(), networkRows: new Map(), networkStatus: "Waiting for rates", frame: 0, last: null, next: 0, fanFps: loadFanFps(), cadence: null, changing: false, intervalError: false, details: loadDetails() };
 const processViewKey = "macmon.process-view.v1";
+const bluetoothRows = new Map();
 function loadProcessView() {
   try { const value = localStorage.getItem(processViewKey); if (["grouped", "raw"].includes(value)) return value; } catch { /* Storage is optional. */ }
   return "grouped";
@@ -434,9 +435,10 @@ function settle() {
   put("process-status", Array.isArray(procView.sample?.processes) ? `${processState}${finite(procAge) ? `${Math.floor(procAge / 1000)}s old` : "Age unavailable"}${cadence} / CPU 100% = one core` : collection ? `${unavailable}${collection.state.toUpperCase()} / Waiting for a process snapshot${cadence}` : "Unavailable for this request");
   applicationNetwork(false);
   const diskDelay = refreshDiskHealth(), batteryDelay = battery(state.sample);
+  bluetoothStatus();
   if (!document.hidden) {
     const processDelay = Array.isArray(procView.sample?.processes) && finite(procAge) ? Math.min(1000 - procAge % 1000, !retained && procAge <= processLimit() ? Math.max(1, processLimit() - procAge + 1) : Infinity) : Infinity;
-    const delay = Math.min(live() ? Math.max(1, limit() - age() + 1) : Infinity, diskDelay, processDelay, appNetwork.sample ? 1000 : Infinity, batteryDelay);
+    const delay = Math.min(live() ? Math.max(1, limit() - age() + 1) : Infinity, diskDelay, processDelay, appNetwork.sample ? 1000 : Infinity, batteryDelay, state.sample?.bluetooth?.age_ms != null ? 1000 : Infinity);
     if (Number.isFinite(delay)) staleTimer = setTimeout(settle, delay);
   }
   if (moving()) {
@@ -854,6 +856,58 @@ function processes(reset = false) {
   $("process-notes").hidden = !all || !grouped;
   restoreProcessPosition(position, reset);
 }
+function bluetoothStatus() {
+  const value = localProcessPage() ? state.sample?.bluetooth : null;
+  if (!value || !["warming", "ready", "stale", "unavailable"].includes(value.state)) {
+    put("bluetooth-summary", "Unavailable"); put("bluetooth-status", "Unavailable for this request"); return;
+  }
+  if (["warming", "unavailable"].includes(value.state)) {
+    put("bluetooth-summary", value.state === "warming" ? "Waiting for a report" : "Unavailable");
+    put("bluetooth-status", value.state === "warming" ? "Waiting for macOS Bluetooth telemetry" : "macOS did not supply a usable report; device count is unknown"); return;
+  }
+  if (!validBluetooth(value)) { put("bluetooth-summary", "Unavailable"); put("bluetooth-status", "Invalid Bluetooth report; device count is unknown"); return; }
+  const age = value.age_ms + performance.now() - state.received;
+  const stale = value.state === "stale" || age > 90000 || !live();
+  put("bluetooth-summary", `${value.devices.length} ${stale ? "cached" : "connected"} / ${value.devices.filter((device) => device.batteries.length).length} with battery`);
+  put("bluetooth-status", `${stale ? "STALE / retained / " : ""}${Math.floor(age / 1000)}s old / Controller ${value.controller ? "on" : "off"} / 30s report cache`);
+}
+function validBluetooth(value) {
+  if (![true, false].includes(value?.controller) || !finite(value.age_ms) || !Array.isArray(value.devices) || value.devices.length > 512) return false;
+  const text = (value, maximum) => {
+    if (!diskText(value, maximum * 2)) return false;
+    const scalars = [...value];
+    return scalars.length <= maximum && scalars.every((scalar) => { const point = scalar.codePointAt(0); return point < 0xd800 || point > 0xdfff; });
+  };
+  const seen = new Set();
+  return value.devices.every((device) => {
+    if (typeof device?.id !== "string" || !/^bt-[\da-f]{16}$/.test(device.id) || seen.has(device.id) || !text(device.name, 160) || !text(device.kind, 64) || !Array.isArray(device.batteries) || device.batteries.length > 4) return false;
+    seen.add(device.id); const components = new Set();
+    return device.batteries.every((battery) => {
+      if (!["main", "left", "right", "case"].includes(battery?.component) || components.has(battery.component) || !Number.isInteger(battery.percent) || battery.percent < 0 || battery.percent > 100) return false;
+      components.add(battery.component); return true;
+    });
+  });
+}
+function bluetooth(sample) {
+  const value = localProcessPage() ? sample.bluetooth : null;
+  const devices = value && ["ready", "stale"].includes(value.state) && validBluetooth(value) ? value.devices : [];
+  const keep = new Set(devices.map((device) => device.id));
+  for (const [id, row] of bluetoothRows) if (!keep.has(id)) { row.remove(); bluetoothRows.delete(id); }
+  for (const device of devices) {
+    let row = bluetoothRows.get(device.id);
+    if (!row) {
+      row = document.createElement("article"); row.className = "bluetooth-device";
+      const heading = document.createElement("h3"), kind = document.createElement("p"), batteries = document.createElement("p");
+      heading.className = "bluetooth-name"; kind.className = "muted bluetooth-kind"; batteries.className = "bluetooth-batteries";
+      row.append(heading, kind, batteries); bluetoothRows.set(device.id, row);
+    }
+    row.querySelector(".bluetooth-name").textContent = device.name;
+    row.querySelector(".bluetooth-kind").textContent = device.kind;
+    row.querySelector(".bluetooth-batteries").textContent = device.batteries.length ? device.batteries.map((battery) => `${battery.component}: ${battery.percent}%`).join(" / ") : "Battery unavailable / not reported by macOS";
+    $("bluetooth-rows").append(row);
+  }
+  bluetoothStatus();
+}
 function update(sample) {
   const metrics = sample.metrics, vm = metrics.soc?.vm, memory = metrics.memory || {};
   const frequencies = metrics.soc?.gpu_freqs;
@@ -881,6 +935,7 @@ function update(sample) {
   if (state.history.length > 60) state.history.shift();
   network(metrics);
   disks(sample);
+  bluetooth(sample);
   cooling(metrics);
   temperatures(sample);
   drawCharts();

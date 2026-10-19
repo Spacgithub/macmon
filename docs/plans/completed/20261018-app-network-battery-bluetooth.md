@@ -1,3 +1,5 @@
+Done: 2026-10-19, PR #38
+
 # Application network, battery and Bluetooth monitoring
 
 ## Agreed scope
@@ -42,7 +44,7 @@ future independent Swift control system belong to a separate project.
 
 ## Tasks
 
-- [ ] Validate native sources and document measured coverage, permissions, units and
+- [x] Validate native sources and document measured coverage, permissions, units and
       unsupported cases on the person's concrete Mac model and macOS release.
 - [x] Implement application network acquisition, reset-safe rate/session accounting,
       confirmed grouping, additive sample output and local privacy protection.
@@ -53,8 +55,18 @@ future independent Swift control system belong to a separate project.
 - [x] Implement battery acquisition, honest availability/freshness and shared output.
 - [x] Add Terminal/Web battery summaries and details with focused regressions, native
       runtime verification and resource measurements; review and deliver the battery PR.
-- [ ] Implement Bluetooth device/battery acquisition with explicit supported coverage.
-- [ ] Add Terminal/Web device summaries and expandable supported battery components;
+- [x] Implement Bluetooth device/battery acquisition with explicit supported coverage.
+- [x] Add Terminal/Web device summaries and expandable supported battery components;
       test empty, missing, stale, disconnected and reconnect cases.
-- [ ] Run checks and real-device/resource validation, independently review and deliver
+- [x] Run checks and real-device/resource validation, independently review and deliver
       the Bluetooth PR. Update the roadmap and complete this plan in the finishing PR.
+
+## Result
+
+Delivered application network monitoring in PR #36, battery monitoring in PR #37,
+and connected Bluetooth monitoring in PR #38. Terminal and Web use one shared owner;
+legacy outputs, library types, older clients and released settings remain compatible.
+Independent source/diff reviews, complete checks, native API/PTY/browser validation
+and paired resource measurements are recorded in
+[monitoring validation](../../monitoring-validation.md). Unsupported readings remain
+unavailable and unmeasured hardware/OS cases are explicitly identified.

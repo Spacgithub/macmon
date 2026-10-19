@@ -161,6 +161,14 @@
       </div>
     </section>
     </div>
+    <section class="panel bluetooth" aria-labelledby="bluetooth-title">
+      <div class="panel-head"><div><p class="eyebrow">CONNECTED ACCESSORIES</p><h2 id="bluetooth-title">Bluetooth</h2></div><button id="bluetooth-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="bluetooth-details" aria-label="Show Bluetooth details">Details</button></div>
+      <p class="reading bluetooth-reading" id="bluetooth-summary">Waiting for a report</p><p class="muted" id="bluetooth-status" role="status">Local device telemetry</p>
+      <div id="bluetooth-details" hidden>
+        <p class="muted table-note">Connected devices reported by macOS, refreshed every 30 seconds. Battery support varies by device; missing components stay unavailable. Cached reports do not establish a current connection or current charge.</p>
+        <div class="bluetooth-scroll" tabindex="0" role="region" aria-label="Connected Bluetooth devices and reported battery components"><div id="bluetooth-rows"></div></div>
+      </div>
+    </section>
     <section class="panel processes" aria-labelledby="process-title">
       <div class="panel-head"><div><p class="eyebrow" id="process-count">PROCESS TELEMETRY</p><h2 id="process-title">Applications &amp; processes</h2></div><button id="process-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="process-details" aria-label="Show process details">Details</button></div>
       <div class="process-controls"><label class="motion">View <select id="process-view"><option value="grouped">Applications</option><option value="raw">Processes</option></select></label><label class="motion">Sort by <select id="process-sort"><option value="cpu_pct">CPU usage</option><option value="gpu_pct">GPU usage</option><option value="mem_bytes">Memory</option></select></label><label class="motion process-filter">Filter <input id="process-filter" type="search" maxlength="128" placeholder="Name or PID" aria-label="Filter application or process names and PIDs"></label></div>

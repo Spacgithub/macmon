@@ -271,3 +271,8 @@ footer { margin-top: 24px; text-align: center; }
 .battery-overview h3 { margin: 0 0 .5rem; }
 .battery-overview p { margin: .3rem 0; }
 .battery-components { margin-top: 1rem; }
+:root { --bluetooth-gap: 1rem; }
+.bluetooth-reading { font-size: clamp(1.2rem, 2.2vw, 1.7rem); }
+.bluetooth-scroll { max-height: 25rem; overflow: auto; margin-top: var(--bluetooth-gap); }
+.bluetooth-device { padding: .85rem 0; border-top: 1px solid var(--line); }
+.bluetooth-device h3, .bluetooth-device p { overflow-wrap: anywhere; margin: .25rem 0; }

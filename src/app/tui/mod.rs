@@ -2,6 +2,7 @@
 
 mod app_network;
 mod battery;
+mod bluetooth;
 mod boxes;
 mod compute;
 mod cooling;
@@ -484,6 +485,10 @@ pub struct App {
   memory_activity: MemoryActivity,
   thermal_state: Option<ThermalState>,
   disks: Option<Vec<DiskMetric>>,
+  bluetooth: Option<crate::bluetooth::Snapshot>,
+  bluetooth_received: Option<Instant>,
+  bluetooth_detail: Option<usize>,
+  bluetooth_rendered_age: Option<u64>,
   disk_sampled: Option<Instant>,
   battery: Option<crate::battery::Snapshot>,
 
@@ -609,6 +614,8 @@ impl App {
       self.memory_activity = frame.details.memory_activity;
       self.thermal_state = frame.details.thermal_state;
       self.disks.clone_from(&frame.details.disks);
+      self.bluetooth.clone_from(&frame.details.bluetooth);
+      self.bluetooth_received = Some(frame.sampled);
       self.disk_sampled = Some(frame.sampled);
       self.battery.clone_from(&frame.details.battery);
       self.temperatures.push(frame.details.temperatures.clone(), &frame.metrics.temp);
@@ -724,6 +731,9 @@ impl App {
   }
 
   fn process_demand(&self) -> ProcessDemand {
+    if self.bluetooth_detail.is_some() {
+      return ProcessDemand::None;
+    }
     if self.info.is_some() {
       return ProcessDemand::Details;
     }
@@ -881,6 +891,12 @@ impl App {
       return Ok(ControlFlow::Continue(false));
     }
     if matches!(event, Event::Tick) {
+      if self.bluetooth_detail.is_some()
+        && self.bluetooth_rendered_age
+          != self.bluetooth_snapshot().and_then(|snapshot| snapshot.age_ms).map(|age| age / 1000)
+      {
+        return Ok(ControlFlow::Continue(true));
+      }
       let fresh = self.source_live();
       if self.source_commands.is_some() && self.source_fresh != fresh {
         self.source_fresh = fresh;
@@ -945,6 +961,21 @@ impl App {
       return ControlFlow::Continue(());
     }
 
+    if let Some(scroll) = self.bluetooth_detail {
+      let page = usize::from(self.screen_area.height.saturating_sub(2)).max(1);
+      self.bluetooth_detail = match key.code {
+        KeyCode::Esc | KeyCode::Char('b' | 'q') => None,
+        KeyCode::Up => Some(scroll.saturating_sub(1)),
+        KeyCode::Down => Some(scroll.saturating_add(1)),
+        KeyCode::PageUp => Some(scroll.saturating_sub(page)),
+        KeyCode::PageDown => Some(scroll.saturating_add(page)),
+        KeyCode::Home => Some(0),
+        KeyCode::End => Some(usize::MAX),
+        _ => Some(scroll),
+      };
+      return ControlFlow::Continue(());
+    }
+
     if let Some(mut info) = self.info.take() {
       // the help opens over it, unless `?` is typed into its filter; the overlay sees the key
       // too (it clears `copied`)
@@ -991,6 +1022,7 @@ impl App {
     match key.code {
       KeyCode::Char('q') => return ControlFlow::Break(()),
       KeyCode::Char('?') => self.help = Some(0),
+      KeyCode::Char('b') => self.bluetooth_detail = Some(0),
       KeyCode::Char('r') => self.cfg.toggle_ratio_mode(),
       KeyCode::Char('A')
         if !key
@@ -1035,7 +1067,9 @@ impl App {
 
   /// Panel headers and lists capture clicks; help leaves links and text selection to the terminal.
   fn wants_mouse(&self) -> bool {
-    self.help.is_none() && (self.procs_visible() || !self.panels.targets.is_empty())
+    self.help.is_none()
+      && self.bluetooth_detail.is_none()
+      && (self.procs_visible() || !self.panels.targets.is_empty())
   }
 
   /// Applies a mouse event at the cells of the last frame to the process list, only while the
@@ -1045,7 +1079,7 @@ impl App {
     if !self.source_live() {
       self.kill.close();
     }
-    if self.help.is_some() {
+    if self.help.is_some() || self.bluetooth_detail.is_some() {
       return;
     }
     self.proc_view.copied = false;
@@ -1099,6 +1133,7 @@ impl App {
 
   fn fans_visible(&self) -> bool {
     self.help.is_none()
+      && self.bluetooth_detail.is_none()
       && self.info.is_none()
       && !self.kill.is_open()
       && self.cooling_detailed()
@@ -1198,6 +1233,11 @@ impl App {
   fn render(&mut self, f: &mut Frame) {
     self.process_rendered_age = self.process_sampled.map(|sampled| sampled.elapsed().as_secs());
     self.screen_area = f.area();
+    if let Some(offset) = self.bluetooth_detail {
+      self.render_bluetooth(f, offset);
+      self.render_source_status(f);
+      return;
+    }
     self.normalize_proc_selection();
     #[cfg(test)]
     {
@@ -1338,6 +1378,7 @@ impl App {
         self.refresh_cell_pixels();
         let next = self.next_fan_placements(term.size()?.into());
         if (self.help.is_some()
+          || self.bluetooth_detail.is_some()
           || self.info.is_some()
           || self.kill.is_open()
           || next != self.placements)

@@ -26,6 +26,7 @@ const HELP: &[Row] = &[
   Key("q", "quit"),
   Key("1–6", "toggle Compute, Memory, Power, Network, Cooling, Processes"),
   Key("7", "toggle physical Disk"),
+  Key("b", "Bluetooth summary / connected-device battery details"),
   Key("Tab / ⇧Tab", "select a panel (starts on Processes)"),
   Key("Enter", "expand / summarize the selected panel"),
   Key("d", "expand all / summarize all panels"),

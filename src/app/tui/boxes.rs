@@ -394,6 +394,11 @@ impl App {
       overview = vec![overview[0].clone(), overview.last().unwrap().clone()];
     }
     let mut inner = draw_box(f, area, titles);
+    if !detailed && area.height >= 2 {
+      render_bottom_border(f, area, vec![hint("b", "detail")], |_| {
+        vec![dim(self.bluetooth_summary().replacen("Bluetooth", "BT", 1))]
+      });
+    }
     f.render_widget(Paragraph::new(overview.clone()), inner);
     if !detailed || metrics.is_empty() {
       if !detailed && inner.height as usize > overview.len() {
@@ -499,6 +504,7 @@ impl App {
       hints.push(hint("p", "procs"));
     }
     hints.extend([hint("1-6/d", "panels"), hint("f", self.panels.focus.name())]);
+    hints.push(hint("b", "Bluetooth"));
     let modes = [RatioMode::Scaled, RatioMode::Active].map(|mode| mode.label().len());
     let mode = format!("{:1$}", self.cfg.ratio_mode.label(), modes.into_iter().max().unwrap_or(0));
     let interval = format!("{:>1$}ms", self.cfg.interval(), TUI_MAX_MS.to_string().len());

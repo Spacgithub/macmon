@@ -284,8 +284,8 @@ const processGroupDetail = (h, row) => h.document.getElementById(row.querySelect
 const groupMembers = (h, row) => processGroupDetail(h, row).querySelector('.process-members-table')?.children.find((node) => node.tagName === 'TBODY').children || [];
 async function toggleProcessGroup(h, row) { row.querySelector('.process-group-button').emit('click'); await drainMicrotasks(); }
 async function processControl(h, id, value, event = 'change') { h.elements.get(id).value = value; h.elements.get(id).emit(event); await drainMicrotasks(); }
-function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks, app_network, battery } = {}) {
-  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks, app_network, battery };
+function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks, app_network, battery, bluetooth } = {}) {
+  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks, app_network, battery, bluetooth };
 }
 function nvme(overrides = {}) {
   return { critical_warning: 0, percentage_used: 5, available_spare_percent: 100, spare_threshold_percent: 10,
@@ -1912,6 +1912,91 @@ await check('battery freshness adds sample transit time and continues aging thro
   assert.match(h.text('battery-summary'), /^Retained/); assert.match(h.text('battery-freshness'), /60s old \/ stale/);
   await nextPoll(h); await h.answer(sample({ sequence: 2, battery: batteryFixture() }));
   assert.doesNotMatch(h.text('battery-summary'), /^Retained/);
+});
+
+function bluetoothFixture(overrides = {}) {
+  return { state: 'ready', controller: true, sampled_at: '2026-10-18T00:00:00Z', age_ms: 0, devices: [
+    { id: 'bt-0123456789abcdef', name: 'Wireless headphones', kind: 'Headphones', batteries: [{ component: 'left', percent: 25 }, { component: 'right', percent: 75 }, { component: 'case', percent: 0 }] },
+    { id: 'bt-0123456789abcdee', name: 'Keyboard', kind: 'Keyboard', batteries: [] },
+  ], ...overrides };
+}
+await check('Bluetooth overview and independent detail toggle keep real battery components and missing coverage distinct', async () => {
+  const h = boot(); await h.answer(sample({ bluetooth: bluetoothFixture() }));
+  assert.match(h.text('bluetooth-summary'), /2 connected \/ 1 with battery/);
+  assert.equal(h.elements.get('bluetooth-details').hidden, true);
+  await h.click('bluetooth-toggle');
+  assert.equal(h.elements.get('bluetooth-details').hidden, false);
+  assert.match(h.text('bluetooth-rows'), /left: 25% \/ right: 75% \/ case: 0%/);
+  assert.match(h.text('bluetooth-rows'), /Battery unavailable/);
+  assert.equal(h.state().details.network, false);
+  await h.click('collapse-all'); assert.equal(h.elements.get('bluetooth-details').hidden, true);
+});
+await check('Bluetooth age advances on the report clock and retained device lists are never called current', async () => {
+  const h = boot(); await h.answer(sample({ interval_ms: 10000, bluetooth: bluetoothFixture({ age_ms: 89999 }) }));
+  assert.doesNotMatch(h.text('bluetooth-status'), /STALE/);
+  await h.advance(1001); assert.match(h.text('bluetooth-status'), /STALE \/ retained/);
+  assert.match(h.text('bluetooth-summary'), /2 cached/);
+  await h.advance(9000); await h.answer(sample({ sequence: 2, bluetooth: bluetoothFixture({ state: 'stale', age_ms: 4000 }) }));
+  assert.match(h.text('bluetooth-status'), /STALE \/ retained \/ [45]s old/);
+});
+await check('Bluetooth unavailable missing and zero connections stay distinct and disconnect/reconnect replaces rows', async () => {
+  const h = boot(); await h.answer(sample());
+  assert.equal(h.text('bluetooth-summary'), 'Unavailable'); assert.equal(h.elements.get('bluetooth-rows').children.length, 0);
+  await nextPoll(h); await h.answer(sample({ sequence: 2, bluetooth: bluetoothFixture() }));
+  const old = h.elements.get('bluetooth-rows').children[0];
+  await nextPoll(h); await h.answer(sample({ sequence: 3, bluetooth: bluetoothFixture({ devices: [], controller: false }) }));
+  assert.match(h.text('bluetooth-summary'), /0 connected/); assert.match(h.text('bluetooth-status'), /Controller off/);
+  assert.equal(h.elements.get('bluetooth-rows').children.length, 0);
+  await nextPoll(h); await h.answer(sample({ sequence: 4, bluetooth: bluetoothFixture() }));
+  assert.notEqual(h.elements.get('bluetooth-rows').children[0], old);
+  await nextPoll(h); await h.answer(sample({ sequence: 5, bluetooth: { state: 'unavailable' } }));
+  assert.equal(h.text('bluetooth-summary'), 'Unavailable'); assert.equal(h.elements.get('bluetooth-rows').children.length, 0);
+});
+await check('Bluetooth private names are never rendered on remote pages and text stays escaped', async () => {
+  const remote = boot({ hostname: '192.0.2.1' }); await remote.answer(sample({ bluetooth: bluetoothFixture() }));
+  assert.equal(remote.elements.get('bluetooth-rows').children.length, 0);
+  const h = boot(), data = bluetoothFixture(); data.devices[0].name = '<img src=x onerror=alert(1)>';
+  await h.answer(sample({ bluetooth: data })); assert.ok(h.text('bluetooth-rows').includes(data.devices[0].name));
+});
+await check('malformed Bluetooth schema never guesses zero charge or repeats duplicate device identities', async () => {
+  for (const invalid of [{ controller: null }, { age_ms: -1 }, { devices: [null] }, { devices: [bluetoothFixture().devices[0], bluetoothFixture().devices[0]] }, { devices: [{ ...bluetoothFixture().devices[0], batteries: [{ component: 'left', percent: 101 }] }] }]) {
+    const h = boot(); await h.answer(sample({ bluetooth: bluetoothFixture(invalid) }));
+    assert.equal(h.text('bluetooth-summary'), 'Unavailable'); assert.equal(h.elements.get('bluetooth-rows').children.length, 0);
+  }
+});
+
+await check('Bluetooth device text accepts Unicode scalar limits without hiding other connected devices', async () => {
+  for (const [name, kind] of [
+    ['a'.repeat(120) + '🎧'.repeat(21), 'Headphones'],
+    ['🎧'.repeat(160), '🔊'.repeat(64)],
+    ['e\u0301'.repeat(80), '耳机'.repeat(32)],
+  ]) {
+    const h = boot(), value = bluetoothFixture();
+    Object.assign(value.devices[0], { name, kind });
+    await h.answer(sample({ bluetooth: value })); await h.click('bluetooth-toggle');
+    assert.match(h.text('bluetooth-summary'), /2 connected \/ 1 with battery/);
+    const rows = h.elements.get('bluetooth-rows').children;
+    assert.equal(rows.length, 2); assert.equal(rows[0].querySelector('.bluetooth-name').textContent, name);
+    assert.equal(rows[0].querySelector('.bluetooth-kind').textContent, kind);
+    assert.equal(rows[1].querySelector('.bluetooth-name').textContent, 'Keyboard');
+    assert.match(rows[0].querySelector('.bluetooth-batteries').textContent, /case: 0%/);
+  }
+});
+
+await check('Bluetooth rejects overlong or malformed scalar text while keeping disk validation unchanged', async () => {
+  for (const [field, invalid] of [
+    ['name', '🎧'.repeat(161)], ['kind', '🔊'.repeat(65)],
+    ['name', 'a'.repeat(161)], ['kind', 'a'.repeat(65)],
+    ['name', 'device\u0000name'], ['kind', 'type\u001b[31m'],
+    ['name', 'device\ud800name'], ['name', 'device\udfffname'], ['kind', '\ud800'],
+    ['name', ' \t '],
+  ]) {
+    const h = boot(), value = bluetoothFixture(); value.devices[0][field] = invalid;
+    await h.answer(sample({ bluetooth: value }));
+    assert.equal(h.text('bluetooth-summary'), 'Unavailable');
+    assert.equal(h.elements.get('bluetooth-rows').children.length, 0);
+  }
+  const h = boot(); assert.equal(h.inspect(`diskText("🎧".repeat(81))`), null);
 });
 
 console.log(`${tests.length} dashboard checks passed.`);

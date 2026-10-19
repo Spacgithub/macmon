@@ -17,6 +17,12 @@
 
 ## 🌟 Features
 
+The personal fork also reports connected Bluetooth accessories and source-supported
+battery components. In Terminal press `b` for details; the Web dashboard has an
+independent Bluetooth Details switch. Missing battery coverage and cached/stale
+reports remain explicit. See [Bluetooth monitoring](docs/bluetooth-monitoring.md)
+for source coverage, report freshness and local access protection.
+
 - 🚫 Runs without sudo
 - ⚡ Real-time CPU / GPU / ANE power usage
 - 📊 CPU frequency-scaled and active ratios per cluster
