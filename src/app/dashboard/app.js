@@ -384,6 +384,7 @@ function applyDetails() {
   $("detail-grid").dataset.expanded = String(state.details.network || state.details.cooling);
   diskScope();
   processes();
+  applicationNetwork();
   requestProcessDemand();
   drawCharts();
   settle();
@@ -404,10 +405,11 @@ function settle() {
   const cadence = collection ? ` / ${collection.demand}${collection.interval_ms ? ` ${number(collection.interval_ms / 1000)}s` : ""}` : "";
   const unavailable = state.waiting ? "WAITING / retained / " : state.online === false ? "OFFLINE / retained / " : "";
   put("process-status", Array.isArray(procView.sample?.processes) ? `${processState}${finite(procAge) ? `${Math.floor(procAge / 1000)}s old` : "Age unavailable"}${cadence} / CPU 100% = one core` : collection ? `${unavailable}${collection.state.toUpperCase()} / Waiting for a process snapshot${cadence}` : "Unavailable for this request");
+  applicationNetwork(false);
   const diskDelay = refreshDiskHealth();
   if (!document.hidden) {
     const processDelay = Array.isArray(procView.sample?.processes) && finite(procAge) ? Math.min(1000 - procAge % 1000, !retained && procAge <= processLimit() ? Math.max(1, processLimit() - procAge + 1) : Infinity) : Infinity;
-    const delay = Math.min(live() ? Math.max(1, limit() - age() + 1) : Infinity, diskDelay, processDelay);
+    const delay = Math.min(live() ? Math.max(1, limit() - age() + 1) : Infinity, diskDelay, processDelay, appNetwork.sample ? 1000 : Infinity);
     if (Number.isFinite(delay)) staleTimer = setTimeout(settle, delay);
   }
   if (moving()) {
@@ -564,6 +566,59 @@ function temperatures(sample) {
     });
     return row;
   }));
+}
+// Application socket accounting has its own identity and age, independent of system frames.
+const appNetwork = { sample: null, received: 0, rows: new Map(), open: new Set(), session: null, identity: null };
+function refreshAppNetwork(sample, started) {
+  const session = sample.process_collection?.session ?? sample.sampled_at;
+  if (appNetwork.session !== session) { appNetwork.open.clear(); appNetwork.rows.clear(); appNetwork.session = session; }
+  const value = sample.app_network;
+  appNetwork.sample = value && ["warming", "ready", "unavailable"].includes(value.state) && Number.isSafeInteger(value.sequence) && value.sequence >= 0 && finite(value.age_ms) && Array.isArray(value.groups) ? value : null;
+  appNetwork.received = started;
+  const identity = `${session}/${appNetwork.sample?.sequence}/${appNetwork.sample?.state}`;
+  if (identity !== appNetwork.identity) { appNetwork.identity = identity; applicationNetwork(); }
+}
+function applicationNetwork(render = true) {
+  const rate = (value) => finite(value) ? `${diskBytes(value)}/s` : value == null ? "Pending" : "Unavailable";
+  const value = appNetwork.sample;
+  const observedAge = value ? value.age_ms + performance.now() - appNetwork.received : Infinity;
+  const label = !value ? "Unavailable for this request or collector" : value.state === "unavailable" ? "UNAVAILABLE / retained" : observedAge > 6000 || !live() ? "STALE / retained" : value.state === "warming" ? "Rates warming" : "Observed socket traffic";
+  put("app-network-status", `${label}${value ? ` / ${Math.floor(observedAge / 1000)}s old / ${Number.isSafeInteger(value.excluded_processes) ? value.excluded_processes : "?"} unverified processes excluded` : ""}`);
+  if (!render) return;
+  const groups = [], ids = new Set(), pids = new Set();
+  for (const group of value?.groups ?? []) {
+    if (!diskText(group?.id, 256) || !diskText(group.name, 256) || ids.has(group.id) || !["application", "process"].includes(group.kind) || !Array.isArray(group.members)) continue;
+    ids.add(group.id);
+    const members = group.members.filter((member) => {
+      if (!member || !Number.isSafeInteger(member.pid) || member.pid <= 0 || member.pid > 2147483647 || pids.has(member.pid) || !diskText(member.instance, 256) || !diskText(member.name, 256)) return false;
+      pids.add(member.pid); return true;
+    });
+    if (members.length) groups.push({ ...group, members });
+  }
+  const sort = $("app-network-sort").value, field = { rx: "rx_bytes_per_sec", tx: "tx_bytes_per_sec", rx_total: "rx_session_bytes", tx_total: "tx_session_bytes" }[sort];
+  groups.sort((a, b) => field ? Number(finite(b[field])) - Number(finite(a[field])) || (finite(b[field]) ? b[field] : 0) - (finite(a[field]) ? a[field] : 0) || a.name.localeCompare(b.name) : a.name.localeCompare(b.name));
+  const top = groups[0]; put("app-network-summary", top ? `${groups.length} groups / ${top.name} / ↓ ${rate(top.rx_bytes_per_sec)} / ↑ ${rate(top.tx_bytes_per_sec)}` : value ? "No verified network processes reported" : "Unavailable");
+  const visible = state.details.network ? groups : groups.slice(0, 3), rows = [], next = new Map();
+  appNetwork.open.forEach((id) => { if (!ids.has(id)) appNetwork.open.delete(id); });
+  for (const group of visible) {
+    let cached = appNetwork.rows.get(group.id);
+    if (!cached) {
+      const row = document.createElement("tr"), cell = document.createElement("td"), button = document.createElement("button"); button.type = "button"; button.className = "process-group-button";
+      cell.append(button); row.append(cell); for (const heading of ["Receive / s", "Transmit / s", "RX session", "TX session"]) { const data = document.createElement("td"); data.dataset.label = heading; row.append(data); }
+      button.addEventListener("click", () => { if (state.details.network && appNetwork.open.has(group.id)) appNetwork.open.delete(group.id); else appNetwork.open.add(group.id); if (!state.details.network) changeDetails(["network"], true); else applicationNetwork(); });
+      cached = { row, button };
+    }
+    const open = state.details.network && appNetwork.open.has(group.id); cached.button.textContent = `${open ? "−" : "+"} ${group.name} ×${group.members.length}`; cached.button.setAttribute("aria-expanded", String(open));
+    const values = [rate(group.rx_bytes_per_sec), rate(group.tx_bytes_per_sec), diskBytes(diskInteger(group.rx_session_bytes)), diskBytes(diskInteger(group.tx_session_bytes))];
+    values.forEach((text, index) => { cached.row.children[index + 1].textContent = text; });
+    rows.push(cached.row); next.set(group.id, cached);
+    if (open) for (const member of group.members) {
+      const row = document.createElement("tr"); row.className = "app-network-member";
+      for (const [index, text] of [`${member.pid} / ${member.name}`, rate(member.rx_bytes_per_sec), rate(member.tx_bytes_per_sec), diskBytes(diskInteger(member.rx_session_bytes)), diskBytes(diskInteger(member.tx_session_bytes))].entries()) { const cell = document.createElement("td"); cell.textContent = text; cell.dataset.label = ["Process", "Receive / s", "Transmit / s", "RX session", "TX session"][index]; row.append(cell); }
+      rows.push(row);
+    }
+  }
+  diskChildren($("app-network-rows"), rows); appNetwork.rows = next;
 }
 function network(metrics) {
   const seen = new Set(), rows = Array.isArray(metrics.network) ? metrics.network.filter((item) => {
@@ -842,6 +897,7 @@ async function poll() {
     state.waiting = false;
     const identity = `${sample.sequence}/${sample.sampled_at}`;
     refreshProcesses(sample, started, identity);
+    refreshAppNetwork(sample, started);
     if (identity !== state.identity) {
       update(sample);
       state.identity = identity;
@@ -858,7 +914,7 @@ async function poll() {
     controller = null;
     state.busy = false;
     const processDelay = processLease.mode === "managed" ? { none: Infinity, summary: 5000, details: 1000 }[processLease.wanted] : Infinity;
-    const delay = Math.min(state.cadence ? Math.min(state.cadence.effective_ms, state.cadence.pending ? 1000 : 10000) : 1000, processDelay);
+    const delay = Math.min(state.cadence ? Math.min(state.cadence.effective_ms, state.cadence.pending ? 1000 : 10000) : 1000, processDelay, appNetwork.sample ? 2000 : Infinity);
     if (!document.hidden) pollTimer = setTimeout(poll, state.urgent ? 0 : Math.max(0, Math.max(250, delay) - (performance.now() - started)));
   }
 }
@@ -876,6 +932,8 @@ $("process-view").addEventListener("change", () => {
   try { localStorage.setItem(processViewKey, procView.mode); } catch { /* Keep this view usable without storage. */ }
   processes(true);
 });
+$("app-network-sort").value = "rx";
+$("app-network-sort").addEventListener("change", () => applicationNetwork());
 $("process-sort").addEventListener("change", () => processes(true));
 $("process-filter").addEventListener("input", () => processes(true));
 $("disk-select").addEventListener("change", () => { state.diskSelected = state.disks.has($("disk-select").value) ? $("disk-select").value : null; drawDiskChart(); });

@@ -1,5 +1,6 @@
 //! Terminal user interface.
 
+mod app_network;
 mod boxes;
 mod compute;
 mod cooling;
@@ -514,6 +515,7 @@ pub struct App {
   unfocused: bool,
   network: Option<Vec<NetworkMetric>>,
   network_sampled: bool,
+  app_network: app_network::View,
   compute: compute::Compute,
   panels: PanelState,
   temperatures: Temperatures,
@@ -596,6 +598,7 @@ impl App {
     self.source_sampled = Some(frame.sampled);
     self.source_fresh = self.source_live();
     self.cfg.adopt_interval(frame.cadence.effective_ms);
+    self.app_network.update(frame.details.app_network.clone());
     self.process_state = Some(frame.process_state);
     self.process_interval_ms = frame.process_interval_ms;
     self.process_sampled = frame.processes.as_ref().map(|processes| processes.snapshot.sampled);

@@ -284,8 +284,8 @@ const processGroupDetail = (h, row) => h.document.getElementById(row.querySelect
 const groupMembers = (h, row) => processGroupDetail(h, row).querySelector('.process-members-table')?.children.find((node) => node.tagName === 'TBODY').children || [];
 async function toggleProcessGroup(h, row) { row.querySelector('.process-group-button').emit('click'); await drainMicrotasks(); }
 async function processControl(h, id, value, event = 'change') { h.elements.get(id).value = value; h.elements.get(id).emit(event); await drainMicrotasks(); }
-function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks } = {}) {
-  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks };
+function sample({ sequence = 1, sampled_at = '2026-10-14T12:00:00Z', age_ms = 0, interval_ms = 1000, cadence, data = metrics(), processes = null, processes_age_ms = null, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks, app_network } = {}) {
+  return { sequence, sampled_at, age_ms, interval_ms, cadence, metrics: data, processes, processes_age_ms, process_groups, process_collection, temperatures, memory_activity, thermal_state, disks, app_network };
 }
 function nvme(overrides = {}) {
   return { critical_warning: 0, percentage_used: 5, available_spare_percent: 100, spare_threshold_percent: 10,
@@ -1840,4 +1840,33 @@ await check('malformed collection metadata stays unavailable without inserting e
   }
 });
 
+function appNetworkFixture(overrides = {}) {
+  const member = (pid, rx = 200) => ({ pid, instance: `network-${pid}`, name: `helper-${pid}`, rx_bytes_per_sec: rx, tx_bytes_per_sec: 10, rx_session_bytes: 4096, tx_session_bytes: 128 });
+  const group = (id, rx) => ({ id, name: id, kind: 'application', members: [member(rx)], rx_bytes_per_sec: rx, tx_bytes_per_sec: rx / 2, rx_session_bytes: rx * 100, tx_session_bytes: rx * 10 });
+  return { state: 'ready', sequence: 1, age_ms: 2000, interval_ms: 2000, observed_processes: 4, excluded_processes: 1, groups: [group('Browser', 500), group('Editor', 200), group('Music', 100), group('Chat', 50)], ...overrides };
+}
+await check('application network keeps interface telemetry, top groups, sorting and independent member expansion', async () => {
+  const h = boot(); await h.answer(sample({ app_network: appNetworkFixture(), process_collection: collection() }));
+  const rows = () => h.elements.get('app-network-rows').children;
+  assert.equal(rows().length, 3); assert.match(h.text('network-observer'), /en0/); assert.match(h.text('app-network-summary'), /4 groups.*Browser/);
+  await h.click('network-toggle');
+  const browser = rows()[0].children[0].children[0]; browser.emit('click'); await drainMicrotasks(); assert.equal(browser.getAttribute('aria-expanded'), 'true'); assert.match(h.text('app-network-rows'), /helper-500/);
+  const editor = rows().find((row) => row.children[0].textContent.includes('Editor')).children[0].children[0]; editor.emit('click'); await drainMicrotasks();
+  browser.emit('click'); await drainMicrotasks(); assert.equal(editor.getAttribute('aria-expanded'), 'true'); assert.doesNotMatch(h.text('app-network-rows'), /helper-500/); assert.match(h.text('app-network-rows'), /helper-200/);
+  await h.click('network-toggle'); assert.equal(rows().length, 3); assert.doesNotMatch(h.text('app-network-rows'), /helper-/);
+  editor.emit('click'); await drainMicrotasks(); assert.equal(editor.getAttribute('aria-expanded'), 'true'); assert.match(h.text('app-network-rows'), /helper-200/);
+  await h.click('network-toggle');
+  await h.click('network-toggle'); assert.equal(rows().filter((row) => row.className !== 'app-network-member').length, 4);
+  h.elements.get('app-network-sort').value = 'name'; h.elements.get('app-network-sort').emit('change'); assert.match(rows()[0].textContent, /Browser/); assert.match(rows()[1].textContent, /Chat/);
+});
+await check('application socket ages, warming, unavailable, malformed data and collector restart stay honest', async () => {
+  const h = boot(); const value = appNetworkFixture(); value.groups.forEach((group) => { group.rx_bytes_per_sec = null; });
+  await h.answer(sample({ app_network: value, process_collection: collection() })); assert.match(h.text('app-network-rows'), /Pending/);
+  h.jump(4100); h.inspect('settle()'); assert.match(h.text('app-network-status'), /STALE/);
+  await nextPoll(h);
+  await h.answer(sample({ sequence: 2, app_network: appNetworkFixture({ state: 'unavailable', age_ms: 19000 }), process_collection: collection() })); assert.match(h.text('app-network-status'), /UNAVAILABLE.*retained/); assert.ok(Number(h.text('app-network-status').match(/(\d+)s old/)[1]) >= 19);
+  await nextPoll(h); await h.answer(sample({ sequence: 3, app_network: null, process_collection: collection() })); assert.equal(h.elements.get('app-network-rows').children.length, 0); assert.match(h.text('app-network-status'), /Unavailable for this request/);
+  await nextPoll(h); const bad = appNetworkFixture(); bad.groups[0].name = 'bad\u0000name'; bad.groups.push({ id: '<img>', name: '<img onerror=bad>', kind: 'process', members: [] });
+  await h.answer(sample({ sequence: 4, app_network: bad, process_collection: collection({ session: 'new-owner' }) })); assert.doesNotMatch(h.text('app-network-rows'), /bad|<img/);
+});
 console.log(`${tests.length} dashboard checks passed.`);

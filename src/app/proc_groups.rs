@@ -276,8 +276,28 @@ impl Ownership {
     &mut self,
     entries: &[(u32, Option<&str>, Option<Coalition>)],
   ) -> Vec<Option<AppIdentity>> {
+    self.applications_retaining(entries, &[])
+  }
+
+  /// Retain IDs through temporarily unreadable metadata; retained paths never seed ownership.
+  pub(crate) fn applications_retaining(
+    &mut self,
+    entries: &[(u32, Option<&str>, Option<Coalition>)],
+    retained: &[(u32, &str)],
+  ) -> Vec<Option<AppIdentity>> {
     let live: HashSet<_> = entries.iter().filter_map(|(_, path, _)| *path).collect();
-    self.paths.retain(|path, _| live.contains(path.as_str()));
+    let keep: HashSet<_> = retained.iter().map(|(_, path)| *path).collect();
+    self.paths.retain(|path, _| live.contains(path.as_str()) || keep.contains(path.as_str()));
+    let retained: HashSet<_> = retained
+      .iter()
+      .filter_map(|(uid, path)| {
+        self
+          .paths
+          .get(*path)
+          .and_then(|bundle| bundle.app.as_ref())
+          .map(|(path, _)| (*uid, path.clone()))
+      })
+      .collect();
     let mut active = HashSet::new();
     let mut owners = HashMap::<(u32, Coalition), Option<AppIdentity>>::new();
     let mut result = Vec::with_capacity(entries.len());
@@ -313,7 +333,7 @@ impl Ownership {
       }
       result.push((app, bundle.is_some_and(|bundle| bundle.xpc)));
     }
-    self.apps.retain(|key, _| active.contains(key));
+    self.apps.retain(|key, _| active.contains(key) || retained.contains(key));
     result
       .into_iter()
       .zip(entries)
@@ -323,6 +343,10 @@ impl Ownership {
         })
       })
       .collect()
+  }
+
+  pub(crate) fn application_ids(&self) -> impl Iterator<Item = &str> {
+    self.apps.values().map(|app| app.id.as_str())
   }
 }
 
@@ -355,6 +379,22 @@ mod tests {
       started: Some((42, 0)),
       meta: ProcMeta { instance: instance.into(), app, known, ..Default::default() },
     }
+  }
+
+  #[test]
+  fn retained_ids_do_not_seed_coalition_ownership_from_historical_paths() {
+    let mut owner = ownership();
+    let first = owner.applications(&[(501, Some(APP), Some(COAL))])[0].clone().unwrap();
+    let uncertain = owner.applications_retaining(
+      &[(501, Some(XPC), Some(COAL)), (501, None, Some(COAL))],
+      &[(501, APP)],
+    );
+    assert!(uncertain.iter().all(Option::is_none));
+    assert_eq!(owner.application_ids().collect::<Vec<_>>(), [first.id.as_str()]);
+    let recovered =
+      owner.applications(&[(501, Some(APP), Some(COAL)), (501, Some(XPC), Some(COAL))]);
+    assert_eq!(recovered[0], Some(first));
+    assert_eq!(recovered[0], recovered[1]);
   }
 
   #[test]

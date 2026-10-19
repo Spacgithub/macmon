@@ -119,6 +119,15 @@
         <tbody id="network-rows"></tbody>
       </table>
       </div>
+      <div class="app-network-summary">
+        <h3>Application traffic</h3><p class="muted" id="app-network-status">Waiting for a sample</p>
+        <p class="network-observer" id="app-network-summary">Unavailable</p>
+        <div class="process-controls"><label for="app-network-sort">Sort</label><select id="app-network-sort"><option value="rx">Receive rate</option><option value="tx">Transmit rate</option><option value="rx_total">Receive session</option><option value="tx_total">Transmit session</option><option value="name">Name</option></select></div>
+        <div class="network-scroll" tabindex="0" role="region" aria-label="Application network; expand Network details for all applications">
+          <table><caption class="sr-only">Observed TCP/UDP application traffic and monitoring-session totals</caption><thead><tr><th scope="col">Application / process</th><th scope="col">Receive / s</th><th scope="col">Transmit / s</th><th scope="col">RX session</th><th scope="col">TX session</th></tr></thead><tbody id="app-network-rows"></tbody></table>
+        </div>
+        <p class="muted table-note">TCP/UDP socket accounting, including loopback and VPN/proxy processes. Session totals count observed increases after monitoring starts; gaps and counter resets are omitted. Exited sockets/processes can be missing. This is separate from interface traffic.</p>
+      </div>
     </section>
     <section class="panel" aria-labelledby="cooling-title">
       <div class="panel-head"><div><p class="eyebrow">THERMAL SYSTEM</p><h2 id="cooling-title">Temperature &amp; cooling</h2></div><button id="cooling-toggle" class="detail-toggle" type="button" aria-expanded="false" aria-controls="cooling-details" aria-label="Show temperature and cooling details">Details</button></div>

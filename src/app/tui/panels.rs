@@ -402,6 +402,15 @@ impl App {
       return false;
     }
     let index = self.panels.focus as usize;
+    if self.panels.focus == Panel::Network {
+      if key.code == KeyCode::Char('n') {
+        self.app_network.enabled = !self.app_network.enabled;
+        return true;
+      }
+      if self.app_network.enabled && self.app_network.key(key.code) {
+        return true;
+      }
+    }
     match key.code {
       KeyCode::Tab | KeyCode::BackTab => {
         let count = Panel::ALL.len();
@@ -632,7 +641,9 @@ impl App {
         text(format!(" · [{}] {}", self.panels.focus as usize + 1, self.panels.focus.name())),
       ]);
       frame.render_widget(title, Rect { height: 1, ..area });
-      let footer = if self.proc_view.typing() {
+      let footer = if self.panels.focus == Panel::Network {
+        " n apps / interfaces · s sort · Space/←→ members · ↑↓ select · Enter detail · f full"
+      } else if self.proc_view.typing() {
         " Enter keep filter · Esc clear filter"
       } else if self.panels.fullscreen {
         " f / Esc back · ↑↓ PgUp/PgDn Home/End scroll · Tab switch · ? help"
@@ -654,6 +665,10 @@ impl App {
         } else {
           self.render_proc_summary(frame, rect);
         }
+        continue;
+      }
+      if panel == Panel::Network && self.app_network.enabled {
+        self.render_app_network(frame, rect, detailed);
         continue;
       }
       if panel == Panel::Network {
