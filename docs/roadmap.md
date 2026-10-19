@@ -257,3 +257,8 @@ what we need.
       battery components with explicit coverage and freshness, local-only identities
       and independently accessible Terminal/Web details.
       Plan: [docs/plans/completed/20261018-app-network-battery-bluetooth.md](plans/completed/20261018-app-network-battery-bluetooth.md).
+
+- [x] **41. Manually switch Web monitoring on and off.** Release the backend's sampling
+      subscription from the dashboard while retaining a control page for resuming, with
+      honest paused values and independent Terminal sampling.
+      Plan: [docs/plans/completed/20261019-web-monitoring-toggle.md](plans/completed/20261019-web-monitoring-toggle.md).

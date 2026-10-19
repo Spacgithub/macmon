@@ -37,8 +37,8 @@ h3 { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
 .memory-note { margin-top: 12px; line-height: 1.7; }
 .detail-controls, .panel-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .detail-controls { justify-content: flex-end; margin-top: 24px; }
-.detail-controls button, .detail-toggle { padding: 7px 12px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: #132231; font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap; }
-.detail-controls button:hover, .detail-toggle:hover, .detail-toggle[aria-expanded="true"] { color: var(--accent); border-color: #497480; background: #172d3a; }
+.detail-controls button, .detail-toggle, .monitoring-control button { padding: 7px 12px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: #132231; font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap; }
+.detail-controls button:hover, .detail-toggle:hover, .detail-toggle[aria-expanded="true"], .monitoring-control button:not(:disabled):hover, #monitoring-toggle[aria-pressed="true"]:not(:disabled) { color: var(--accent); border-color: #497480; background: #172d3a; }
 .detail-toggle { flex-shrink: 0; }
 .table-note { margin: 10px 0; line-height: 1.6; }
 .network-scroll[data-expanded="false"] th:nth-child(n+4), .network-scroll[data-expanded="false"] td:nth-child(n+4) { display: none; }
@@ -276,3 +276,7 @@ footer { margin-top: 24px; text-align: center; }
 .bluetooth-scroll { max-height: 25rem; overflow: auto; margin-top: var(--bluetooth-gap); }
 .bluetooth-device { padding: .85rem 0; border-top: 1px solid var(--line); }
 .bluetooth-device h3, .bluetooth-device p { overflow-wrap: anywhere; margin: .25rem 0; }
+.monitoring-control { display: flex; justify-content: flex-end; align-items: center; gap: .75rem; margin-top: .75rem; }
+.monitoring-control > span { color: var(--muted); font-size: .75rem; }
+#monitoring-feedback { max-width: 25rem; }
+#status[data-state="paused"] { color: var(--muted); }

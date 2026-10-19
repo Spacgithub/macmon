@@ -316,16 +316,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut previous = None::<(String, u64)>;
         loop {
           let key = previous.as_ref().map(|(session, sequence)| (session.as_str(), *sequence));
-          let wait = process_cadence.write().unwrap().refresh_process_demand(Instant::now());
+          let (wait, generation) = {
+            let mut control = process_cadence.write().unwrap();
+            (control.refresh_process_demand(Instant::now()), control.monitoring().generation)
+          };
           match client.wait_after(key, wait) {
             Ok(Some(frame)) => {
-              previous = Some((frame.session.clone(), frame.revision));
-              *shared_frames.write().unwrap() = Some(frame);
+              let key = (frame.session.clone(), frame.revision);
+              if process_cadence.read().unwrap().forward(&shared_frames, frame, generation) {
+                previous = Some(key);
+              }
             }
             Ok(None) => {}
             Err(error) => {
               eprintln!("sampling source error: {error}");
-              return;
+              thread::sleep(Duration::from_secs(1));
             }
           }
         }

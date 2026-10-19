@@ -110,7 +110,7 @@ function fanTemplate() {
 
 async function drainMicrotasks() { for (let i = 0; i < 24; i++) await Promise.resolve(); }
 
-function boot({ reduced = false, storage = new Map(), storageFailure = false, expanded = false, managed = false, hostname = 'localhost' } = {}) {
+function boot({ reduced = false, storage = new Map(), storageFailure = false, expanded = false, managed = false, monitoring = false, hostname = 'localhost' } = {}) {
   let now = 0, nextId = 1, activeFetches = 0, maximumFetches = 0;
   const timers = new Map(), frames = new Map(), requests = [], elements = new Map(), animationTimes = [];
   const document = new Target();
@@ -148,13 +148,14 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
     return id;
   };
   const fetch = (url, options) => {
-    assert.ok(['/api/sample', '/api/interval', '/api/process-demand'].includes(url));
-    if (url === '/api/sample') assert.equal(options.cache, 'no-store');
+    assert.ok(['/api/sample', '/api/interval', '/api/process-demand', '/api/monitoring'].includes(url));
+    if (url === '/api/sample' || url === '/api/monitoring' && options.method !== 'POST') assert.equal(options.cache, 'no-store');
     else {
       assert.equal(options.method, 'POST');
       assert.equal(options.headers['Content-Type'], 'application/json');
       const body = JSON.parse(options.body);
-      if (url === '/api/interval') assert.ok(['increase', 'decrease'].includes(body.adjustment));
+      if (url === '/api/monitoring') assert.equal(typeof body.enabled, 'boolean');
+      else if (url === '/api/interval') assert.ok(['increase', 'decrease'].includes(body.adjustment));
       else {
         assert.ok(['none', 'summary', 'details'].includes(body.demand));
         assert.ok(body.lease === null || /^[\da-f]{32}$/i.test(body.lease));
@@ -173,6 +174,12 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
       };
       request.answer = (payload, status = 200) => finish({ status, ok: status >= 200 && status < 300,
         async json() { request.jsonCalls++; return payload; } });
+      request.delayJson = (status = 200) => {
+        let release;
+        const body = new Promise((resolve) => { release = resolve; });
+        finish({ status, ok: status >= 200 && status < 300, async json() { request.jsonCalls++; return body; } });
+        return release;
+      };
       request.fail = () => finish(new Error('Synthetic network failure'), true);
       options.signal.addEventListener('abort', () => {
         request.aborted = options.signal.reason;
@@ -182,6 +189,7 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
     });
     requests.push(request);
     if (url === '/api/process-demand' && !managed) request.answer({}, 404);
+    if (url === '/api/monitoring' && !monitoring) request.answer({}, 404);
     return request.promise;
   };
   const context = vm.createContext({ document, window, console, AbortController,
@@ -198,6 +206,7 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
   const inspect = (expression) => vm.runInContext(expression, context, { timeout: 1000 });
   const pending = (url = '/api/sample') => requests.find((request) => request.url === url && !request.done);
   const advance = async (milliseconds) => {
+    await drainMicrotasks();
     const until = now + milliseconds;
     let iterations = 0;
     while (true) {
@@ -216,6 +225,7 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
   return {
     elements, document, media, frames, requests, inspect, pending, storage, animationTimes,
     motionTimers: () => Number(timers.has(inspect('state.frame'))),
+    pollTimers: () => [...timers.values()].filter((value) => value.callback.name === 'poll').length,
     jump: (milliseconds) => { now += milliseconds; },
     state: () => inspect('state'),
     text: (id) => elements.get(id).textContent,
@@ -224,7 +234,8 @@ function boot({ reduced = false, storage = new Map(), storageFailure = false, ex
     maximumFetches: () => maximumFetches,
     async answer(payload, status = 200) { await drainMicrotasks(); assert.ok(pending(), 'No pending real poll'); pending().answer(payload, status); await drainMicrotasks(); },
     async control(payload, status = 200) { assert.ok(pending('/api/interval'), 'No pending real control'); pending('/api/interval').answer(payload, status); await drainMicrotasks(); },
-    async demand(payload = { lease: 'a'.repeat(32), ttl_ms: 15000 }, status = 200) { assert.ok(pending('/api/process-demand'), 'No pending process-demand request'); pending('/api/process-demand').answer(payload, status); await drainMicrotasks(); },
+    async demand(payload = { lease: 'a'.repeat(32), ttl_ms: 15000 }, status = 200) { await drainMicrotasks(); assert.ok(pending('/api/process-demand'), 'No pending process-demand request'); pending('/api/process-demand').answer(payload, status); await drainMicrotasks(); },
+    async monitoring(payload, status = 200) { await drainMicrotasks(); assert.ok(pending('/api/monitoring'), 'No pending monitoring request'); pending('/api/monitoring').answer(payload, status); await drainMicrotasks(); },
     async fail() { assert.ok(pending()); pending().fail(); await drainMicrotasks(); },
     async click(id) { const element = elements.get(id); if (!element.disabled) element.emit('click'); await drainMicrotasks(); },
     advance,
@@ -1631,6 +1642,7 @@ const demandBody = (h) => JSON.parse(h.pending('/api/process-demand').options.bo
 
 await check('managed process polling registers first and uses the lease marker without legacy requests', async () => {
   const h = boot({ managed: true });
+  await drainMicrotasks();
   assert.equal(h.pending(), undefined); assert.deepEqual(demandBody(h), { lease: null, demand: 'summary' });
   await h.demand();
   assert.equal(h.pending().options.headers['X-Macmon-Process-Lease'], 'a'.repeat(32));
@@ -1752,7 +1764,7 @@ await check('remote pages do not register process demand and forbidden controls 
   await denied.answer(sample()); assert.equal(denied.status(), 'live');
   await denied.click('process-toggle'); assert.equal(denied.requests.filter((request) => request.url === '/api/process-demand').length, 1);
   for (const hostname of ['localhost', '127.0.0.1', '127.42.0.1', '[::1]', '[::ffff:7f00:1]']) {
-    const h = boot({ managed: true, hostname }); assert.ok(h.pending('/api/process-demand'));
+    const h = boot({ managed: true, hostname }); await drainMicrotasks(); assert.ok(h.pending('/api/process-demand'));
   }
 });
 
@@ -1768,7 +1780,7 @@ await check('bad or failed lease replies never create an unmarked process demand
 });
 
 await check('independent process sequences refresh immediately during a ten-second system interval without adding chart samples', async () => {
-  const h = boot({ managed: true }); await h.click('process-toggle'); await h.demand(); await h.demand();
+  const h = boot({ managed: true }); await drainMicrotasks(); await h.click('process-toggle'); await h.demand(); await h.demand();
   const first = processFixture(1), detail = collection({ interval_ms: 10000, demand: 'details' });
   await h.answer(sample({ ...first, interval_ms: 10000, cadence: cadence(10000), process_collection: detail }));
   const history = h.state().history.length, before = processName(processGroups(h)[0]);
@@ -1997,6 +2009,181 @@ await check('Bluetooth rejects overlong or malformed scalar text while keeping d
     assert.equal(h.elements.get('bluetooth-rows').children.length, 0);
   }
   const h = boot(); assert.equal(h.inspect(`diskText("🎧".repeat(81))`), null);
+});
+
+
+const monitoringState = (enabled = true, generation = 0, state = enabled ? 'running' : 'paused', instance = '1'.repeat(16)) => ({ enabled, generation, state, instance });
+async function monitored({ managed = false, expanded = true } = {}) {
+  const h = boot({ monitoring: true, managed, expanded });
+  await h.monitoring(monitoringState());
+  if (managed) await h.demand();
+  return h;
+}
+async function confirmSwitch(h, enabled, generation, state = enabled ? 'reconnecting' : 'paused') {
+  await h.monitoring(monitoringState(enabled, generation, state));
+  if (h.pending('/api/monitoring')) await h.monitoring(monitoringState(enabled, generation, state));
+}
+
+await check('an initially paused backend polls only lightweight state and keeps all telemetry stopped', async () => {
+  const h = boot({ monitoring: true, managed: true, expanded: true });
+  await h.monitoring(monitoringState(false, 1));
+  assert.equal(h.status(), 'paused'); assert.equal(h.pending(), undefined); assert.equal(h.pending('/api/process-demand'), undefined);
+  await h.click('process-toggle'); await h.click('expand-all'); await h.fps(60); await h.motion(true); await h.focused(false); await h.focused(true);
+  for (let round = 0; round < 12; round++) { await h.advance(5000); await h.monitoring(monitoringState(false, 1)); }
+  assert.equal(h.requests.filter((item) => item.url !== '/api/monitoring').length, 0);
+  assert.equal(h.motionTimers(), 0); assert.equal(h.animationTimes.length, 0); assert.equal(h.pollTimers(), 0);
+  assert.match(h.text('monitoring-feedback'), /paused.*retained/);
+  await h.hidden(true); await h.hidden(false); await h.monitoring(monitoringState(false, 1));
+  assert.equal(h.pending('/api/process-demand'), undefined); assert.equal(h.pending(), undefined);
+});
+
+await check('the absolute Web switch preserves readings and resumes only after a fresh sample', async () => {
+  const h = await monitored({ managed: true });
+  await h.answer(sample({ ...processFixture(), process_collection: collection(), cadence: cadence(1000) }));
+  const history = h.state().history.length;
+  await h.click('monitoring-toggle'); await h.click('monitoring-toggle');
+  assert.equal(h.requests.filter((item) => item.url === '/api/monitoring' && item.options.method === 'POST').length, 1);
+  assert.notEqual(h.status(), 'paused', 'pending POST is not a confirmed pause');
+  assert.doesNotMatch(h.text('process-status'), /^PAUSED/, 'pending requests cannot claim a confirmed pause');
+  assert.equal(h.motionTimers(), 0);
+  await confirmSwitch(h, false, 1);
+  assert.equal(h.status(), 'paused'); assert.equal(h.text('cpu-value'), '25.0%'); assert.equal(h.state().history.length, history);
+  assert.match(h.text('process-status'), /^PAUSED/);
+  assert.equal(h.elements.get('interval-up').disabled, true); assert.equal(h.pending('/api/process-demand'), undefined);
+  await h.click('monitoring-toggle'); await confirmSwitch(h, true, 2);
+  assert.equal(h.status(), 'waiting'); assert.match(h.text('monitoring-feedback'), /fresh sample/);
+  await h.demand({ lease: 'b'.repeat(32), ttl_ms: 15000 }); await h.answer({}, 503);
+  assert.equal(h.status(), 'waiting'); assert.equal(h.motionTimers(), 0);
+  await h.advance(1000); await h.answer(sample({ sequence: 2, data: metrics({ cpu_active_ratio: 0.9 }) }));
+  assert.equal(h.status(), 'live'); assert.equal(h.text('cpu-value'), '90.0%'); assert.match(h.text('monitoring-feedback'), /enabled/);
+  assert.doesNotMatch(h.text('monitoring-feedback'), /waiting for a fresh sample/);
+});
+
+await check('a late sample JSON cannot revive readings or poll timers after pause', async () => {
+  const h = await monitored();
+  const release = h.pending().delayJson(); await drainMicrotasks();
+  await h.click('monitoring-toggle'); await confirmSwitch(h, false, 1);
+  release(sample({ data: metrics({ cpu_active_ratio: 0.99 }) })); await drainMicrotasks();
+  assert.equal(h.status(), 'paused'); assert.equal(h.state().sample, null); assert.equal(h.state().history.length, 0);
+  assert.equal(h.pollTimers(), 0); assert.equal(h.pending(), undefined); assert.equal(h.motionTimers(), 0);
+});
+
+await check('a late process lease JSON is discarded and resumed polling obtains a new lease', async () => {
+  const h = boot({ monitoring: true, managed: true }); await h.monitoring(monitoringState());
+  const release = h.pending('/api/process-demand').delayJson(); await drainMicrotasks();
+  await h.click('monitoring-toggle'); await confirmSwitch(h, false, 1);
+  await h.click('monitoring-toggle'); await confirmSwitch(h, true, 2);
+  release({ lease: 'a'.repeat(32), ttl_ms: 15000 }); await drainMicrotasks();
+  await h.advance(0);
+  assert.equal(h.inspect('processLease.token'), null);
+  assert.ok(h.pending('/api/process-demand'), 'resumption retries registration after the cancelled old JSON settles');
+  await h.demand({ lease: 'b'.repeat(32), ttl_ms: 15000 });
+  assert.equal(h.pending().options.headers['X-Macmon-Process-Lease'], 'b'.repeat(32));
+  await h.answer(sample()); assert.equal(h.status(), 'live');
+});
+
+await check('late interval JSON cannot overwrite cadence after a pause and resume', async () => {
+  const h = await monitored(); await h.answer(sample({ cadence: cadence(1000) }));
+  await h.click('interval-up'); const release = h.pending('/api/interval').delayJson(); await drainMicrotasks();
+  await h.click('monitoring-toggle'); await confirmSwitch(h, false, 1);
+  await h.click('monitoring-toggle'); await confirmSwitch(h, true, 2);
+  await h.answer(sample({ sequence: 2, cadence: cadence(2500) }));
+  release(cadence(1250)); await drainMicrotasks();
+  assert.equal(h.state().cadence.requested_ms, 2500); assert.equal(h.text('interval-value'), '2500 ms'); assert.equal(h.status(), 'live');
+});
+
+await check('failed or timed out switch requests never confirm a state change or automatically enable', async () => {
+  for (const failure of ['network', 'timeout', 'invalid', 'server']) {
+    const h = await monitored(); await h.answer(sample()); await h.click('monitoring-toggle');
+    const post = h.pending('/api/monitoring');
+    if (failure === 'network') { post.fail(); await drainMicrotasks(); }
+    else if (failure === 'timeout') await h.advance(2500);
+    else await h.monitoring(failure === 'invalid' ? monitoringState(true, 0) : {}, failure === 'server' ? 500 : 200);
+    assert.match(h.text('monitoring-feedback'), /not confirmed/); assert.notEqual(h.status(), 'paused');
+    assert.equal(h.requests.filter((item) => item.options.method === 'POST' && item.url === '/api/monitoring').length, 1);
+    assert.equal(h.pending(), undefined); assert.equal(h.motionTimers(), 0);
+    await h.monitoring(monitoringState(false, 1)); assert.equal(h.status(), 'paused');
+  }
+});
+
+await check('foreground tabs wait for confirmed shared state before metrics, demand or animation resume', async () => {
+  const h = await monitored({ managed: true }); await h.answer(sample());
+  await h.hidden(true); if (h.pending('/api/process-demand')) await h.demand();
+  await h.advance(100); await h.hidden(false); await h.focused(true);
+  assert.equal(h.pending(), undefined); assert.equal(h.pending('/api/process-demand'), undefined); assert.equal(h.motionTimers(), 0);
+  assert.notEqual(h.status(), 'live'); assert.ok(h.pending('/api/monitoring'));
+  await h.monitoring(monitoringState(false, 1)); assert.equal(h.status(), 'paused');
+  assert.equal(h.pending('/api/process-demand'), undefined);
+});
+
+await check('backend instance changes reset generation ordering and never send an automatic enable', async () => {
+  const h = boot({ monitoring: true, expanded: true }); await h.monitoring(monitoringState(false, 4));
+  await h.click('cpu-toggle'); const detail = h.state().details.cpu;
+  await h.advance(5000); h.pending('/api/monitoring').fail(); await drainMicrotasks();
+  await h.advance(5000); await h.monitoring(monitoringState(true, 0, 'running', '2'.repeat(16)));
+  assert.equal(h.inspect('monitoring.value.generation'), 0); assert.equal(h.inspect('monitoring.value.instance'), '2'.repeat(16));
+  await h.answer(sample({ sequence: 1 })); assert.equal(h.status(), 'live'); assert.equal(h.state().details.cpu, detail);
+  assert.equal(h.requests.filter((item) => item.url === '/api/monitoring' && item.options.method === 'POST').length, 0);
+});
+
+await check('late old-instance monitoring JSON cannot overwrite the newly confirmed backend', async () => {
+  const h = await monitored(); await h.answer(sample()); await h.advance(5000);
+  const release = h.pending('/api/monitoring').delayJson(); await drainMicrotasks();
+  await h.click('monitoring-toggle'); await h.monitoring(monitoringState(false, 0, 'paused', '2'.repeat(16)));
+  release(monitoringState(true, 100, 'running')); await drainMicrotasks();
+  if (h.pending('/api/monitoring')) await h.monitoring(monitoringState(false, 0, 'paused', '2'.repeat(16)));
+  assert.equal(h.status(), 'paused'); assert.equal(h.inspect('monitoring.value.instance'), '2'.repeat(16)); assert.equal(h.pollTimers(), 0);
+});
+
+await check('same-generation status checks neither multiply metrics timers nor revive stale reconnecting text', async () => {
+  const h = await monitored(); await h.answer(sample());
+  for (let tick = 1; tick <= 30; tick++) {
+    await h.advance(tick * 1000 - h.now());
+    assert.ok(h.pending(), `one metric poll at tick ${tick}`); await h.answer(sample({ sequence: tick + 1 }));
+    if (h.pending('/api/monitoring')) { await h.advance(100); await h.monitoring(monitoringState(true, 0, 'reconnecting')); }
+    assert.ok(h.pollTimers() <= 1); assert.equal(h.pending(), undefined); assert.match(h.text('monitoring-feedback'), /enabled/);
+  }
+  assert.equal(h.requests.filter((item) => item.url === '/api/sample').length, 31);
+});
+
+await check('malformed monitoring state is never treated as permission to collect', async () => {
+  for (const invalid of [{ enabled: 1 }, { enabled: false }, { generation: -1 }, { generation: Number.MAX_SAFE_INTEGER + 1 }, { state: 'paused' }, { state: 'unknown' }, { instance: '' }, { instance: 'g'.repeat(16) }]) {
+    const h = boot({ monitoring: true, managed: true }); await h.monitoring({ ...monitoringState(), ...invalid });
+    assert.equal(h.pending(), undefined); assert.equal(h.pending('/api/process-demand'), undefined); assert.notEqual(h.status(), 'live');
+    assert.equal(h.elements.get('monitoring-toggle').disabled, true); assert.match(h.text('monitoring-feedback'), /not confirmed/);
+  }
+});
+
+await check('same-instance generation ordering rejects stale and contradictory state without enabling', async () => {
+  const h = boot({ monitoring: true }); await h.monitoring(monitoringState(false, 4));
+  await h.advance(5000); await h.monitoring(monitoringState(true, 3));
+  assert.equal(h.status(), 'paused'); assert.equal(h.inspect('monitoring.value.generation'), 4); assert.equal(h.pending(), undefined);
+  await h.advance(5000); await h.monitoring(monitoringState(true, 4));
+  assert.match(h.text('monitoring-feedback'), /not confirmed/); assert.equal(h.pending(), undefined);
+  await h.advance(5000); await h.monitoring(monitoringState(true, 5));
+  await h.answer(sample()); assert.equal(h.status(), 'live');
+  assert.equal(h.requests.filter((item) => item.url === '/api/monitoring' && item.options.method === 'POST').length, 0);
+});
+
+await check('unreachable monitoring state displays OFFLINE and recovers through confirmed GET without enabling', async () => {
+  for (const timeout of [false, true]) {
+    const h = await monitored(); await h.answer(sample()); await h.advance(5000);
+    if (timeout) await h.advance(2500); else { h.pending('/api/monitoring').fail(); await drainMicrotasks(); }
+    assert.equal(h.status(), 'offline'); assert.match(h.text('monitoring-feedback'), /offline.*not confirmed/);
+    assert.equal(h.pending(), undefined); assert.equal(h.motionTimers(), 0); assert.equal(h.pollTimers(), 0);
+    assert.equal(h.text('cpu-value'), '25.0%');
+    await h.advance(5000); await h.monitoring(monitoringState());
+    assert.equal(h.status(), 'waiting'); await h.answer(sample({ sequence: 2 })); assert.equal(h.status(), 'live');
+    assert.equal(h.requests.filter((item) => item.url === '/api/monitoring' && item.options.method === 'POST').length, 0);
+  }
+});
+
+await check('legacy or remote monitoring controls preserve existing data functionality', async () => {
+  for (const code of [403, 404]) {
+    const h = boot({ monitoring: true }); await h.monitoring({}, code); await h.answer(sample());
+    assert.equal(h.status(), 'live'); assert.equal(h.elements.get('monitoring-toggle').disabled, true);
+    await h.advance(1000); assert.ok(h.pending()); assert.equal(h.pending('/api/monitoring'), undefined);
+  }
 });
 
 console.log(`${tests.length} dashboard checks passed.`);
