@@ -1059,27 +1059,49 @@ mod tests {
     assert_ne!(fresh.groups[0].members[0].instance, old_instance);
   }
 
-  #[test]
-  fn observer_input_stays_idle_on_its_private_terminal_and_shutdown_reaps_child() {
+  fn check_observer_input_and_cleanup(ready_delay: Duration) {
     let stop = AtomicBool::new(false);
     let mut pid = None;
     let mut cancelled = None;
     let started = Instant::now();
+    let script = r#"import os,select,signal,sys,time
+assert os.isatty(0) and os.isatty(1)
+assert os.ttyname(0)==os.ttyname(1)
+assert not select.select([0],[],[],0)[0]
+time.sleep(float(sys.argv[1]))
+print(',bytes_in,bytes_out,\ncheck.%d,1,2,\n,bytes_in,bytes_out,' % os.getpid(),flush=True)
+while True:
+    signal.pause()
+"#;
+    // Interpreter startup and host metadata collection are not cancellation latency.
+    // Only this fixture gets a wider readiness window; the production watchdog is unchanged.
     observe(
-      Command::new("/usr/bin/python3").args(["-c", "import os,select,time; assert os.isatty(0) and os.isatty(1); assert os.ttyname(0)==os.ttyname(1); assert not select.select([0],[],[],0)[0]; print(',bytes_in,bytes_out,\\ncheck.%d,1,2,\\n,bytes_in,bytes_out,' % os.getpid(),flush=True); time.sleep(5)"]),
+      Command::new("/usr/bin/python3").args(["-c", script, &ready_delay.as_secs_f64().to_string()]),
       &stop,
-      Duration::from_secs(5),
+      Duration::from_secs(15),
       |rows, _, _, _| {
         pid = rows.keys().next().copied();
         cancelled = Some(Instant::now());
         stop.store(true, Ordering::Release);
       },
-    ).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(7));
+    )
+    .unwrap();
+    assert!(cancelled.unwrap().duration_since(started) >= ready_delay);
     assert!(cancelled.unwrap().elapsed() < Duration::from_secs(1));
     let pid = pid.expect("private stdin must be a terminal without immediately readable EOF");
     assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+  }
+
+  #[test]
+  fn observer_input_stays_idle_on_its_private_terminal_and_shutdown_reaps_child() {
+    check_observer_input_and_cleanup(Duration::ZERO);
+  }
+
+  #[test]
+  fn delayed_observer_readiness_keeps_cancellation_and_child_reaping_bounded() {
+    // Reproduces a valid fixture becoming ready after the former five-second window.
+    check_observer_input_and_cleanup(Duration::from_secs(6));
   }
 
   #[test]
