@@ -248,8 +248,13 @@ fn to_prometheus(m: &Metrics, soc: &SocInfo) -> String {
     };
   }
 
-  // `gauge_any!`: a gauge every Mac and VM has.
+  // `gauge_any!`: a gauge for a Mac or VM; an optional value is omitted without a reading.
   macro_rules! gauge_any {
+    ($out:expr, $name:literal, $help:literal, ?$value:expr) => {
+      if let Some(value) = $value {
+        gauge_any!($out, $name, $help, value);
+      }
+    };
     ($out:expr, $name:literal, $help:literal, $value:expr) => {
       gauge_head!($out, $name, $help);
       let name = metric_name!($name);
@@ -300,6 +305,13 @@ fn to_prometheus(m: &Metrics, soc: &SocInfo) -> String {
   gauge_any!(out, "memory_ram_used_bytes", "Used RAM in bytes", m.memory.ram_usage);
   gauge_any!(out, "memory_swap_total_bytes", "Total swap in bytes", m.memory.swap_total);
   gauge_any!(out, "memory_swap_used_bytes", "Used swap in bytes", m.memory.swap_usage);
+  gauge_any!(out, "memory_pressure_level", "Memory pressure: 0 normal, 1 warning, 2 critical", ?m.memory_pressure_level);
+  gauge_any!(out, "memory_pressure_percent", "Memory pressure in percent, as in Activity Monitor", ?m.memory_pressure_percent);
+  gauge_any!(out, "net_in_bytes_per_second", "Bytes per second received by the Ethernet and Wi-Fi interfaces", ?m.net_in);
+  gauge_any!(out, "net_out_bytes_per_second", "Bytes per second sent by the Ethernet and Wi-Fi interfaces", ?m.net_out);
+  gauge_any!(out, "disk_read_bytes_per_second", "Bytes per second read from the disks", ?m.disk_read);
+  gauge_any!(out, "disk_write_bytes_per_second", "Bytes per second written to the disks", ?m.disk_write);
+  gauge_any!(out, "uptime_seconds", "Seconds since boot", ?m.uptime);
   gauge_any!(out, "cpu_scaled_ratio", "Combined frequency-scaled CPU ratio (0–1), weighted by core count", m.cpu_scaled_ratio);
   gauge_any!(out, "cpu_usage_ratio", "DEPRECATED: use macmon_cpu_scaled_ratio", m.cpu_scaled_ratio);
   gauge_any!(out, "cpu_active_ratio", "Combined CPU active residency ratio (not frequency-scaled, 0–1), weighted by core count", m.cpu_active_ratio);
@@ -321,10 +333,17 @@ fn to_prometheus(m: &Metrics, soc: &SocInfo) -> String {
   gauge_mac!(out, "cpu_power_watts", "CPU power consumption in Watts", m.cpu_power);
   gauge_mac!(out, "gpu_power_watts", "GPU power consumption in Watts", m.gpu_power);
   gauge_mac!(out, "ane_power_watts", "Apple Neural Engine power consumption in Watts", m.ane_power);
+  gauge_mac!(out, "chip_power_watts", "Chip power consumption in Watts", m.chip_power);
   gauge_mac!(out, "all_power_watts", "Combined CPU+GPU+ANE power consumption in Watts", m.all_power);
   gauge_mac!(out, "sys_power_watts", "Total system power consumption in Watts", m.sys_power);
   gauge_mac!(out, "ram_power_watts", "RAM power consumption in Watts", m.ram_power);
   gauge_mac!(out, "gpu_ram_power_watts", "GPU RAM power consumption in Watts", m.gpu_ram_power);
+  gauge_mac!(out, "dcs_power_watts", "DCS power consumption in Watts", ?m.dcs_power);
+  gauge_mac!(out, "media_power_watts", "Video encoder and image processor power consumption in Watts", ?m.media_power);
+  gauge_mac!(out, "dc_in_power_watts", "Power adapter input in Watts", ?m.dc_in_power);
+  gauge_mac!(out, "display_power_watts", "Built-in display backlight power in Watts", ?m.display_power);
+  gauge_any!(out, "gpu_memory_alloc_bytes", "System memory allocated by the GPU in bytes", ?m.gpu_mem_alloc);
+  gauge_any!(out, "gpu_memory_in_use_bytes", "System memory in use by the GPU in bytes", ?m.gpu_mem_in_use);
   if !m.fans.is_empty() {
     gauge_head!(out, "fan_speed_rpm", "Fan speed in revolutions per minute");
     let fan_speed_rpm = metric_name!("fan_speed_rpm");
@@ -2179,7 +2198,14 @@ mod tests {
   #[test]
   fn a_vm_has_no_power_and_frequency_gauges() {
     let tier = CpuTierMetrics { label: "_".into(), ..Default::default() };
-    let metrics = Metrics { cpu_tiers: vec![tier], ..Default::default() };
+    let metrics = Metrics {
+      cpu_tiers: vec![tier],
+      dcs_power: Some(0.25),
+      media_power: Some(0.5),
+      dc_in_power: Some(10.0),
+      display_power: Some(2.0),
+      ..Default::default()
+    };
     let types = |vm| {
       let soc = SocInfo { vm, ..Default::default() };
       let output = to_prometheus(&metrics, &soc);
@@ -2188,16 +2214,67 @@ mod tests {
     };
 
     // a Mac: every gauge, in the same order
-    let power =
-      ["cpu", "gpu", "ane", "all", "sys", "ram", "gpu_ram"].map(|x| format!("{x}_power_watts"));
+    let power = [
+      "cpu", "gpu", "ane", "chip", "all", "sys", "ram", "gpu_ram", "dcs", "media", "dc_in",
+      "display",
+    ]
+    .map(|x| format!("{x}_power_watts"));
     let freqs = ["ecpu_freq_mhz", "pcpu_freq_mhz", "cpu_tier_freq_mhz", "gpu_freq_mhz"];
     let mac = types(false);
-    assert_eq!(mac.len(), 29, "{mac:?}"); // no temperature and fan gauges without readings
+    assert_eq!(mac.len(), 34, "{mac:?}"); // no temperature and fan gauges without readings
     assert!(power.iter().chain(&freqs.map(String::from)).all(|x| mac.contains(x)), "{mac:?}");
 
     // a VM: the same without the power and frequency gauges
     let expected = mac.iter().filter(|x| !power.contains(x) && !freqs.contains(&x.as_str()));
     assert_eq!(types(true), expected.cloned().collect::<Vec<_>>());
+  }
+
+  #[test]
+  fn additive_exporter_metrics_leave_existing_totals_and_memory_unchanged() {
+    let metrics = Metrics {
+      all_power: 2.0,
+      chip_power: 3.0,
+      memory_pressure_level: Some(1),
+      memory_pressure_percent: Some(25),
+      net_in: Some(1_000),
+      disk_write: Some(2_000),
+      uptime: Some(3_600),
+      gpu_mem_alloc: Some(4_000),
+      gpu_mem_in_use: Some(500),
+      dc_in_power: Some(10.0),
+      ..Default::default()
+    };
+    let soc = SocInfo::default();
+    let doc: serde_json::Value = serde_json::from_str(&to_json(&metrics, &soc)).unwrap();
+    assert_eq!(
+      doc["memory"],
+      serde_json::json!({"ram_total":0,"ram_usage":0,"swap_total":0,"swap_usage":0})
+    );
+    assert_eq!(doc["memory_pressure_level"], 1);
+    assert_eq!(doc["all_power"], 2.0);
+    assert_eq!(doc["chip_power"], 3.0);
+    assert_eq!(doc["net_in"], 1_000);
+    assert!(doc["net_out"].is_null());
+
+    let output = to_prometheus(&metrics, &soc);
+    for (name, value) in [
+      ("all_power_watts", "2"),
+      ("chip_power_watts", "3"),
+      ("memory_pressure_level", "1"),
+      ("memory_pressure_percent", "25"),
+      ("net_in_bytes_per_second", "1000"),
+      ("disk_write_bytes_per_second", "2000"),
+      ("uptime_seconds", "3600"),
+      ("gpu_memory_alloc_bytes", "4000"),
+      ("gpu_memory_in_use_bytes", "500"),
+      ("dc_in_power_watts", "10"),
+    ] {
+      assert!(output.contains(&format!("macmon_{name}{{chip=\"\"}} {value}\n")), "{name}");
+    }
+    for absent in ["net_out_bytes_per_second", "disk_read_bytes_per_second", "display_power_watts"]
+    {
+      assert!(!output.contains(&format!("macmon_{absent}")), "{absent}");
+    }
   }
 
   #[test]

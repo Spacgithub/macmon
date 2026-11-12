@@ -122,26 +122,6 @@ impl Default for Config {
   }
 }
 
-/// The real user behind `sudo` (`SUDO_UID` / `SUDO_GID` while running as root): files saved into
-/// their home are handed back to them, so their own runs can still update the settings.
-fn sudo_owner() -> Option<(u32, u32)> {
-  let var = |name| std::env::var(name).ok();
-  owner_behind_sudo(unsafe { libc::geteuid() }, var("SUDO_UID"), var("SUDO_GID"))
-}
-
-fn owner_behind_sudo(euid: u32, uid: Option<String>, gid: Option<String>) -> Option<(u32, u32)> {
-  if euid != 0 {
-    return None;
-  }
-  Some((uid?.parse().ok()?, gid?.parse().ok()?))
-}
-
-fn give_to(path: &Path, owner: Option<(u32, u32)>) {
-  if let Some((uid, gid)) = owner {
-    let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
-  }
-}
-
 impl Config {
   fn normalize(mut self) -> Self {
     self.interval = self.interval.clamp(TUI_MIN_MS, TUI_MAX_MS);
@@ -189,18 +169,23 @@ impl Config {
     Self { path, ..cfg }
   }
 
-  /// Writes the settings to their file.
+  /// Writes the settings to their file for unprivileged sessions only.
   pub fn save(&self) {
     self.save_preferences(false);
   }
 
   fn save_preferences(&self, interval_change: bool) {
+    self.save_as(unsafe { libc::geteuid() }, interval_change);
+  }
+
+  fn save_as(&self, euid: u32, interval_change: bool) {
+    // A root session must not write through a user's HOME, even when the path exists.
+    if euid == 0 {
+      return;
+    }
     let Some(path) = &self.path else { return };
-    let owner = sudo_owner();
-    if let Some(dir) = path.parent().filter(|dir| !dir.exists())
-      && fs::create_dir_all(dir).is_ok()
-    {
-      give_to(dir, owner);
+    if let Some(dir) = path.parent() {
+      let _ = fs::create_dir_all(dir);
     }
 
     if let Ok(mut file) =
@@ -223,7 +208,6 @@ impl Config {
           .and_then(|_| file.write_all(&bytes))
           .and_then(|_| file.set_len(bytes.len() as u64));
       }
-      give_to(path, owner);
     }
   }
 
@@ -366,16 +350,28 @@ impl Drop for TempConfig {
 
 #[cfg(test)]
 mod tests {
-  use super::{Config, ProcSort, RatioMode, TUI_MIN_MS, TempConfig, ViewType, owner_behind_sudo};
+  use super::{Config, ProcSort, RatioMode, TUI_MIN_MS, TempConfig, ViewType};
 
   #[test]
-  fn files_saved_under_sudo_go_to_the_real_user() {
-    let id = |s: &str| Some(s.to_string());
-    assert_eq!(owner_behind_sudo(0, id("501"), id("20")), Some((501, 20)));
-    // not root, root without sudo, or broken variables: files stay as created
-    assert_eq!(owner_behind_sudo(501, id("501"), id("20")), None);
-    assert_eq!(owner_behind_sudo(0, None, None), None);
-    assert_eq!(owner_behind_sudo(0, id("x"), id("20")), None);
+  fn root_preferences_do_not_follow_links_or_create_files() {
+    use std::os::unix::fs::symlink;
+
+    let file = TempConfig::new("root_save_symlink");
+    let path = file.path();
+    let dir = path.parent().unwrap();
+    let missing = dir.join("missing").join("macmon.json");
+    std::fs::create_dir_all(dir).unwrap();
+    let target = dir.join("target");
+    std::fs::write(&target, "protected content").unwrap();
+    symlink(&target, &path).unwrap();
+    let cfg = Config::load_from(Some(path));
+    for interval_change in [false, true] {
+      cfg.save_as(0, interval_change);
+    }
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "protected content");
+    Config::load_from(Some(missing.clone())).save_as(0, true);
+    assert!(!missing.parent().unwrap().exists());
+    std::fs::remove_file(target).unwrap();
   }
 
   fn parse(json: &str) -> Config {

@@ -22,6 +22,7 @@ use super::theme::{self, dim, faint, gradient, heading, text};
 use crate::config::{Config, ProcSort};
 use crate::proc_groups::{GroupKind, ProcGroup};
 use crate::procs::ProcInfo;
+use crate::query::{Query, has_qualifier};
 
 /// Narrowest NAME column; other columns are dropped to keep it.
 const NAME_MIN_WIDTH: u16 = 8;
@@ -291,6 +292,29 @@ fn hit(proc: &ProcInfo, term: &str) -> bool {
   proc.name.to_lowercase().contains(term) || proc.pid.to_string().contains(term)
 }
 
+enum ProcessFilter {
+  Plain(Filter),
+  Fields(Query),
+}
+
+impl ProcessFilter {
+  fn parse(text: &str) -> Self {
+    if has_qualifier(text) {
+      Self::Fields(Query::parse(text))
+    } else {
+      Self::Plain(Filter::parse(text))
+    }
+  }
+
+  fn matches(&self, proc: &ProcInfo, app_label: Option<&str>) -> bool {
+    match self {
+      Self::Plain(filter) => filter
+        .matches(|term| app_label.is_some_and(|label| label.contains(term)) || hit(proc, term)),
+      Self::Fields(query) => query.matches(proc, app_label),
+    }
+  }
+}
+
 /// Totals of the listed processes matching one filter term: `chrome` sums Chrome and all its
 /// helpers. A process matching two terms counts in both.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -325,29 +349,82 @@ impl Group {
   }
 }
 
-/// Drops the last word of a filter and the commas and spaces after it: `claude, clan` →
-/// `claude, `, then `claude, ` → ``.
-fn delete_word(text: &mut String) {
-  let separator = |c: char| c == ',' || c.is_whitespace();
-  let kept = text.trim_end_matches(separator).trim_end_matches(|c| !separator(c)).len();
-  text.truncate(kept);
+/// What separates the words of a filter.
+fn is_separator(c: char) -> bool {
+  c == ',' || c.is_whitespace()
 }
 
-/// Filter input on `filter`: characters and Backspace edit, Ctrl-W / Alt-Backspace delete the last
-/// word, Ctrl-U (what Ghostty sends for Cmd-Backspace) and Cmd-Backspace delete the whole text,
-/// Enter keeps the filter, Esc clears it; both end the input. Returns whether the filter changed.
-pub(super) fn type_filter(filter: &mut String, typing: &mut bool, key: KeyEvent) -> bool {
+/// Start of the word before character `at`, past the commas and spaces after that word.
+fn word_start(text: &str, at: usize) -> usize {
+  let head = text[..byte_at(text, at)].trim_end_matches(is_separator);
+  head.trim_end_matches(|c| !is_separator(c)).chars().count()
+}
+
+/// End of the word after character `at`, past the commas and spaces before that word.
+fn word_end(text: &str, at: usize) -> usize {
+  let rest = &text[byte_at(text, at)..];
+  let left = rest.trim_start_matches(is_separator).trim_start_matches(|c| !is_separator(c));
+  at + rest.chars().count() - left.chars().count()
+}
+
+/// Drops the word before the cursor and the commas and spaces after that word: `claude, clan` →
+/// `claude, `, then `claude, ` → ``.
+fn delete_word(text: &mut String, cursor: &mut usize) {
+  let start = word_start(text, *cursor);
+  text.replace_range(byte_at(text, start)..byte_at(text, *cursor), "");
+  *cursor = start;
+}
+
+/// Byte offset of character `at` of `text`, its length past the last one.
+fn byte_at(text: &str, at: usize) -> usize {
+  text.char_indices().nth(at).map_or(text.len(), |(i, _)| i)
+}
+
+/// Filter input on `filter` at character `cursor`: ← / →, Alt-← / Alt-→ or Alt-B / Alt-F (by word),
+/// Ctrl-A / Ctrl-E move to its ends, characters, Backspace and Delete edit there, Ctrl-W /
+/// Alt-Backspace delete the word before it, Ctrl-U (what Ghostty sends for Cmd-Backspace) and
+/// Cmd-Backspace delete the whole text, Enter keeps the filter, Esc clears it; both end the input.
+/// Returns whether the filter changed.
+pub(super) fn type_filter(
+  filter: &mut String,
+  cursor: &mut usize,
+  typing: &mut bool,
+  key: KeyEvent,
+) -> bool {
   let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
   let alt = key.modifiers.contains(KeyModifiers::ALT);
   let cmd = key.modifiers.contains(KeyModifiers::SUPER);
+  let len = filter.chars().count();
+  let moved = match key.code {
+    KeyCode::Left | KeyCode::Char('b') if alt => Some(word_start(filter, *cursor)),
+    KeyCode::Right | KeyCode::Char('f') if alt => Some(word_end(filter, *cursor)),
+    KeyCode::Left => Some(cursor.saturating_sub(1)),
+    KeyCode::Right => Some(len.min(*cursor + 1)),
+    KeyCode::Char('a') if ctrl => Some(0),
+    KeyCode::Char('e') if ctrl => Some(len),
+    _ => None,
+  };
+  if let Some(moved) = moved {
+    *cursor = moved;
+    return false;
+  }
+
+  let at = byte_at(filter, *cursor);
   match key.code {
     KeyCode::Char('u') if ctrl => filter.clear(),
     KeyCode::Backspace if cmd => filter.clear(),
-    KeyCode::Char('w') if ctrl => delete_word(filter),
-    KeyCode::Backspace if alt => delete_word(filter),
-    KeyCode::Char(c) if !(ctrl || alt || cmd) => filter.push(c),
-    KeyCode::Backspace => {
-      filter.pop();
+    KeyCode::Char('w') if ctrl => delete_word(filter, cursor),
+    KeyCode::Backspace if alt => delete_word(filter, cursor),
+    KeyCode::Char(c) if !(ctrl || alt || cmd) => {
+      filter.insert(at, c);
+      *cursor += 1;
+    }
+    KeyCode::Backspace if *cursor > 0 => {
+      *cursor -= 1;
+      filter.remove(byte_at(filter, *cursor));
+    }
+    KeyCode::Delete if *cursor < len => {
+      filter.remove(at);
     }
     KeyCode::Enter => {
       *typing = false;
@@ -359,44 +436,81 @@ pub(super) fn type_filter(filter: &mut String, typing: &mut bool, key: KeyEvent)
     }
     _ => return false,
   }
+  *cursor = (*cursor).min(filter.chars().count());
   true
 }
 
 /// `name`, then `/ filter`, or the filter once there is one or it is being typed. A filter too
 /// long for the border shows its end (`/…ari█`); with no room for that next to `name`, the filter
-/// takes its place.
+/// takes its place. `cursor`: while it is typed.
 pub(super) fn filter_titles(
   name: Vec<Span<'static>>,
   filter: &str,
-  typing: bool,
+  cursor: Option<usize>,
+  enabled: bool,
   width: u16,
 ) -> Titles<'static> {
-  if !typing && filter.is_empty() {
+  if cursor.is_none() && filter.is_empty() {
     return Titles::new(name).left(hint("/", "filter"));
   }
   let beside = title_text_room(width, &[Line::from(name.clone())]);
   if beside >= FILTER_MIN_WIDTH {
-    Titles::new(name).left(filter_title(filter, typing, beside))
+    Titles::new(name).left(filter_title(filter, cursor, enabled, beside))
   } else {
-    Titles::new(filter_title(filter, typing, title_text_room(width, &[])))
+    Titles::new(filter_title(filter, cursor, enabled, title_text_room(width, &[])))
   }
 }
 
-/// `/saf` (with a cursor while typing) in `room` cells: a filter too long keeps its end, after `…`.
-pub(super) fn filter_title(filter: &str, typing: bool, room: u16) -> Vec<Span<'static>> {
-  // `/` and the cursor (one cell each) around the filter text
-  let text_room = usize::from(room).saturating_sub(1 + usize::from(typing));
+/// `spans` with one span a character, the one at `at` inverted, or the cursor block after them.
+fn with_cursor(spans: Vec<Span<'static>>, at: usize) -> Vec<Span<'static>> {
+  let chars = |span: Span<'static>| {
+    let chars = span.content.chars().map(|c| Span::styled(c.to_string(), span.style));
+    chars.collect::<Vec<_>>()
+  };
+  let mut cells: Vec<_> = spans.into_iter().flat_map(chars).collect();
+  match cells.get_mut(at) {
+    Some(cell) => cell.style = cell.style.add_modifier(Modifier::REVERSED),
+    None => cells.push(Span::styled(FILTER_CURSOR, theme::TEXT)),
+  }
+  cells
+}
+
+/// `/saf` (with a cursor while typing) in `room` cells: a filter too long keeps its end after `…`,
+/// or with the cursor inside it the part around the cursor.
+pub(super) fn filter_title(
+  filter: &str,
+  cursor: Option<usize>,
+  enabled: bool,
+  room: u16,
+) -> Vec<Span<'static>> {
+  // `/` and a possible trailing cursor around the filter text
+  let text_room = usize::from(room).saturating_sub(1 + usize::from(cursor.is_some()));
 
   let mut spans = vec![heading("/")];
-  if Span::raw(filter).width() <= text_room {
-    spans.push(text(filter.to_string()));
-  } else {
-    spans.push(dim(ELLIPSIS));
-    spans.push(text(tail(filter, text_room.saturating_sub(1)).to_string()));
+  let (mut shown, mut skipped) = (filter, 0);
+  if Span::raw(filter).width() > text_room {
+    let room = text_room.saturating_sub(1);
+    let before = &filter[..cursor.map_or(filter.len(), |at| byte_at(filter, at))];
+    let end = head(filter, room.max(Span::raw(before).width() + room / 2));
+    shown = tail(end, room);
+    skipped = filter[..end.len() - shown.len()].chars().count();
+    if skipped > 0 {
+      spans.push(dim(ELLIPSIS));
+    }
   }
-  if typing {
-    spans.push(Span::styled(FILTER_CURSOR, theme::TEXT));
+
+  let words = vec![text(shown.to_string())];
+  match cursor {
+    Some(at) => spans.extend(with_cursor(words, at.saturating_sub(skipped))),
+    None => spans.extend(words),
   }
+
+  if !enabled {
+    for span in &mut spans {
+      *span = faint(span.content.clone());
+    }
+  }
+
   spans
 }
 
@@ -530,6 +644,8 @@ pub(super) struct ProcView {
   pub(super) sort_desc: bool,
   pub(super) grouped: bool,
   filter: String,
+  filter_enabled: bool,
+  cursor: usize,
   /// Filter input mode: keys edit the filter instead of acting as shortcuts.
   typing: bool,
   /// Latest sample, sorted; `None` until the first one arrives.
@@ -570,6 +686,8 @@ impl ProcView {
       sort_desc,
       grouped,
       filter: String::new(),
+      filter_enabled: true,
+      cursor: 0,
       typing: false,
       procs: None,
       rows: vec![],
@@ -603,7 +721,11 @@ impl ProcView {
   }
 
   pub(super) fn filter(&self) -> &str {
-    &self.filter
+    if self.filter_enabled { &self.filter } else { "" }
+  }
+
+  fn filter_cursor(&self) -> Option<usize> {
+    self.typing.then_some(self.cursor)
   }
 
   pub(super) fn groups(&self) -> &[Group] {
@@ -745,12 +867,25 @@ impl ProcView {
     let procs = self.procs.as_deref_mut().unwrap_or_default();
     sort_procs(procs, self.sort, self.sort_desc, self.grouped);
 
-    let filter = Filter::parse(&self.filter);
-    self.rows = (0..procs.len()).filter(|&i| filter.matches(|t| hit(&procs[i], t))).collect();
+    let filter = ProcessFilter::parse(self.filter());
+    self.rows.clear();
     self.groups = if self.grouped {
       Vec::new()
     } else {
-      filter.any.iter().map(|term| Group::sum(term, self.rows().filter(|p| hit(p, term)))).collect()
+      let procs = self.procs.as_deref().unwrap_or_default();
+      self.rows.extend((0..procs.len()).filter(|&index| filter.matches(&procs[index], None)));
+      match &filter {
+        ProcessFilter::Plain(filter) => filter
+          .any
+          .iter()
+          .map(|term| Group::sum(term, self.rows().filter(|proc| hit(proc, term))))
+          .collect(),
+        ProcessFilter::Fields(query) => query
+          .any
+          .iter()
+          .map(|term| Group::sum(&term.text, self.rows().filter(|proc| term.hit(proc, None))))
+          .collect(),
+      }
     };
     sort_groups(&mut self.groups, self.sort, self.sort_desc);
 
@@ -767,7 +902,7 @@ impl ProcView {
     self.offset = self.offset.min(self.display.len().saturating_sub(self.page.max(1)));
   }
 
-  fn rebuild_display(&mut self, filter: &Filter) {
+  fn rebuild_display(&mut self, filter: &ProcessFilter) {
     self.members.clear();
     self.leaders.clear();
     self.roots.clear();
@@ -793,10 +928,10 @@ impl ProcView {
         let mut members: Vec<_> = all
           .into_iter()
           .filter(|&member| {
-            filter.matches(|term| {
-              (group.kind == GroupKind::Application && name.contains(term))
-                || hit(&procs[member], term)
-            })
+            filter.matches(
+              &procs[member],
+              (group.kind == GroupKind::Application).then_some(name.as_str()),
+            )
           })
           .collect();
         // The immutable membership uses identities; the sorted sample provides child order.
@@ -974,11 +1109,22 @@ impl ProcView {
 
     match key.code {
       _ if self.typing => {
-        if type_filter(&mut self.filter, &mut self.typing, key) {
+        if type_filter(&mut self.filter, &mut self.cursor, &mut self.typing, key) {
           self.refresh();
         }
       }
-      KeyCode::Char('/') => self.typing = true,
+      KeyCode::Char('/') => {
+        self.cursor = self.filter.chars().count();
+        self.typing = true;
+        if !self.filter_enabled {
+          self.filter_enabled = true;
+          self.refresh();
+        }
+      }
+      KeyCode::Char('F') if !self.filter.is_empty() => {
+        self.filter_enabled = !self.filter_enabled;
+        self.refresh();
+      }
       KeyCode::Char('g')
         if !key
           .modifiers
@@ -1150,8 +1296,13 @@ impl ProcView {
         self.row_count(),
         self.procs().map_or(0, <[_]>::len)
       );
-      let titles =
-        filter_titles(vec![theme::value(name, theme::SECTION)], &self.filter, self.typing, width);
+      let titles = filter_titles(
+        vec![theme::value(name, theme::SECTION)],
+        &self.filter,
+        self.filter_cursor(),
+        self.filter_enabled,
+        width,
+      );
       return if self.typing {
         titles
       } else {
@@ -1172,7 +1323,7 @@ impl ProcView {
     if let Some(procs) = self.procs() {
       let total = procs.len().to_string();
       // padded to the digits of the total, so the filter after it stays put while it is typed
-      let count = if self.filter.is_empty() && !self.typing {
+      let count = if self.filter().is_empty() && !self.typing {
         format!(" {total}")
       } else {
         format!(" {:>width$}/{total}", self.row_count(), width = total.len())
@@ -1180,7 +1331,8 @@ impl ProcView {
       name.push(dim(count));
     }
 
-    let titles = filter_titles(name, &self.filter, self.typing, width);
+    let titles =
+      filter_titles(name, &self.filter, self.filter_cursor(), self.filter_enabled, width);
     let actions =
       || join([hint("i", "info"), hint("e", "finder"), hint("c", "copy"), hint("k", "kill")]);
     match self.typing {
@@ -1233,12 +1385,13 @@ impl App {
       };
       filter_titles(
         vec![theme::value(name, theme::SECTION)],
-        view.filter(),
-        view.typing(),
+        &view.filter,
+        view.filter_cursor(),
+        view.filter_enabled,
         area.width,
       )
       .right(hint("f", "full"))
-    } else if view.typing() || !view.filter().is_empty() {
+    } else if view.typing() || !view.filter.is_empty() {
       view.titles(area.width).right(hint("f", "full"))
     } else if area.height < 5 {
       Titles::new(theme::value(format!("6 Processes · {count}"), theme::SECTION))
@@ -1298,7 +1451,7 @@ impl App {
     if (self.proc_view.grouped || self.proc_view.row_count() > 5) && area.height > 1 {
       let shown = (inner.height.saturating_sub(1) as usize).min(5).min(self.proc_view.roots.len());
       let label = if self.proc_view.grouped {
-        let scope = if self.proc_view.filter.is_empty() { "procs" } else { "matching" };
+        let scope = if self.proc_view.filter().is_empty() { "procs" } else { "matching" };
         format!(
           " {shown}/{} entries · {} {scope} · g raw ",
           self.proc_view.roots.len(),
@@ -1463,7 +1616,7 @@ impl App {
             } else {
               "▶"
             };
-            let matching = if view.filter.is_empty() {
+            let matching = if view.filter().is_empty() {
               String::new()
             } else {
               format!("{}/{count} ", view.members[index].len())
@@ -1722,9 +1875,15 @@ mod tests {
 
   #[test]
   fn application_totals_are_filter_independent_and_member_matches_are_explicit() {
-    for (filter, matched) in
-      [("safari", 2), ("浏览器", 2), ("bookmarks", 1), ("2301", 1), ("safari,!bookmarks", 1)]
-    {
+    for (filter, matched) in [
+      ("safari", 2),
+      ("浏览器", 2),
+      ("bookmarks", 1),
+      ("2301", 1),
+      ("safari,!bookmarks", 1),
+      ("app:safari mem:>800m", 1),
+      ("浏览器 mem:>800m", 1),
+    ] {
       let mut view = grouped_view();
       let initial = view.applications[safari(&view)].clone();
       press(&mut view, KeyCode::Char('/'));
@@ -2181,6 +2340,38 @@ mod tests {
       type_str(&mut view, filter);
       assert_eq!(pids(&view), expected, "{filter:?}");
     }
+  }
+
+  #[test]
+  fn field_queries_can_be_disabled_and_restored_without_changing_the_saved_filter() {
+    let mut view = view();
+    assert!(press(&mut view, KeyCode::Char('/')));
+    type_str(&mut view, "saf mem:>800m");
+    assert!(press(&mut view, KeyCode::Enter));
+    assert_eq!(pids(&view), [2301]);
+    assert_eq!(view.groups().len(), 1);
+    assert!(press(&mut view, KeyCode::Char('F')));
+    assert!(view.filter().is_empty());
+    assert_eq!(pids(&view).len(), 5);
+    assert!(view.groups().is_empty());
+    assert!(press(&mut view, KeyCode::Char('F')));
+    assert_eq!(view.filter(), "saf mem:>800m");
+    assert_eq!(pids(&view), [2301]);
+  }
+
+  #[test]
+  fn filter_cursor_inserts_and_deletes_without_splitting_unicode() {
+    let mut view = view();
+    assert!(press(&mut view, KeyCode::Char('/')));
+    type_str(&mut view, "sαf");
+    assert!(press(&mut view, KeyCode::Left));
+    assert!(press(&mut view, KeyCode::Backspace));
+    assert!(press(&mut view, KeyCode::Char('a')));
+    assert_eq!(view.filter(), "saf");
+    assert_eq!(pids(&view), [2301, 77]);
+    assert!(press(&mut view, KeyCode::Delete));
+    assert_eq!(view.filter(), "sa");
+    assert!(view.typing());
   }
 
   #[test]

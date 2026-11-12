@@ -312,6 +312,51 @@ pub(crate) fn exe_path(pid: i32) -> Option<String> {
   Some(String::from_utf8_lossy(&buf[..len as usize]).into_owned())
 }
 
+/// Local detail only: returns arguments without environment strings or terminal control characters.
+pub(crate) fn cmd_line(pid: i32) -> Option<String> {
+  let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+  let mut read = |buf: *mut u8, size: &mut usize| unsafe {
+    libc::sysctl(mib.as_mut_ptr(), 3, buf.cast(), size, std::ptr::null_mut(), 0) == 0
+  };
+  let mut size = 0;
+  if !read(std::ptr::null_mut(), &mut size) || !(4..=1024 * 1024).contains(&size) {
+    return None;
+  }
+  let mut buf = vec![0; size];
+  read(buf.as_mut_ptr(), &mut size).then_some(())?;
+  let args = parse_args(buf.get(..size)?)?;
+  let mut escaped = String::with_capacity(args.len());
+  for c in args.chars() {
+    if c.is_control() {
+      escaped.extend(c.escape_default());
+    } else {
+      escaped.push(c);
+    }
+  }
+  Some(escaped)
+}
+
+/// XNU's `exec_extract_strings` aligns the path to the new process's pointer size (8 on Apple
+/// Silicon) before `argc` NUL-terminated arguments.
+/// `argv[0]` can be empty; skipping all zeroes would admit a subsequent environment value.
+fn parse_args(buf: &[u8]) -> Option<String> {
+  let (argc, rest) = buf.split_first_chunk()?;
+  let argc = usize::try_from(i32::from_ne_bytes(*argc)).ok()?;
+  let path = rest.iter().position(|&byte| byte == 0)?;
+  let start = (path + 1).next_multiple_of(8);
+  rest.get(path..start)?.iter().all(|&byte| byte == 0).then_some(())?;
+  let mut words = rest[start..].split_inclusive(|&byte| byte == 0);
+  let mut result = String::new();
+  for index in 0..argc {
+    let word = words.next()?.strip_suffix(&[0])?;
+    if index > 0 {
+      result.push(' ');
+    }
+    result.push_str(&String::from_utf8_lossy(word));
+  }
+  Some(result)
+}
+
 /// Reads a process through libproc; fails for other users' processes.
 fn read_libproc(pid: i32, flavor: c_int, (numer, denom): (u32, u32)) -> Option<Raw> {
   let info = bsd_info(pid)?;
@@ -808,7 +853,6 @@ impl ProcSampler {
   /// a process is the same while its pid, start time, command and executable path stay the same.
   /// A path that isn't readable on this tick keeps the last one.
   fn update(&mut self, rows: Vec<Raw>, elapsed_ns: u64) -> Vec<ProcInfo> {
-    let mut known = HashMap::with_capacity(rows.len());
     let mut procs = Vec::with_capacity(rows.len());
     self.clock_ns += elapsed_ns;
 
@@ -888,7 +932,7 @@ impl ProcSampler {
         },
       });
       let counters = raw.counters;
-      known.insert(
+      self.known.insert(
         raw.pid,
         Known {
           identity: raw.identity,
@@ -902,7 +946,11 @@ impl ProcSampler {
       );
     }
 
-    self.known = known;
+    // PID enumeration and the libproc/ps merge produce one row per PID.
+    if self.known.len() > procs.len() {
+      let alive: HashSet<_> = procs.iter().map(|row| row.pid).collect();
+      self.known.retain(|pid, _| alive.contains(pid));
+    }
     procs
   }
 }
@@ -918,6 +966,22 @@ mod tests {
   /// Pids of made-up processes.
   const A: i32 = 1_000_001;
   const B: i32 = 1_000_002;
+
+  #[test]
+  fn command_line_uses_exact_arguments_and_does_not_read_environment() {
+    let cases: &[(i32, &[u8], Option<&str>)] = &[
+      (2, b"/bin/ls\0ls\0-l\0KEY=1\0", Some("ls -l")),
+      (2, b"/bin/ls\0\0-l\0KEY=1\0", Some(" -l")),
+      (0, b"/bin/ls\0KEY=1\0", Some("")),
+      (-1, b"/bin/ls\0KEY=1\0", None),
+      (2, b"/bin/ls\0ls\0-l", None),
+      (1, b"/bin/sleep\0sleep\0", None),
+    ];
+    for (argc, rest, expected) in cases {
+      let buffer = [&argc.to_ne_bytes(), *rest].concat();
+      assert_eq!(parse_args(&buffer).as_deref(), *expected);
+    }
+  }
 
   fn counters(cpu_ns: u64, energy_nj: Option<u64>) -> Counters {
     Counters { start: 42, cpu_ns, energy_nj, gpu_ns: None, gpu_readable: false }

@@ -18,6 +18,7 @@ mod find_clpc;
 mod proc_groups;
 mod process_demand;
 mod procs;
+mod query;
 mod serve;
 mod source;
 mod stress;
@@ -100,6 +101,10 @@ enum Commands {
     /// Uninstall the launchd service
     #[arg(long, default_value_t = false)]
     uninstall: bool,
+
+    /// Explicitly install a user LaunchAgent (also the default for --install)
+    #[arg(long, requires = "install", conflicts_with = "uninstall")]
+    agent: bool,
   },
 
   /// Control the browser dashboard (starts and opens by default)
@@ -261,6 +266,16 @@ fn run_stress(
   result
 }
 
+/// The first tick of the nonzero interval after the last scheduled tick and after `now`.
+/// Skip overrun ticks without drifting from the original schedule.
+fn next_tick(sampled_at: Instant, interval: Duration, now: Instant) -> Instant {
+  let mut tick = sampled_at + interval;
+  while tick <= now {
+    tick += interval;
+  }
+  tick
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
   let args = Cli::parse();
   let explicit_interval =
@@ -272,12 +287,17 @@ fn main() -> Result<(), Box<dyn Error>> {
       // Debug override: require CLPC CPU/GPU/ANE counters without fallback.
       let force_clpc = std::env::var("MACMON_FORCE_CLPC").is_ok_and(|x| x == "1");
       let mut sampler = if force_clpc { Sampler::with_clpc()? } else { Sampler::new()? };
+      let interval = Duration::from_millis(args.interval.max(100).into());
+      let mut scheduled = Instant::now();
       let mut counter = 0u32;
 
       let soc_info_val = if *soc_info { Some(sampler.get_soc_info().clone()) } else { None };
 
       loop {
-        let doc = sampler.get_metrics(args.interval.max(100))?;
+        let now = Instant::now();
+        scheduled = next_tick(scheduled, interval, now);
+        thread::sleep(scheduled - now);
+        let doc = sampler.get_metrics_now()?;
 
         let mut doc = metrics_to_json_value(&doc)?;
         if let Some(ref soc) = soc_info_val {
@@ -294,9 +314,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
       }
     }
-    Some(Commands::Serve { host, port, install, uninstall }) => {
-      if *install || *uninstall {
-        serve::launchd(host, *port, *install)?;
+    Some(Commands::Serve { host, port, install, uninstall, agent }) => {
+      if *install || *agent || *uninstall {
+        serve::launchd(host, *port, *install || *agent)?;
         return Ok(());
       }
       // Bind first: an occupied HTTP port must not leave a hidden sampling owner behind.
@@ -413,6 +433,26 @@ mod tests {
       };
       assert_eq!(host, expected);
       assert_eq!(port, 9090);
+    }
+  }
+
+  #[test]
+  fn explicit_agent_uses_the_existing_login_install_path() {
+    let cli = Cli::try_parse_from(["macmon", "serve", "--install", "--agent"]).unwrap();
+    assert!(matches!(cli.command, Some(Commands::Serve { install: true, agent: true, .. })));
+    assert!(Cli::try_parse_from(["macmon", "serve", "--agent"]).is_err());
+    assert!(Cli::try_parse_from(["macmon", "serve", "--uninstall", "--agent"]).is_err());
+  }
+
+  #[test]
+  fn scheduled_sampling_skips_overruns_and_stays_anchored() {
+    let origin = Instant::now();
+    let interval = Duration::from_millis(100);
+    for (elapsed, expected) in [(0, 100), (80, 100), (100, 200), (395, 400)] {
+      assert_eq!(
+        next_tick(origin, interval, origin + Duration::from_millis(elapsed)),
+        origin + Duration::from_millis(expected)
+      );
     }
   }
 

@@ -189,6 +189,8 @@ to `~/.warp/themes/`, then select **Macmon Deep Space** in Warp's Theme Picker
 The program uses ANSI colors and also follows other terminal palettes; it does not change your
 terminal preferences automatically.
 
+When the TUI runs as root, preference changes stay in memory for that session.
+
 The process panel starts with application totals. Press `g` to switch between applications
 and individual processes; this choice is saved. In the full list (`6` then `f`), select an
 application and press Right to expand its members or Left to collapse it. Left on a member
@@ -203,6 +205,11 @@ case sensitivity: `safari, cargo` matches either, while `chrome, !helper` exclud
 helpers. Application totals always include the full membership; the matching/total count
 describes the visible children. In individual mode, the original filter-term totals remain
 available. `Enter` keeps the filter and `Esc` clears it after leaving a full-panel view.
+While editing, use Left/Right to move the cursor. Press `Shift-F` in
+the process list to turn the existing filter off or back on without retyping it.
+For a field query, combine terms with spaces and separate alternatives with commas,
+for example `app:safari mem:<1g` or `user:root cpu:>10`. Supported fields are
+`app:`, `user:`, `path:`, `cpu:`, `gpu:`, `power:`, `mem:` and `time:`.
 Grouped CPU 100% is one core, memory sums reported process memory, and GPU totals sum
 process shares. `≥` marks a partial total; `-` means unavailable. Large values retain their
 units using compact notation. Unconfirmed application ownership remains an individual row.
@@ -211,7 +218,7 @@ Complete process snapshots refresh every 5 seconds in a summary, or every 1 seco
 detailed list is requested. A slower system interval takes precedence. The highest demand
 among connected views wins; with no demand, collection pauses and retained data keeps its
 original age. Unfocused terminals use the summary cadence. A process Info overlay always
-requests details, but reads only that selected PID's files and sockets on a separate worker,
+requests details, but reads only that selected PID's command line, files and sockets on a separate worker,
 every 5 seconds (or the slower system interval). Press `r` in Info to refresh immediately;
 while entering its filter, `r` remains text. Closing Info discards late results.
 
@@ -489,6 +496,7 @@ macmon serve --uninstall                 # stop and remove
 ```
 
 This creates a launchd agent at `~/Library/LaunchAgents/com.macmon.plist` that auto-starts on login and restarts on crash.
+`macmon serve --install --agent` explicitly selects the same login service.
 
 #### Prometheus and Grafana
 
@@ -562,6 +570,15 @@ macOS 27 broke the CPU/ANE power source that macmon previously used without root
 The working rootless workaround we found is to read hidden energy reports from the AppleCLPC driver through IOReport. These reports use opaque IDs instead of discoverable CPU/GPU/ANE channel names, so macmon has to identify the counters and verify their units. This leaves macmon maintaining undocumented mappings for data that Apple's own tool can still read directly.
 
 Both the CLI and the Rust library use known CLPC counters automatically, and `Sampler::new()` retains legacy fallbacks for older systems. New chips or driver versions may need additional mappings. On an unsupported configuration, zero CPU/ANE readings can mean unavailable counters rather than zero consumption. See [docs/clpc-discovery.md](docs/clpc-discovery.md) for details.
+
+The machine-readable metrics also report `chip_power` for whole-chip power. The existing
+`all_power` remains the CPU + GPU + ANE subtotal used by Terminal and Web. Memory-controller
+power (`dcs_power`), M6 media power (`media_power`), adapter input (`dc_in_power`) and internal
+backlight power (`display_power`) are optional. A missing source returns `null` in JSON.
+
+Additional JSON fields expose GPU memory, the sampled memory-pressure level and percentage,
+uptime, and aggregate network and disk rates where supported. The per-interface readings,
+disk health details, cached battery monitoring and existing Prometheus metrics remain available.
 
 ### Battery monitoring
 
@@ -870,6 +887,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Creating `Sampler` inside the worker keeps its low-level macOS handles on that thread. In an async runtime, use its blocking-thread facility rather than calling `get_metrics` directly from an executor worker.
 
+If your application already has a timer, create the sampler before the first tick and call
+`sampler.get_metrics_now()` on each tick. This reads immediately and calculates counter-based
+metrics from the preceding sample, or from sampler initialization on the first call.
+
 ## 🤝 Contributing
 
 All contributions are welcome! Feel free to open an issue or submit a pull request.
@@ -894,8 +915,8 @@ Distributed under the [MIT License](LICENSE).
 
 ## Maintaining this personal fork
 
-`Spacgithub/macmon` keeps personal features, including Network Monitoring once its feature PR is
-merged. `origin` points to this fork; `vladkens/macmon` is a read-only `upstream`. Upstream fixes,
+`Spacgithub/macmon` keeps personal features such as Network Monitoring and the Web dashboard.
+`origin` points to this fork; `vladkens/macmon` is a read-only `upstream`. Upstream fixes,
 performance improvements and new features are merged into the fork's history, preserving personal
 commits. Changes to the same code can still require conflict resolution and testing.
 

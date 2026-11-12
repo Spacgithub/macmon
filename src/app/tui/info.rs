@@ -61,8 +61,7 @@ fn split(path: &str) -> (&str, &str) {
 /// Sort order: by kind, then paths by directory and name (so a directory's files stay together
 /// around its subdirectories), sockets by text, then the mode.
 fn order(file: &OpenFile) -> (Kind, &str, &str, &'static str) {
-  let (dir, name) =
-    if file.kind <= Kind::File { split(&file.text) } else { ("", file.text.as_str()) };
+  let (dir, name) = if file.kind.is_path() { split(&file.text) } else { ("", file.text.as_str()) };
   (file.kind, dir, name, file.mode)
 }
 
@@ -92,6 +91,7 @@ pub(super) struct Info {
   proc: ProcInfo,
   files: Result<Vec<OpenFile>, String>,
   filter: String,
+  cursor: usize,
   pub(super) typing: bool,
   /// The selected row, and its key, which it follows when the rows change.
   index: usize,
@@ -120,6 +120,7 @@ impl Info {
       proc,
       files,
       filter,
+      cursor: 0,
       typing,
       index,
       key,
@@ -246,8 +247,9 @@ impl Info {
     let Ok(files) = &self.files else { return vec![] };
     let filter = Filter::parse(&self.filter);
     let hit = |f: &OpenFile, t: &str| {
-      let text = [f.text.to_lowercase(), self.tilde(&f.text).to_lowercase()];
-      f.kind.label().contains(t) || text.iter().any(|text| text.contains(t))
+      f.kind.label().contains(t)
+        || f.text.to_lowercase().contains(t)
+        || (f.kind != Kind::Cmd && self.tilde(&f.text).to_lowercase().contains(t))
     };
     let exe = OpenFile { fd: None, kind: Kind::Exe, text: self.proc.path.clone(), mode: "" };
     let mut entries: Vec<&OpenFile> = (std::iter::once(&exe).chain(files))
@@ -295,14 +297,17 @@ impl Info {
     }
     match key.code {
       _ if self.typing => {
-        if type_filter(&mut self.filter, &mut self.typing, key) {
+        if type_filter(&mut self.filter, &mut self.cursor, &mut self.typing, key) {
           self.follow();
         }
       }
-      KeyCode::Char('/') => self.typing = true,
+      KeyCode::Char('/') => {
+        self.typing = true;
+        self.cursor = self.filter.chars().count();
+      }
       KeyCode::Char('e') => {
         // exe, cwd, dir and file rows, not sockets
-        if let Some(row) = self.rows().get(self.index).filter(|row| row.kind <= Kind::File) {
+        if let Some(row) = self.rows().get(self.index).filter(|row| row.kind.is_path()) {
           sys.reveal(&row.text);
         }
       }
@@ -366,7 +371,12 @@ impl Info {
   /// the filter keys on the right while typing.
   fn divider_titles(&self, width: u16) -> Titles<'static> {
     let filter = match self.typing || !self.filter.is_empty() {
-      true => filter_title(&self.filter, self.typing, title_text_room(width, &[])),
+      true => filter_title(
+        &self.filter,
+        self.typing.then_some(self.cursor),
+        true,
+        title_text_room(width, &[]),
+      ),
       false => hint("/", "filter"),
     };
     let hints = join([hint("Enter", "keep"), hint("Esc", "clear")]);
@@ -385,7 +395,13 @@ impl Info {
     let name = vec![heading(self.proc.name.clone()), text(format!(" {}", self.proc.pid))];
     let titles = Titles::new(name);
     let rows = self.rows();
-    let actions = || join([hint("c", "copy"), hint("e", "finder")]);
+    let actions = || {
+      if rows.get(self.index).is_some_and(|row| row.kind == Kind::Cmd) {
+        hint("c", "copy")
+      } else {
+        join([hint("c", "copy"), hint("e", "finder")])
+      }
+    };
     let titles = if self.typing || rows.is_empty() { titles } else { titles.right(actions()) };
     let mut list = draw_box(f, area, titles);
     if self.files.is_ok() && list.height >= COUNTS_MIN_HEIGHT {
@@ -410,10 +426,9 @@ impl Info {
       let columns = format!(" {:5} {:2}  ", row.kind.label(), row.mode);
       let count = if row.count > 1 { format!("  ×{}", row.count) } else { String::new() };
       let room = usize::from(list.width).saturating_sub(COLUMNS + 1 + Span::raw(&count).width());
-      let shown = match row.kind {
-        kind if kind > Kind::File => cut_middle(&self.tilde(&row.text), room), // sockets
-        _ => cut_path(&self.tilde(&row.text), room),
-      };
+      let shown = if row.kind == Kind::Cmd { row.text.clone() } else { self.tilde(&row.text) };
+      let shown =
+        if row.kind.is_path() { cut_path(&shown, room) } else { cut_middle(&shown, room) };
       let line = Rect { y, height: 1, ..list };
       f.render_widget(Line::from(vec![side(columns), text(shown), side(count)]), line);
       if i == self.index {
@@ -565,6 +580,19 @@ mod tests {
 
   fn info(files: Result<Vec<OpenFile>, i32>) -> (Info, FakeSys) {
     overlay(proc(), files)
+  }
+
+  #[test]
+  fn command_line_detail_is_copyable_but_not_a_finder_path() {
+    let command = "/Applications/Browser --example";
+    let entry = OpenFile { fd: None, kind: Kind::Cmd, text: command.into(), mode: "" };
+    let (mut info, fake) = info(Ok(vec![entry]));
+    info.select(1);
+    assert_eq!(info.rows()[info.index].kind, Kind::Cmd);
+    assert!(press(&mut info, &fake, KeyCode::Char('e')));
+    assert!(fake.0.borrow().revealed.is_empty());
+    assert!(press(&mut info, &fake, KeyCode::Char('c')));
+    assert_eq!(fake.0.borrow().copied, [command]);
   }
 
   /// The Chrome renderer's overlay.
