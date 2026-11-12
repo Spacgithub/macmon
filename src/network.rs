@@ -9,6 +9,11 @@ use std::time::Instant;
 use libc::{CTL_NET, IFDATA_GENERAL, IFMIB_IFALLDATA, NETLINK_GENERIC, PF_LINK};
 use serde::Serialize;
 
+use crate::shared::sum_rates;
+
+/// Ethernet and Wi-Fi interface type in `net/if_types.h`.
+const IFT_ETHER: u8 = 6;
+
 /// Traffic on one up, non-loopback network interface, including VPNs and bridges.
 #[derive(Debug, Default, Clone, Serialize)]
 #[cfg_attr(feature = "app", derive(serde::Deserialize))]
@@ -37,8 +42,14 @@ impl NetworkSampler {
     }
   }
 
-  pub(crate) fn sample(&mut self) -> Option<Vec<NetworkMetric>> {
-    self.record(read_counters().ok(), Instant::now())
+  pub(crate) fn sample(&mut self) -> (Option<Vec<NetworkMetric>>, [Option<u64>; 2]) {
+    let (counters, physical) = match read_counters() {
+      Ok((counters, physical)) => (Some(counters), physical),
+      Err(_) => (None, Vec::new()),
+    };
+    let metrics = self.record(counters, Instant::now());
+    let aggregate = metrics.as_deref().map_or([None; 2], |x| physical_rates(x, &physical));
+    (metrics, aggregate)
   }
 
   fn record(
@@ -66,7 +77,25 @@ impl NetworkSampler {
   }
 }
 
-fn read_counters() -> io::Result<Vec<NetworkMetric>> {
+fn physical_rates(metrics: &[NetworkMetric], physical: &[String]) -> [Option<u64>; 2] {
+  let links = metrics.iter().filter(|metric| physical.contains(&metric.name));
+  [
+    sum_rates(links.clone().map(|metric| metric.rx_bytes_per_sec)),
+    sum_rates(links.map(|metric| metric.tx_bytes_per_sec)),
+  ]
+}
+
+#[cfg(feature = "app")]
+pub(crate) fn physical_bytes() -> Option<[u64; 2]> {
+  let (metrics, physical) = read_counters().ok()?;
+  metrics
+    .into_iter()
+    .filter(|metric| physical.contains(&metric.name))
+    .map(|metric| [metric.rx_bytes, metric.tx_bytes])
+    .reduce(|a, b| [a[0].saturating_add(b[0]), a[1].saturating_add(b[1])])
+}
+
+fn read_counters() -> io::Result<(Vec<NetworkMetric>, Vec<String>)> {
   // IFALLDATA preserves 64 bits; NET_RT_IFLIST2 truncates non-platform binaries' byte counts.
   let mut mib = [CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFALLDATA, 0, IFDATA_GENERAL];
   let name = mib.as_mut_ptr();
@@ -88,12 +117,13 @@ fn read_counters() -> io::Result<Vec<NetworkMetric>> {
   Err(io::ErrorKind::WouldBlock.into())
 }
 
-fn parse_counters(bytes: &[u8]) -> io::Result<Vec<NetworkMetric>> {
+fn parse_counters(bytes: &[u8]) -> io::Result<(Vec<NetworkMetric>, Vec<String>)> {
   let (chunks, remainder) = bytes.as_chunks::<{ size_of::<libc::ifmibdata>() }>();
   if !remainder.is_empty() {
     return Err(io::ErrorKind::InvalidData.into());
   }
   let mut metrics = Vec::new();
+  let mut physical = Vec::new();
   for chunk in chunks {
     // The buffer need not be aligned; the SDK's if_data64 is packed to four bytes.
     let raw = unsafe { chunk.as_ptr().cast::<libc::ifmibdata>().read_unaligned() };
@@ -105,14 +135,23 @@ fn parse_counters(bytes: &[u8]) -> io::Result<Vec<NetworkMetric>> {
     if name.is_empty() {
       continue;
     }
+    let name = name.to_string_lossy().into_owned();
+    // VM Ethernet repeats traffic measured on its host uplink. Bridges and tunnels
+    // stay visible in the per-interface panel but are not included in the aggregate.
+    if raw.ifmd_data.ifi_type == IFT_ETHER
+      && !name.starts_with("vmenet")
+      && !name.starts_with("bridge")
+    {
+      physical.push(name.clone());
+    }
     metrics.push(NetworkMetric {
-      name: name.to_string_lossy().into_owned(),
+      name,
       rx_bytes: raw.ifmd_data.ifi_ibytes,
       tx_bytes: raw.ifmd_data.ifi_obytes,
       ..Default::default()
     });
   }
-  Ok(metrics)
+  Ok((metrics, physical))
 }
 
 #[cfg(test)]
@@ -120,7 +159,7 @@ mod tests {
   use std::mem::size_of;
   use std::time::{Duration, Instant};
 
-  use super::{NetworkMetric, NetworkSampler, parse_counters};
+  use super::{IFT_ETHER, NetworkMetric, NetworkSampler, parse_counters, physical_rates};
 
   fn counter(name: &str, rx_bytes: u64, tx_bytes: u64) -> NetworkMetric {
     NetworkMetric { name: name.into(), rx_bytes, tx_bytes, ..Default::default() }
@@ -192,12 +231,13 @@ mod tests {
     assert!(sampler.record(Some(vec![]), at + Duration::from_secs(4)).unwrap().is_empty());
   }
 
-  fn raw_bytes(name: &str, flags: i32, rx: u64, tx: u64) -> Vec<u8> {
+  fn raw_bytes(name: &str, flags: i32, kind: u8, rx: u64, tx: u64) -> Vec<u8> {
     let mut raw = unsafe { std::mem::zeroed::<libc::ifmibdata>() };
     for (out, byte) in raw.ifmd_name.iter_mut().zip(name.bytes()) {
       *out = byte as _;
     }
     raw.ifmd_flags = flags as u32;
+    raw.ifmd_data.ifi_type = kind;
     raw.ifmd_data.ifi_ibytes = rx;
     raw.ifmd_data.ifi_obytes = tx;
     unsafe {
@@ -213,21 +253,50 @@ mod tests {
   fn parses_unaligned_64_bit_counters_and_filters_down_and_loopback_interfaces() {
     let large = 1u64 << 40;
     let mut bytes = vec![0];
-    bytes.extend(raw_bytes("en0", libc::IFF_UP, large, large + 1));
-    bytes.extend(raw_bytes("lo0", libc::IFF_UP | libc::IFF_LOOPBACK, 100, 100));
-    bytes.extend(raw_bytes("down", 0, 100, 100));
-    bytes.extend(raw_bytes("utun0", libc::IFF_UP, 20, 30));
-    let metrics = parse_counters(&bytes[1..]).unwrap();
+    bytes.extend(raw_bytes("en0", libc::IFF_UP, IFT_ETHER, large, large + 1));
+    bytes.extend(raw_bytes("lo0", libc::IFF_UP | libc::IFF_LOOPBACK, 24, 100, 100));
+    bytes.extend(raw_bytes("down", 0, IFT_ETHER, 100, 100));
+    bytes.extend(raw_bytes("utun0", libc::IFF_UP, 1, 20, 30));
+    let (metrics, physical) = parse_counters(&bytes[1..]).unwrap();
     assert_eq!(metrics.len(), 2);
+    assert_eq!(physical, ["en0"]);
     assert_eq!(
       (metrics[0].name.as_str(), metrics[0].rx_bytes, metrics[0].tx_bytes),
       ("en0", large, large + 1)
     );
     assert_eq!(metrics[1].name, "utun0");
     assert!(metrics.iter().all(|x| x.rx_bytes_per_sec.is_none()));
-    assert!(parse_counters(&[]).unwrap().is_empty());
+    assert!(parse_counters(&[]).unwrap().0.is_empty());
     assert!(parse_counters(&bytes[1..bytes.len() - 1]).is_err());
-    assert!(parse_counters(&raw_bytes("abcdefghijklmnop", libc::IFF_UP, 0, 0)).is_err());
-    assert!(parse_counters(&raw_bytes("", libc::IFF_UP, 0, 0)).unwrap().is_empty());
+    assert!(parse_counters(&raw_bytes("abcdefghijklmnop", libc::IFF_UP, 0, 0, 0)).is_err());
+    assert!(parse_counters(&raw_bytes("", libc::IFF_UP, 0, 0, 0)).unwrap().0.is_empty());
+  }
+
+  #[test]
+  fn aggregate_uses_the_same_counters_without_double_counting_virtual_links() {
+    let at = Instant::now();
+    let mut sampler = NetworkSampler::default();
+    let snapshot = |delta: u64, en1_rx: u64| {
+      let mut bytes = Vec::new();
+      for (name, kind, rx, tx) in [
+        ("en0", IFT_ETHER, 100 + delta, 100 + delta),
+        ("en1", IFT_ETHER, en1_rx, 100),
+        ("vmenet0", IFT_ETHER, 100 + delta, 100 + delta),
+        ("bridge0", IFT_ETHER, 100 + delta, 100 + delta),
+        ("utun0", 1, 100 + delta, 100 + delta),
+      ] {
+        bytes.extend(raw_bytes(name, libc::IFF_UP, kind, rx, tx));
+      }
+      parse_counters(&bytes).unwrap()
+    };
+    let first = sampler.record(Some(snapshot(0, 100).0), at).unwrap();
+    assert_eq!(first.len(), 5);
+    let (counters, physical) = snapshot(100, 150);
+    let next = sampler.record(Some(counters), at + Duration::from_secs(1)).unwrap();
+    assert_eq!(next.len(), 5);
+    assert_eq!(physical_rates(&next, &physical), [Some(150), Some(100)]);
+    let (counters, physical) = snapshot(200, 10);
+    let next = sampler.record(Some(counters), at + Duration::from_secs(2)).unwrap();
+    assert_eq!(physical_rates(&next, &physical), [None, Some(100)]);
   }
 }

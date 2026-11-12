@@ -1305,6 +1305,38 @@ mod tests {
 
   use super::*;
 
+  #[test]
+  fn an_older_owner_frame_needs_no_additive_metrics() {
+    let mut old = Frame::fixture(4, 7);
+    old.metrics.all_power = 2.0;
+    let mut wire = serde_json::to_value(&old).unwrap();
+    let metrics = wire["metrics"].as_object_mut().unwrap();
+    for field in [
+      "chip_power",
+      "dcs_power",
+      "media_power",
+      "dc_in_power",
+      "display_power",
+      "memory_pressure_level",
+      "memory_pressure_percent",
+      "net_in",
+      "net_out",
+      "disk_read",
+      "disk_write",
+      "uptime",
+      "gpu_mem_alloc",
+      "gpu_mem_in_use",
+    ] {
+      metrics.remove(field);
+    }
+
+    let decoded: Frame = serde_json::from_value(wire).unwrap();
+    assert_eq!((decoded.session, decoded.sequence, decoded.revision), (old.session, 4, 7));
+    assert_eq!((decoded.metrics.all_power, decoded.metrics.chip_power), (2.0, 0.0));
+    assert!(decoded.metrics.gpu_mem_alloc.is_none());
+    assert!(decoded.metrics.memory_pressure_level.is_none());
+  }
+
   struct FakeReader<F>(F);
   impl<F: FnMut() -> Vec<ProcInfo>> ProcessReader for FakeReader<F> {
     fn sample(&mut self) -> Vec<ProcInfo> {

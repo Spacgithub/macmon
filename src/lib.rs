@@ -28,6 +28,11 @@
 //! }
 //! ```
 //!
+//! To schedule samples yourself, call [`Sampler::get_metrics_now`] at each
+//! tick. It reads the hardware immediately and measures counter changes since
+//! the previous sample from either method, or since sampler initialization on
+//! the first call.
+//!
 //! To keep an application thread responsive, create the sampler inside a
 //! dedicated worker thread and send completed metrics through a channel:
 //!
@@ -76,6 +81,7 @@ mod disk;
 #[cfg(feature = "app")]
 #[doc(hidden)]
 pub mod diagnostics;
+mod fallback;
 mod memory_activity;
 #[doc(hidden)]
 pub mod metrics;
